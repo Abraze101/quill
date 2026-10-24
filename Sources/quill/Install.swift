@@ -1,20 +1,17 @@
 import ArgumentParser
 import Foundation
 
-/// Manage quill's LaunchAgent so the daemon starts at login.
-///
-/// We deliberately do NOT use SMAppService.mainApp here — that requires a full
-/// .app bundle. Since quill ships as a single binary in /usr/local/bin, a
-/// plain LaunchAgent plist is the simpler, more honest mechanism.
+/// Preserve the legacy LaunchAgent command for standalone binary installs.
+/// App bundles manage launch at login in Settings through SMAppService instead.
 struct Install: ParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Install or remove the launch-at-login LaunchAgent."
+        abstract: "Install or remove the legacy launch-at-login LaunchAgent."
     )
 
-    @Flag(name: .long, help: "Register quill to start at login.")
+    @Flag(name: .long, help: "Register a standalone quill binary to start at login.")
     var launchAtLogin: Bool = false
 
-    @Flag(name: .long, help: "Remove the launch-at-login agent.")
+    @Flag(name: .long, help: "Remove only the legacy LaunchAgent; app login settings are unchanged.")
     var uninstall: Bool = false
 
     func run() throws {
@@ -44,6 +41,7 @@ struct Install: ParsableCommand {
     }
 
     private func writeAgent() throws {
+        try ensureLegacyInstallAllowed()
         let binary = try resolveBinaryPath()
 
         let plist: [String: Any] = [
@@ -77,7 +75,7 @@ struct Install: ParsableCommand {
             ))
         }
 
-        print("✓ launch-at-login installed")
+        print("✓ legacy launch-at-login installed")
         print("  plist:  \(url.path)")
         print("  binary: \(binary)")
         print("  logs:   /tmp/quill.out.log, /tmp/quill.err.log")
@@ -88,10 +86,36 @@ struct Install: ParsableCommand {
         if FileManager.default.fileExists(atPath: url.path) {
             _ = runLaunchctl(["bootout", "gui/\(uid())", url.path])
             try FileManager.default.removeItem(at: url)
-            print("✓ launch-at-login removed")
+            print("✓ legacy LaunchAgent plist removed")
         } else {
-            print("nothing to remove (no agent at \(url.path))")
+            print("nothing to remove (no legacy agent at \(url.path))")
         }
+        print("Quill.app's Launch at login setting is unchanged; manage it in Quill Settings.")
+    }
+
+    private func ensureLegacyInstallAllowed() throws {
+        let installedLocations = [
+            URL(fileURLWithPath: "/Applications/Quill.app", isDirectory: true),
+            FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Applications/Quill.app", isDirectory: true),
+        ]
+        let installedApp = installedLocations.first { url in
+            Bundle(url: url)?.bundleIdentifier == Self.label
+        }
+        guard Bundle.main.bundleURL.pathExtension.lowercased() == "app" || installedApp != nil else {
+            return
+        }
+
+        let instruction: String
+        if let installedApp {
+            instruction = "Open \(installedApp.path) and use Launch at login in Quill Settings."
+        } else {
+            instruction = "Install Quill.app in Applications, then use Launch at login in Quill Settings."
+        }
+        FileHandle.standardError.write(Data(
+            "Legacy LaunchAgent registration is unavailable for app installs. \(instruction)\n".utf8
+        ))
+        throw ExitCode(1)
     }
 
     private func resolveBinaryPath() throws -> String {

@@ -25,6 +25,7 @@ actor ParakeetEngine: TranscriptionEngine {
     nonisolated let model = "parakeet-tdt-0.6b-v2-coreml"
 
     private var manager: AsrManager?
+    private var speakerStatus: SpeakerIdentificationState = .disabled
 
     func prepare() async throws {
         guard manager == nil else { return }
@@ -35,7 +36,14 @@ actor ParakeetEngine: TranscriptionEngine {
     }
 
     func transcribe(_ audio: URL) async throws -> [TranscriptSegment] {
+        try await transcribe(audio, identifySpeakers: false)
+    }
+
+    func speakerIdentificationStatus() async -> SpeakerIdentificationState { speakerStatus }
+
+    func transcribe(_ audio: URL, identifySpeakers: Bool) async throws -> [TranscriptSegment] {
         guard let manager else { throw EngineError.notPrepared }
+        speakerStatus = identifySpeakers ? .unavailable : .disabled
 
         // A track with no frames (recorder died before its first buffer)
         // makes AVFoundation raise an ObjC exception deep inside the
@@ -52,52 +60,36 @@ actor ParakeetEngine: TranscriptionEngine {
 
         var state = try TdtDecoderState()
         let result = try await manager.transcribe(audio, decoderState: &state)
+        try Task.checkCancellation()
 
-        let words = buildWordTimings(from: result.tokenTimings ?? [])
-        guard !words.isEmpty else {
+        let words = buildWordTimings(from: result.tokenTimings ?? []).map {
+            TranscriptWord(start: $0.startTime, end: $0.endTime, text: $0.word)
+        }
+        guard !words.isEmpty, words.allSatisfy({ $0.start.isFinite && $0.end.isFinite && $0.start >= 0 && $0.end >= $0.start }) else {
             let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
             return text.isEmpty
                 ? []
-                : [TranscriptSegment(start: 0, end: result.duration, text: text)]
+                : [TranscriptSegment(start: 0, end: result.duration.isFinite ? max(0, result.duration) : 0, text: text)]
         }
-        return Self.segments(from: words)
+        guard identifySpeakers else { return SpeakerAlignment.segments(words: words) }
+        do {
+            let intervals = try await LocalDiarizationProcess.run(audio: audio)
+            try Task.checkCancellation()
+            let segments = SpeakerAlignment.segments(words: words, intervals: intervals)
+            let identified = segments.filter { $0.speakerID != nil }.count
+            speakerStatus = identified == 0 ? .unavailable : (identified == segments.count ? .completed : .partial)
+            return segments
+        } catch {
+            // Cancellation is never downgraded to a successful transcript.
+            try Task.checkCancellation()
+            speakerStatus = .unavailable
+            return SpeakerAlignment.segments(words: words)
+        }
     }
 
     func release() async {
         if let manager { await manager.cleanup() }
         manager = nil
-    }
-
-    /// Group word timings into readable segments: break on sentence-ending
-    /// punctuation (parakeet v2 emits punctuation), a silence gap, or a hard
-    /// length cap so a run-on speaker still wraps.
-    private static func segments(from words: [WordTiming]) -> [TranscriptSegment] {
-        var out: [TranscriptSegment] = []
-        var current: [WordTiming] = []
-
-        func flush() {
-            guard let first = current.first, let last = current.last else { return }
-            out.append(TranscriptSegment(
-                start: first.startTime,
-                end: last.endTime,
-                text: current.map(\.word).joined(separator: " ")
-            ))
-            current = []
-        }
-
-        for word in words {
-            if let last = current.last, word.startTime - last.endTime > 1.0 {
-                flush()
-            }
-            current.append(word)
-            let endsSentence = word.word.hasSuffix(".")
-                || word.word.hasSuffix("?")
-                || word.word.hasSuffix("!")
-            if endsSentence || current.count >= 60 {
-                flush()
-            }
-        }
-        flush()
-        return out
+        speakerStatus = .disabled
     }
 }

@@ -6,9 +6,15 @@
     <string>com.digimata.quill</string>
     <key>CFBundleName</key>
     <string>quill</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.3</string>
+    <key>CFBundleVersion</key>
+    <string>5</string>
     <key>NSMicrophoneUsageDescription</key>
-    <string>quill records your microphone during meetings so you can transcribe them later. Audio never leaves this Mac.</string>
+    <string>Quill records your microphone and saves audio on this Mac. Optional connections can upload recordings after you enable them.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>Quill records the meeting window or display you choose, with audio, and saves the recording on this Mac.</string>
     <key>NSAudioCaptureUsageDescription</key>
-    <string>quill records system audio (the other side of your meetings) so you can transcribe them later. Audio never leaves this Mac.</string>
+    <string>Quill records system audio and saves it on this Mac. Optional connections can upload recordings after you enable them.</string>
 </dict>
 </plist>

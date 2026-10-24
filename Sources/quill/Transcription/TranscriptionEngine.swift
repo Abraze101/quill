@@ -6,7 +6,17 @@ struct TranscriptSegment: Sendable {
     let start: TimeInterval
     let end: TimeInterval
     let text: String
+    var words: [TranscriptWord]? = nil
+    var speakerID: String? = nil
 }
+
+struct TranscriptWord: Sendable {
+    let start: TimeInterval
+    let end: TimeInterval
+    let text: String
+}
+
+enum SpeakerIdentificationState: String, Sendable { case disabled, completed, partial, unavailable }
 
 /// A speech-to-text engine quill can run locally. Engines are prepared lazily
 /// (model download + load) when the transcription queue has work and released
@@ -18,5 +28,14 @@ protocol TranscriptionEngine: Sendable {
     var model: String { get }
     func prepare() async throws
     func transcribe(_ audio: URL) async throws -> [TranscriptSegment]
+    func transcribe(_ audio: URL, identifySpeakers: Bool) async throws -> [TranscriptSegment]
+    func speakerIdentificationStatus() async -> SpeakerIdentificationState
     func release() async
+}
+
+extension TranscriptionEngine {
+    func transcribe(_ audio: URL, identifySpeakers: Bool) async throws -> [TranscriptSegment] {
+        try await transcribe(audio)
+    }
+    func speakerIdentificationStatus() async -> SpeakerIdentificationState { .disabled }
 }

@@ -2,12 +2,58 @@ import AVFoundation
 import CoreAudio
 import Foundation
 
-/// Records all system audio output to a file via a Core Audio process tap
-/// (macOS 14.2+). No virtual device, no kernel extension — the tap mixes every
-/// process's output to stereo and hands us buffers through a private aggregate
-/// device. First use triggers the one-time "System Audio Recording" TCC prompt
-/// and lights the purple recording indicator while active.
-final class SystemAudioRecorder {
+/// Cross-queue Stop fence. It is deliberately independent of CoreAudio's
+/// serial queue, which may be waiting in a native permission/start call.
+private final class SystemAudioStopFence: @unchecked Sendable {
+    private let lock = NSLock()
+    private var active = false
+    private var used = false
+    private var generation = 0
+    private var sink: SystemAudioSink?
+    private var stopSeconds: Double?
+
+    func begin(generation: Int) throws {
+        try lock.withLock {
+            guard !used else { throw CancellationError() }
+            used = true
+            active = true
+            self.generation = generation
+        }
+    }
+    func accepts(_ generation: Int) -> Bool { lock.withLock { active && self.generation == generation } }
+    var isActive: Bool { lock.withLock { active } }
+    var currentSink: SystemAudioSink? { lock.withLock { sink } }
+    var stoppedAt: Double? { lock.withLock { stopSeconds } }
+    func install(_ sink: SystemAudioSink, generation: Int) throws {
+        try lock.withLock {
+            guard active, self.generation == generation else { throw CancellationError() }
+            self.sink = sink
+            sink.activate(generation: generation)
+        }
+    }
+    func replace(generation: Int, reason: String) -> Bool {
+        lock.withLock {
+            guard active else { return false }
+            self.generation = generation
+            sink?.interrupt(reason: reason)
+            return true
+        }
+    }
+    func stop(at now: Double) {
+        lock.withLock {
+            // Stop before start must also prohibit a later permission/start.
+            used = true
+            active = false
+            if stopSeconds == nil { stopSeconds = now }
+            sink?.interrupt(reason: "recording_stopped")
+        }
+    }
+}
+
+/// CoreAudio handles, recovery policy, timers and attempts are confined to one
+/// serial control queue. Callbacks only touch the generation-owned locked sink.
+/// The same system.caf and transcript origin survive every recovered route.
+final class SystemAudioRecorder: @unchecked Sendable {
     enum RecorderError: Error, CustomStringConvertible {
         case tapCreationFailed(OSStatus)
         case tapFormatUnreadable(OSStatus)
@@ -29,146 +75,197 @@ final class SystemAudioRecorder {
         }
     }
 
-    private var tapID = AudioObjectID(kAudioObjectUnknown)
-    private var aggregateID = AudioObjectID(kAudioObjectUnknown)
-    private var procID: AudioDeviceIOProcID?
-    private var file: AVAudioFile?
-    private let queue = DispatchQueue(label: "com.digimata.quill.system-tap")
-    private(set) var isRecording = false
-    /// Wall-clock time of the first captured buffer — the track's true start,
-    /// used to offset-align the two tracks' transcript timestamps.
-    private(set) var firstBufferAt: Date?
+    @MainActor var onStatusChange: (@MainActor @Sendable (SystemAudioCaptureStatus) -> Void)?
+    @MainActor private var startRequested = false
+    @MainActor private var stopRequested = false
+    @MainActor var captureTimeline: RecordingCaptureTimeline?
+    private var timelineForCapture: RecordingCaptureTimeline?
+    private let control = DispatchQueue(label: "com.digimata.quill.system-tap.control")
+    private let fence = SystemAudioStopFence()
+    private let clock: @Sendable () -> Double
+    private let makeTransport: @Sendable (DispatchQueue) -> any SystemAudioCaptureTransport
+    private let automaticWatchdog: Bool
+    private var policy: SystemAudioRecoveryPolicy
+    private var transport: (any SystemAudioCaptureTransport)?
+    private var timer: DispatchSourceTimer?
+    private var recovery: DispatchWorkItem?
+    private var outputURL: URL?
 
-    /// Start capturing system audio, encoding AAC into `url` (use a .caf
-    /// extension — CAF needs no finalization pass, so a crash mid-meeting
-    /// loses nothing already written).
-    func start(writingTo url: URL) throws {
-        guard !isRecording else { return }
-
-        let description = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
-        description.name = "quill system tap"
-        description.isPrivate = true
-        description.muteBehavior = .unmuted
-
-        var newTapID = AudioObjectID(kAudioObjectUnknown)
-        let status = AudioHardwareCreateProcessTap(description, &newTapID)
-        guard status == noErr else { throw RecorderError.tapCreationFailed(status) }
-        tapID = newTapID
-
-        do {
-            let format = try tapStreamFormat()
-            try createAggregateDevice(tapUUID: description.uuid)
-            file = try makeFile(url: url, format: format)
-            try installIOProc(format: format)
-        } catch {
-            cleanup()
-            throw error
-        }
-
-        isRecording = true
+    init(timing: SystemAudioRecoveryPolicy.Timing = .init(), automaticWatchdog: Bool = true,
+         clock: @escaping @Sendable () -> Double = { AVAudioTime.seconds(forHostTime: mach_absolute_time()) },
+         makeTransport: @escaping @Sendable (DispatchQueue) -> any SystemAudioCaptureTransport = { SystemAudioTransport(control: $0) }) {
+        policy = SystemAudioRecoveryPolicy(timing: timing)
+        self.automaticWatchdog = automaticWatchdog
+        self.clock = clock
+        self.makeTransport = makeTransport
     }
 
-    /// Stop capturing and finalize the file. Idempotent.
-    func stop() {
-        guard isRecording else { return }
-        isRecording = false
-        if let procID, aggregateID != kAudioObjectUnknown {
-            AudioDeviceStop(aggregateID, procID)
-        }
-        cleanup()
+    var firstBufferAt: Date? { fence.currentSink?.firstBufferAt }
+    var captureFailure: String? { fence.currentSink?.captureFailure }
+    var hasCapturedAudio: Bool { fence.currentSink?.hasCapturedAudio ?? false }
+    var captureReport: [String: Any] {
+        fence.currentSink?.report ?? ["received_audio": false, "coverage_complete": false]
     }
 
-    // MARK: -
-
-    private func tapStreamFormat() throws -> AVAudioFormat {
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioTapPropertyFormat,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var asbd = AudioStreamBasicDescription()
-        var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
-        let status = AudioObjectGetPropertyData(tapID, &address, 0, nil, &size, &asbd)
-        guard status == noErr, let format = AVAudioFormat(streamDescription: &asbd) else {
-            throw RecorderError.tapFormatUnreadable(status)
-        }
-        return format
+    @MainActor
+    func start(writingTo url: URL) async throws {
+        guard !stopRequested else { throw CancellationError() }
+        guard !startRequested else { return }
+        startRequested = true
+        var startSucceeded = false
+        defer { if !startSucceeded { stopRequested = true } }
+        let fence = self.fence
+        let timeline = captureTimeline
+        let clock = self.clock
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                control.async { [self] in
+                    do {
+                        let generation = policy.start(at: clock())
+                        try fence.begin(generation: generation)
+                        outputURL = url
+                        timelineForCapture = timeline
+                        try configure(generation: generation)
+                        guard fence.accepts(generation) else { throw CancellationError() }
+                        policy.started(generation, at: clock())
+                        startWatchdog()
+                        continuation.resume()
+                    } catch {
+                        fence.stop(at: clock())
+                        cleanup()
+                        fence.currentSink?.close(at: fence.stoppedAt ?? clock())
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
+        } onCancel: { fence.stop(at: clock()) }
+        startSucceeded = true
     }
 
-    private func createAggregateDevice(tapUUID: UUID) throws {
-        let desc: [String: Any] = [
-            kAudioAggregateDeviceNameKey: "quill-tap",
-            kAudioAggregateDeviceUIDKey: UUID().uuidString,
-            kAudioAggregateDeviceIsPrivateKey: true,
-            kAudioAggregateDeviceIsStackedKey: false,
-            kAudioAggregateDeviceTapAutoStartKey: true,
-            kAudioAggregateDeviceSubDeviceListKey: [] as [[String: Any]],
-            kAudioAggregateDeviceTapListKey: [
-                [
-                    kAudioSubTapUIDKey: tapUUID.uuidString,
-                    kAudioSubTapDriftCompensationKey: true,
-                ]
-            ],
-        ]
-        var newAggregateID = AudioObjectID(kAudioObjectUnknown)
-        let status = AudioHardwareCreateAggregateDevice(desc as CFDictionary, &newAggregateID)
-        guard status == noErr else { throw RecorderError.aggregateCreationFailed(status) }
-        aggregateID = newAggregateID
-    }
+    /// Synchronous invalidation for Stop/sleep. Native teardown follows on its
+    /// queue; queued callbacks and recovery attempts cannot revive this session.
+    @MainActor
+    func requestStop() { stopRequested = true; fence.stop(at: clock()) }
 
-    private func makeFile(url: URL, format: AVAudioFormat) throws -> AVAudioFile {
-        let settings: [String: Any] = [
-            AVFormatIDKey: kAudioFormatMPEG4AAC,
-            AVSampleRateKey: format.sampleRate,
-            AVNumberOfChannelsKey: format.channelCount,
-        ]
-        do {
-            return try AVAudioFile(
-                forWriting: url,
-                settings: settings,
-                commonFormat: format.commonFormat,
-                interleaved: format.isInterleaved
-            )
-        } catch {
-            throw RecorderError.fileCreationFailed(error)
-        }
-    }
-
-    private func installIOProc(format: AVAudioFormat) throws {
-        var status = AudioDeviceCreateIOProcIDWithBlock(&procID, aggregateID, queue) {
-            [weak self] _, inInputData, _, _, _ in
-            guard let self, let file = self.file else { return }
-            if self.firstBufferAt == nil { self.firstBufferAt = Date() }
-            guard let buffer = AVAudioPCMBuffer(
-                pcmFormat: format,
-                bufferListNoCopy: inInputData,
-                deallocator: nil
-            ) else { return }
-            do {
-                try file.write(from: buffer)
-            } catch {
-                FileHandle.standardError.write(Data("system track write failed: \(error)\n".utf8))
+    @MainActor
+    func stop() async {
+        requestStop()
+        await withCheckedContinuation { continuation in
+            control.async { [self] in
+                cleanup()
+                fence.currentSink?.close(at: fence.stoppedAt ?? clock())
+                continuation.resume()
             }
         }
-        guard status == noErr, let procID else { throw RecorderError.ioProcCreationFailed(status) }
+    }
 
-        status = AudioDeviceStart(aggregateID, procID)
-        guard status == noErr else { throw RecorderError.deviceStartFailed(status) }
+    private func configure(generation: Int) throws {
+        guard fence.accepts(generation), let outputURL else { throw CancellationError() }
+        let next = makeTransport(control)
+        let timeline = timelineForCapture
+        transport = next
+        try next.start(isCurrent: { [fence] in fence.accepts(generation) }, prepare: { [fence, clock] input in
+            guard fence.accepts(generation) else { throw CancellationError() }
+            let sink: SystemAudioSink
+            if let existing = fence.currentSink { sink = existing }
+            else {
+                guard input.sampleRate.isFinite, input.sampleRate > 0, input.channelCount > 0 else {
+                    throw RecorderError.tapFormatUnreadable(-1)
+                }
+                do { sink = try SystemAudioSink(url: outputURL, sampleRate: input.sampleRate, clock: clock, captureTimeline: timeline) }
+                catch { throw RecorderError.fileCreationFailed(error) }
+            }
+            let converter = try MicPCMConverter(input: input, output: sink.format)
+            do { try fence.install(sink, generation: generation) }
+            catch { sink.close(at: fence.stoppedAt ?? clock()); throw error }
+            return { buffer, seconds in sink.append(buffer, hostSeconds: seconds, generation: generation, converter: converter) }
+        }, routeChanged: { [weak self] in
+            guard let self else { return }
+            self.control.async { [self] in
+                guard fence.accepts(generation) else { return }
+                policy.routeChanged(at: clock())
+            }
+        })
+        guard fence.accepts(generation) else { throw CancellationError() }
+    }
+
+    private func startWatchdog() {
+        guard automaticWatchdog, timer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: control)
+        timer.schedule(deadline: .now() + 0.5, repeating: 0.5)
+        timer.setEventHandler { [weak self] in self?.checkHealth() }
+        self.timer = timer
+        timer.resume()
+    }
+
+    private func checkHealth() {
+        guard fence.isActive else { return }
+        let telemetry = fence.currentSink?.telemetry
+        handle(policy.tick(at: clock(), successfulWrite: telemetry?.lastWrite,
+                           failure: telemetry?.failure != nil))
+    }
+
+    private func handle(_ action: SystemAudioRecoveryPolicy.Action) {
+        switch action {
+        case .none: return
+        case .recording: emit(.recording, generation: policy.generation)
+        case .failed:
+            guard fence.replace(generation: policy.generation, reason: "recovery_exhausted") else { return }
+            transport?.stop()
+            transport = nil
+            let message = "System audio unavailable after three recovery attempts. Microphone recording can continue."
+            fence.currentSink?.fail(message)
+            timer?.cancel()
+            timer = nil
+            emit(.failed(message: message), generation: policy.generation)
+        case .recover(let generation, let attempt, let delay, let reason):
+            guard fence.replace(generation: generation, reason: reason) else { return }
+            fence.currentSink?.recordRecovery(reason: reason, attempt: attempt)
+            emit(.recovering(attempt: attempt), generation: generation)
+            recovery?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                guard let self, self.fence.accepts(generation), self.policy.begin(generation) else { return }
+                self.transport?.stop()
+                self.transport = nil
+                do {
+                    try self.configure(generation: generation)
+                    self.policy.started(generation, at: self.clock())
+                } catch {
+                    self.transport?.stop()
+                    self.transport = nil
+                    guard self.fence.accepts(generation) else { return }
+                    self.handle(self.policy.restartFailed(generation))
+                }
+            }
+            recovery = work
+            control.asyncAfter(deadline: .now() + delay, execute: work)
+        }
+    }
+
+    private func emit(_ status: SystemAudioCaptureStatus, generation: Int) {
+        Task { @MainActor [weak self] in
+            guard let self, self.fence.accepts(generation) else { return }
+            self.onStatusChange?(status)
+        }
     }
 
     private func cleanup() {
-        if let procID, aggregateID != kAudioObjectUnknown {
-            AudioDeviceDestroyIOProcID(aggregateID, procID)
+        policy.stop()
+        recovery?.cancel()
+        recovery = nil
+        timer?.cancel()
+        timer = nil
+        transport?.stop()
+        transport = nil
+    }
+
+    /// Deterministic production-policy tick for isolated hardware-free checks.
+    /// It follows the same serial queue as the live watchdog.
+    @MainActor
+    func checkHealthForTesting() async {
+        await withCheckedContinuation { continuation in
+            control.async { [self] in checkHealth(); continuation.resume() }
         }
-        procID = nil
-        if aggregateID != kAudioObjectUnknown {
-            AudioHardwareDestroyAggregateDevice(aggregateID)
-            aggregateID = AudioObjectID(kAudioObjectUnknown)
-        }
-        if tapID != kAudioObjectUnknown {
-            AudioHardwareDestroyProcessTap(tapID)
-            tapID = AudioObjectID(kAudioObjectUnknown)
-        }
-        file = nil
     }
 }

@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "Quill meeting detector",
+  "version": "0.1.5",
+  "minimum_chrome_version": "106",
+  "description": "Reports joined and left meeting states to local Quill. No audio or video is recorded or sent by this extension.",
+  "permissions": ["nativeMessaging", "storage", "alarms", "webNavigation"],
+  "host_permissions": ["https://meet.google.com/*", "https://*.zoom.us/*"],
+  "background": {"service_worker": "background.js"},
+  "content_scripts": [{
+    "matches": ["https://meet.google.com/*"],
+    "js": ["detector.js", "recording-warning.js", "content.js"],
+    "run_at": "document_idle",
+    "all_frames": false
+  }, {
+    "matches": ["https://*.zoom.us/wc/*"],
+    "js": ["detector.js", "recording-warning.js", "content.js"],
+    "run_at": "document_idle",
+    "all_frames": true
+  }]
+}

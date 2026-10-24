@@ -6,12 +6,17 @@ let package = Package(
     platforms: [.macOS(.v15)],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.3.0"),
-        .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.7.0"),
+        .package(url: "https://github.com/FluidInference/FluidAudio.git", exact: "0.17.5"),
     ],
     targets: [
+        .target(name: "MeetingWorkflow"),
+        // The Command Line Tools installation lacks XCTest; these executable
+        // checks run the same state transitions without a full Xcode install.
+        .executableTarget(name: "meeting-workflow-checks", dependencies: ["MeetingWorkflow"], path: "Tests/MeetingWorkflowTests"),
         .executableTarget(
             name: "quill",
             dependencies: [
+                "MeetingWorkflow",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "FluidAudio", package: "FluidAudio"),
             ],

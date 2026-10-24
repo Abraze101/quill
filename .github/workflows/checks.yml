@@ -1,0 +1,126 @@
+name: Source checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+      NSUnbufferedIO: "YES"
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Show build toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+          xcrun --show-sdk-version
+      - name: Validate source
+        timeout-minutes: 1
+        run: git diff --check
+      - name: Check meeting workflow policies
+        if: ${{ !cancelled() }}
+        timeout-minutes: 3
+        run: sh scripts/test-workflow-policies.sh
+      - name: Test Python workflow
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: python3 -m unittest discover -s integrations/meeting-workflow/tests -v
+      - name: Test browser detector
+        if: ${{ !cancelled() }}
+        timeout-minutes: 2
+        run: node --test integrations/meeting-workflow/browser/*.test.cjs
+      - name: Check screen capture
+        if: ${{ !cancelled() }}
+        timeout-minutes: 4
+        run: sh integrations/meeting-workflow/tests/test-screen-capture.sh
+      - name: Check audio lifecycle
+        if: ${{ !cancelled() }}
+        timeout-minutes: 4
+        run: sh integrations/meeting-workflow/tests/test-audio-lifecycle.sh
+      - name: Check crash-safe audio
+        if: ${{ !cancelled() }}
+        timeout-minutes: 4
+        run: sh integrations/meeting-workflow/tests/test-crash-audio.sh
+      - name: Check recording crash recovery
+        if: ${{ !cancelled() }}
+        timeout-minutes: 4
+        run: sh integrations/meeting-workflow/tests/test-recording-crash-recovery.sh
+      - name: Check pause policies and audio
+        if: ${{ !cancelled() }}
+        timeout-minutes: 4
+        env:
+          # The hosted ARM VM crashes in Apple's video scaler, including with
+          # software encoding. Default local runs still test both real MP4 cases.
+          QUILL_SKIP_SYNTHETIC_VIDEO_ASSEMBLY: "1"
+        run: sh integrations/meeting-workflow/tests/test-recording-pause.sh
+      - name: Check sleep notifications
+        if: ${{ !cancelled() }}
+        timeout-minutes: 4
+        run: sh integrations/meeting-workflow/tests/test-sleep-wake.sh
+      - name: Check app sleep handling
+        if: ${{ !cancelled() }}
+        timeout-minutes: 4
+        run: sh integrations/meeting-workflow/tests/test-app-sleep.sh
+      - name: Check microphone recovery
+        if: ${{ !cancelled() }}
+        timeout-minutes: 4
+        run: sh integrations/meeting-workflow/tests/test-mic-recovery.sh
+      - name: Check system-audio recovery
+        if: ${{ !cancelled() }}
+        timeout-minutes: 4
+        run: sh integrations/meeting-workflow/tests/test-system-audio-recovery.sh
+      - name: Check workflow preferences
+        if: ${{ !cancelled() }}
+        timeout-minutes: 4
+        run: sh integrations/meeting-workflow/tests/test-workflow-preferences.sh
+      - name: Check transcription recovery
+        if: ${{ !cancelled() }}
+        timeout-minutes: 4
+        run: sh integrations/meeting-workflow/tests/test-transcription-recovery.sh
+      - name: Check transcription leases
+        if: ${{ !cancelled() }}
+        timeout-minutes: 4
+        run: sh integrations/meeting-workflow/tests/test-transcription-lease.sh
+      - name: Check speaker identification
+        if: ${{ !cancelled() }}
+        timeout-minutes: 4
+        run: sh integrations/meeting-workflow/tests/test-speaker-identification.sh
+      - name: Check recording controls
+        if: ${{ !cancelled() }}
+        timeout-minutes: 4
+        run: sh integrations/meeting-workflow/tests/test-recording-controls.sh
+      - name: Check login items
+        if: ${{ !cancelled() }}
+        timeout-minutes: 4
+        run: sh integrations/meeting-workflow/tests/test-login-items.sh
+      - name: Check single-instance handling
+        if: ${{ !cancelled() }}
+        timeout-minutes: 4
+        run: sh integrations/meeting-workflow/tests/test-run-instance.sh
+      - name: Build release Quill
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        run: sh scripts/swift-local.sh build -c release --product quill

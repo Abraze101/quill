@@ -1,0 +1,22 @@
+{
+  "recordings_root": "~/Recordings",
+  "local_naming": {
+    "enabled": false
+  },
+  "archive": {
+    "enabled": false,
+    "type": "rclone",
+    "remote": "",
+    "folder": "",
+    "drive_folder_id": ""
+  },
+  "notes": {
+    "enabled": false,
+    "command": [],
+    "timeout_seconds": 1200
+  },
+  "publish": {
+    "enabled": false,
+    "command": []
+  }
+}
