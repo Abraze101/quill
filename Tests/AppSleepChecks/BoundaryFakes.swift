@@ -215,7 +215,8 @@ final class SettingsWindowController {
     var onSetupNotes: (() -> Void)?
     var onReviewProcessing: (() -> Void)?
     var onNotesChange: ((Bool) -> Void)?
-    var onDriveChange: ((Bool) -> Void)?
+    var onDriveDocumentsChange: ((Bool) -> Void)?
+    var onDriveRecordingsChange: ((Bool) -> Void)?
     var onLaunchAtLoginChange: ((Bool) -> Void)?
     var onOpenLoginSettings: (() -> Void)?
     var onCheckInHoursChange: ((Int) -> Void)?

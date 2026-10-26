@@ -170,9 +170,15 @@ final class AppController {
                     transcriptionEnabled: Config.transcriptionEnabled())
             }
         }
-        settings.onDriveChange = { [weak self] enabled in
+        settings.onDriveDocumentsChange = { [weak self] enabled in
             self?.savePreference {
-                try WorkflowPreferences.setDrive(enabled, at: Config.workflowSettingsURL(),
+                try WorkflowPreferences.setDriveDocuments(enabled, at: Config.workflowSettingsURL(),
+                    transcriptionEnabled: Config.transcriptionEnabled())
+            }
+        }
+        settings.onDriveRecordingsChange = { [weak self] enabled in
+            self?.savePreference {
+                try WorkflowPreferences.setDriveRecordings(enabled, at: Config.workflowSettingsURL(),
                     transcriptionEnabled: Config.transcriptionEnabled())
             }
         }
@@ -863,7 +869,6 @@ final class AppController {
         state.localTranscription = Config.transcriptionEnabled()
         state.identifySpeakers = Config.speakerIdentificationEnabled()
         state.notesStatus = completionStatus?.notes ?? state.notesStatus
-        state.googleDriveStatus = completionStatus?.drive ?? state.googleDriveStatus
         state.processingTitle = options.processingTitle ?? "No processing status yet"
         state.processingDetail = options.processingDetail
         state.processingNeedsAttention = options.processingNeedsAttention
@@ -871,9 +876,15 @@ final class AppController {
         if let preferences = completionStatus?.preferences {
             state.notesActive = preferences.notesActive
             state.canEnableNotes = preferences.notesConfigured && state.localTranscription
-            state.driveActive = preferences.driveActive
-            state.canEnableDrive = preferences.driveConfigured && preferences.notesConfigured
-                && preferences.notesEnabled && state.localTranscription
+            state.driveDocumentsActive = preferences.driveDocumentsEnabled
+            state.driveRecordingsActive = preferences.driveRecordingsEnabled
+            state.driveDocumentsTitle = preferences.driveDocumentsTitle
+            state.driveRecordingsTitle = preferences.driveRecordingsTitle
+            state.driveDocumentsStatus = preferences.driveDocumentsDescription
+            state.driveRecordingsStatus = preferences.driveRecordingsDescription
+            let canFile = preferences.notesConfigured && preferences.notesEnabled && state.localTranscription
+            state.canEnableDriveDocuments = preferences.driveDocumentsConfigured && canFile
+            state.canEnableDriveRecordings = preferences.driveRecordingsConfigured && canFile
         }
         state.isRecording = phase != .idle
         state.isPaused = phase == .paused

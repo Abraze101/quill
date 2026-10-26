@@ -27,20 +27,23 @@ struct WorkflowPreferences {
 
     var notesActive: Bool { enabled("notes") || enabled("route") }
     var notesEnabled: Bool { enabled("notes") && enabled("route") }
-    var driveActive: Bool { enabled("archive") || enabled("publish") }
-    var driveEnabled: Bool { enabled("archive") && enabled("publish") }
+    var driveDocumentsEnabled: Bool { enabled("publish") }
+    var driveRecordingsEnabled: Bool { enabled("archive") }
+    var driveActive: Bool { driveDocumentsEnabled || driveRecordingsEnabled }
+    var driveDocumentsTitle: String {
+        legacyDriveOutput("publish") ? "Save notes files to Drive" : "Save notes and transcript to Drive"
+    }
+    var driveRecordingsTitle: String {
+        legacyDriveOutput("archive") ? "Upload recordings and transcripts to Drive" : "Upload audio and video to Drive"
+    }
 
     var notesConfigured: Bool {
         Self.command(stage("notes")) && Self.command(stage("route")) && companiesValid
             && Self.boolean(stage("route")["review_required"]) == true
     }
 
-    var driveConfigured: Bool {
-        let archive = stage("archive"), publish = stage("publish")
-        return Self.driveAdapter(archive) && Self.driveAdapter(publish)
-            && (archive["meetings_root_id"] as? String) == (publish["meetings_root_id"] as? String)
-            && companiesValid
-    }
+    var driveDocumentsConfigured: Bool { driveConfigured("publish", other: "archive") }
+    var driveRecordingsConfigured: Bool { driveConfigured("archive", other: "publish") }
 
     var notesDescription: String {
         if !notesConfigured { return "Configure Call Summary, company folders, and folder review before enabling notes." }
@@ -49,14 +52,83 @@ struct WorkflowPreferences {
         return "Call Summary and company folders are configured. Automatic notes are off."
     }
 
-    var driveDescription: String {
-        if !driveConfigured { return "Configure both Drive adapters with the same meeting folder before enabling filing." }
-        if driveEnabled && Self.boolean(stage("route")["auto_file_explicit_companies"]) == true {
-            return "Meetings with an explicit company destination are filed automatically. Unclear destinations wait for your folder choice."
+    var driveDocumentsDescription: String {
+        if !driveDocumentsConfigured {
+            return "Configure the document connection and company folders. Any enabled recording uploads must use the same meeting folder."
         }
-        if driveEnabled { return "Recordings, transcripts, and notes will be filed after you approve their company folder." }
-        if driveActive { return "Drive filing is partly enabled. Switch off, then on to enable recordings and notes." }
-        return "Company folders are configured. Drive filing is off."
+        if !driveDocumentsEnabled { return documentFilingName + " is off." }
+        if !notesEnabled { return documentFilingName + " is enabled, but meeting notes must be turned on first." }
+        if legacyDriveOutput("publish") {
+            return "Saves notes as Markdown and JSON files. " + filingDescription
+        }
+        return "Saves notes and the full transcript in one Google Doc. " + filingDescription
+    }
+
+    var driveRecordingsDescription: String {
+        if !driveRecordingsConfigured {
+            return "Configure the recording connection and company folders. Any enabled document filing must use the same meeting folder."
+        }
+        if !driveRecordingsEnabled { return recordingUploadName + " are off." }
+        if !notesEnabled { return recordingUploadName + " are enabled, but meeting notes must be turned on first." }
+        if legacyDriveOutput("archive") {
+            return "Uploads audio, any recorded video, recording metadata and available transcript files. " + filingDescription
+        }
+        return "Uploads audio and any recorded video. " + filingDescription
+    }
+
+    var driveDescription: String {
+        if (driveDocumentsEnabled && !driveDocumentsConfigured)
+            || (driveRecordingsEnabled && !driveRecordingsConfigured) {
+            return "An enabled Drive connection needs configuration. Review its settings or turn it off."
+        }
+        if driveActive && !notesEnabled { return "Drive filing waits for meeting notes to be enabled." }
+        let documentState = driveDocumentsEnabled ? "on" : "off"
+        let recordingState = driveRecordingsEnabled ? "on" : "off"
+        return documentFilingName + " is " + documentState + ". "
+            + recordingUploadName + " are " + recordingState + "."
+    }
+
+    private var documentFilingName: String {
+        legacyDriveOutput("publish") ? "Notes file filing" : "Notes and transcript document filing"
+    }
+
+    private var recordingUploadName: String {
+        legacyDriveOutput("archive") ? "Recording, transcript and metadata uploads" : "Audio and video uploads"
+    }
+
+    private func legacyDriveOutput(_ key: String) -> Bool {
+        let settings = stage(key)
+        return settings["type"] as? String == "codex_drive" && Self.driveTextFormat(settings) == .legacy
+    }
+
+    private enum DriveTextFormat: String {
+        case legacy
+        case combined = "combined_google_doc_v1"
+        case nativeTemplate = "native_template_google_doc_v1"
+    }
+
+    private static func driveTextFormat(_ settings: [String: Any]) -> DriveTextFormat? {
+        guard let raw = settings["text_format"] else { return .legacy }
+        guard let value = raw as? String else { return nil }
+        return DriveTextFormat(rawValue: value)
+    }
+
+    private var filingDescription: String {
+        if Self.boolean(stage("route")["auto_file_explicit_companies"]) == true {
+            return "Explicit company destinations file automatically; unclear destinations wait for your choice."
+        }
+        return "Filing waits for your company folder choice."
+    }
+
+    private func driveConfigured(_ key: String, other: String) -> Bool {
+        let selected = stage(key)
+        guard Self.driveAdapter(selected), companiesValid else { return false }
+        // An unused connection is optional. If both outputs are enabled, they
+        // must share the validated private meeting folder.
+        guard enabled(other) else { return true }
+        let peer = stage(other)
+        return Self.driveAdapter(peer)
+            && (selected["meetings_root_id"] as? String) == (peer["meetings_root_id"] as? String)
     }
 
     static func setNotes(_ enabled: Bool, at url: URL, transcriptionEnabled: Bool) throws {
@@ -72,15 +144,26 @@ struct WorkflowPreferences {
         try preferences.write(to: url)
     }
 
-    static func setDrive(_ enabled: Bool, at url: URL, transcriptionEnabled: Bool) throws {
+    static func setDriveDocuments(_ enabled: Bool, at url: URL, transcriptionEnabled: Bool) throws {
+        try setDriveOutput(enabled, stage: "publish", at: url, transcriptionEnabled: transcriptionEnabled)
+    }
+
+    static func setDriveRecordings(_ enabled: Bool, at url: URL, transcriptionEnabled: Bool) throws {
+        try setDriveOutput(enabled, stage: "archive", at: url, transcriptionEnabled: transcriptionEnabled)
+    }
+
+    private static func setDriveOutput(_ enabled: Bool, stage: String, at url: URL, transcriptionEnabled: Bool) throws {
         var preferences = try Self(url: url)
         if enabled {
             guard transcriptionEnabled && preferences.notesConfigured && preferences.notesEnabled else {
                 throw PreferenceError("Enable local transcription and meeting notes before turning on Drive filing.")
             }
-            guard preferences.driveConfigured else { throw PreferenceError(preferences.driveDescription) }
+            let documents = stage == "publish"
+            guard documents ? preferences.driveDocumentsConfigured : preferences.driveRecordingsConfigured else {
+                throw PreferenceError(documents ? preferences.driveDocumentsDescription : preferences.driveRecordingsDescription)
+            }
         }
-        preferences.set(enabled, stages: ["archive", "publish"])
+        preferences.set(enabled, stages: [stage])
         try preferences.write(to: url)
     }
 
@@ -121,6 +204,7 @@ struct WorkflowPreferences {
 
     private static func driveAdapter(_ settings: [String: Any]) -> Bool {
         guard settings["type"] as? String == "codex_drive",
+              driveTextFormat(settings) != nil,
               boolean(settings["requires_route"]) == true,
               let root = settings["meetings_root_id"] as? String,
               matches(root, "\\A[A-Za-z0-9_-]{10,200}\\z"),

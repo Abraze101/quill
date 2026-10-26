@@ -148,8 +148,13 @@ Configure the optional stages through their guides:
   notes-only copy. Sharing requires approval of the exact copy and recipients.
 
 **Create notes and suggest a company** requires local transcription and configured
-runners. **Save recordings and notes to Drive** requires notes and routing first.
-Turning notes off also turns Drive filing off; turning notes back on leaves Drive
+runners. Google Drive has two independent controls: **Save notes and transcript to
+Drive** enables document filing, and **Upload audio and video to Drive** enables
+recording uploads. Either can be on by itself; both require notes and routing
+first. Each needs its own configured adapter. When both are enabled, they must
+use the same Meetings root. Changing one control leaves the other unchanged.
+Existing activation choices are preserved when updating Quill.
+Turning notes off also turns both Drive options off; turning notes back on leaves Drive
 off. Enabling a stage affects new jobs and does not release old holds. Disabling
 holds pending/retry work; an already running external operation may finish.
 

@@ -22,7 +22,8 @@ release or a notarized app download. The original MIT license is preserved;
 - Retries unfinished, previously opted-in transcription from either Quill menu,
   without restarting or rewriting completed transcripts.
 - Uses a separate completion worker for optional Codex notes, destination
-  suggestions, Google Drive filing, and retries that reuse reserved file IDs.
+  suggestions, separate Google Drive controls for documents and recordings,
+  and retries that reuse reserved file IDs.
 - Presents a local meeting library for reviewing notes, recordings, folder
   decisions, retries, and deletion of an entire local meeting to Trash.
 - Suggests sharing recipients from calendars. Sharing requires review and an

@@ -37,15 +37,20 @@ struct QuillSettingsState {
     var sessionID: String?
     var recordingRevision: Int?
     var notesStatus = "Not configured. Processing is off."
-    var googleDriveStatus = "Not configured. Uploads are off."
+    var driveDocumentsTitle = "Save notes and transcript to Drive"
+    var driveRecordingsTitle = "Upload audio and video to Drive"
+    var driveDocumentsStatus = "Configure Google Drive to save notes and transcripts."
+    var driveRecordingsStatus = "Configure Google Drive to upload audio and video."
     var processingTitle = "No processing status yet"
     var processingDetail = ""
     var processingNeedsAttention = false
     var processingReviewAvailable = false
     var notesActive = false
     var canEnableNotes = false
-    var driveActive = false
-    var canEnableDrive = false
+    var driveDocumentsActive = false
+    var canEnableDriveDocuments = false
+    var driveRecordingsActive = false
+    var canEnableDriveRecordings = false
     var loginItem = QuillLoginItemState()
     var checkInHours = 2
     var showInDock = true
@@ -66,7 +71,8 @@ final class SettingsWindowController: NSWindowController {
     var onSetupNotes: (() -> Void)?
     var onReviewProcessing: (() -> Void)?
     var onNotesChange: ((Bool) -> Void)?
-    var onDriveChange: ((Bool) -> Void)?
+    var onDriveDocumentsChange: ((Bool) -> Void)?
+    var onDriveRecordingsChange: ((Bool) -> Void)?
     var onLaunchAtLoginChange: ((Bool) -> Void)?
     var onOpenLoginSettings: (() -> Void)?
     var onCheckInHoursChange: ((Int) -> Void)?
@@ -91,9 +97,11 @@ final class SettingsWindowController: NSWindowController {
     private let processingStatus = NSTextField(wrappingLabelWithString: "")
     private let processingDetail = NSTextField(wrappingLabelWithString: "")
     private let processingButton = NSButton(title: "Review processing…", target: nil, action: nil)
-    private let driveStatus = NSTextField(wrappingLabelWithString: "")
+    private let driveDocumentsStatus = NSTextField(wrappingLabelWithString: "")
+    private let driveRecordingsStatus = NSTextField(wrappingLabelWithString: "")
     private let notesSwitch = NSButton(checkboxWithTitle: "Create notes and suggest a company", target: nil, action: nil)
-    private let driveSwitch = NSButton(checkboxWithTitle: "Save recordings and notes to Drive", target: nil, action: nil)
+    private let driveDocumentsSwitch = NSButton(checkboxWithTitle: "Save notes and transcript to Drive", target: nil, action: nil)
+    private let driveRecordingsSwitch = NSButton(checkboxWithTitle: "Upload audio and video to Drive", target: nil, action: nil)
     private let loginSwitch = NSButton(checkboxWithTitle: "Launch at login", target: nil, action: nil)
     private let loginDetail = NSTextField(wrappingLabelWithString: "")
     private let checkInPopup = NSPopUpButton(frame: .zero, pullsDown: false)
@@ -183,11 +191,16 @@ final class SettingsWindowController: NSWindowController {
         processingDetail.stringValue = state.processingDetail
         processingDetail.isHidden = state.processingDetail.isEmpty
         processingButton.isEnabled = state.processingReviewAvailable
-        driveStatus.stringValue = state.googleDriveStatus
+        driveDocumentsStatus.stringValue = state.driveDocumentsStatus
+        driveRecordingsStatus.stringValue = state.driveRecordingsStatus
+        driveDocumentsSwitch.title = state.driveDocumentsTitle
+        driveRecordingsSwitch.title = state.driveRecordingsTitle
         notesSwitch.state = state.notesActive ? .on : .off
         notesSwitch.isEnabled = state.notesActive || state.canEnableNotes
-        driveSwitch.state = state.driveActive ? .on : .off
-        driveSwitch.isEnabled = state.driveActive || state.canEnableDrive
+        driveDocumentsSwitch.state = state.driveDocumentsActive ? .on : .off
+        driveDocumentsSwitch.isEnabled = state.driveDocumentsActive || state.canEnableDriveDocuments
+        driveRecordingsSwitch.state = state.driveRecordingsActive ? .on : .off
+        driveRecordingsSwitch.isEnabled = state.driveRecordingsActive || state.canEnableDriveRecordings
         loginSwitch.state = state.loginItem.requiresApproval ? .mixed : state.loginItem.enabled ? .on : .off
         loginSwitch.isEnabled = state.loginItem.canChange
         loginDetail.stringValue = state.loginItem.detail
@@ -361,11 +374,17 @@ final class SettingsWindowController: NSWindowController {
         let driveButton = NSButton(title: "Configuration…", target: self, action: #selector(driveSetupClicked))
         driveButton.setAccessibilityLabel("Open Google Drive configuration")
         add(row(label: "Google Drive", control: driveButton), to: root)
-        driveSwitch.target = self
-        driveSwitch.action = #selector(driveChanged)
-        add(driveSwitch, to: root)
-        add(detail(driveStatus), to: root)
-        add(detail(NSTextField(wrappingLabelWithString: "Requires meeting notes. Filing keeps notes private; sharing with attendees needs a separate approval.")), to: root)
+        driveDocumentsSwitch.target = self
+        driveDocumentsSwitch.action = #selector(driveDocumentsChanged)
+        driveDocumentsSwitch.setAccessibilityIdentifier("quill-drive-documents")
+        add(driveDocumentsSwitch, to: root)
+        add(detail(driveDocumentsStatus), to: root)
+        driveRecordingsSwitch.target = self
+        driveRecordingsSwitch.action = #selector(driveRecordingsChanged)
+        driveRecordingsSwitch.setAccessibilityIdentifier("quill-drive-recordings")
+        add(driveRecordingsSwitch, to: root)
+        add(detail(driveRecordingsStatus), to: root)
+        add(detail(NSTextField(wrappingLabelWithString: "Both options require meeting notes and a filing category. Files stay private; sharing with attendees needs a separate approval.")), to: root)
         add(detail(NSTextField(wrappingLabelWithString: "Switching on applies to new completed meetings. Work held while off stays on hold. Work already running may finish.")), to: root)
         add(separator(), to: root)
         add(heading("Startup"), to: root)
@@ -463,9 +482,14 @@ final class SettingsWindowController: NSWindowController {
         onNotesChange?(notesSwitch.state == .on)
         update(state)
     }
-    @objc private func driveChanged() {
-        guard state.driveActive || state.canEnableDrive else { return }
-        onDriveChange?(driveSwitch.state == .on)
+    @objc private func driveDocumentsChanged() {
+        guard state.driveDocumentsActive || state.canEnableDriveDocuments else { return }
+        onDriveDocumentsChange?(driveDocumentsSwitch.state == .on)
+        update(state)
+    }
+    @objc private func driveRecordingsChanged() {
+        guard state.driveRecordingsActive || state.canEnableDriveRecordings else { return }
+        onDriveRecordingsChange?(driveRecordingsSwitch.state == .on)
         update(state)
     }
     @objc private func loginChanged() {

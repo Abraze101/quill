@@ -10,7 +10,8 @@ enum WorkflowPreferenceChecks {
         let url = temporary.appendingPathComponent("workflow.json")
         let company: [String: Any] = ["id": "test-company", "name": "Test company", "drive_folder_id": "folder_1234567890"]
         let adapter: [String: Any] = ["type": "codex_drive", "enabled": false, "requires_route": true,
-                                    "meetings_root_id": "root_1234567890", "codex": "/usr/bin/true"]
+                                    "meetings_root_id": "root_1234567890", "codex": "/usr/bin/true",
+                                    "text_format": "combined_google_doc_v1"]
         let original: [String: Any] = [
             "recordings_root": "/not-opened",
             "custom": ["preserve": [1, 2, 3]],
@@ -33,17 +34,183 @@ enum WorkflowPreferenceChecks {
             let after = try Data(contentsOf: url)
             precondition(after == before, "Rejected changes must preserve the file")
         }
+        func setOutput(_ key: String, _ enabled: Bool, transcription: Bool = true) throws {
+            if key == "publish" {
+                try WorkflowPreferences.setDriveDocuments(enabled, at: url, transcriptionEnabled: transcription)
+            } else {
+                try WorkflowPreferences.setDriveRecordings(enabled, at: url, transcriptionEnabled: transcription)
+            }
+        }
+        func configured(documents: Bool, recordings: Bool) -> [String: Any] {
+            var value = original
+            for key in ["notes", "route", "publish", "archive"] {
+                var stage = value[key] as! [String: Any]
+                stage["enabled"] = key == "publish" ? documents : key == "archive" ? recordings : true
+                value[key] = stage
+            }
+            return value
+        }
+
+        // Loading all four combinations preserves their exact choice; each
+        // control changes only its own activation flag in either direction.
+        for documents in [false, true] {
+            for recordings in [false, true] {
+                let combination = configured(documents: documents, recordings: recordings)
+                try write(combination)
+                let beforeRead = try Data(contentsOf: url)
+                let selected = try WorkflowPreferences(url: url)
+                precondition(selected.driveDocumentsEnabled == documents)
+                precondition(selected.driveRecordingsEnabled == recordings)
+                precondition(selected.driveActive == (documents || recordings))
+                precondition(!selected.driveDescription.contains("partly enabled"))
+                let afterRead = try Data(contentsOf: url)
+                precondition(afterRead == beforeRead, "Reading settings must never migrate flags")
+                for key in ["publish", "archive"] {
+                    for desired in [false, true] {
+                        try write(combination)
+                        try setOutput(key, desired)
+                        var expected = combination
+                        var changed = expected[key] as! [String: Any]
+                        changed["enabled"] = desired
+                        expected[key] = changed
+                        let saved = try object()
+                        precondition(NSDictionary(dictionary: saved).isEqual(to: expected),
+                                     "A Drive control changed another choice or adapter field")
+                    }
+                }
+            }
+        }
+
+        // Omitted text_format is the worker's legacy inventory, not the
+        // combined document format. Mixed existing formats remain unchanged.
+        let formats: [String?] = [nil, "legacy", "combined_google_doc_v1", "native_template_google_doc_v1"]
+        for documentFormat in formats {
+            for recordingFormat in formats {
+                var combination = configured(documents: true, recordings: true)
+                for (key, format) in [("publish", documentFormat), ("archive", recordingFormat)] {
+                    var stage = combination[key] as! [String: Any]
+                    stage["text_format"] = format
+                    combination[key] = stage
+                }
+                try write(combination)
+                let beforeRead = try Data(contentsOf: url)
+                var selected = try WorkflowPreferences(url: url)
+                let legacyDocuments = documentFormat == nil || documentFormat == "legacy"
+                let legacyRecordings = recordingFormat == nil || recordingFormat == "legacy"
+                precondition(selected.driveDocumentsConfigured && selected.driveRecordingsConfigured)
+                precondition(selected.driveDocumentsTitle == (legacyDocuments
+                    ? "Save notes files to Drive" : "Save notes and transcript to Drive"))
+                precondition(selected.driveRecordingsTitle == (legacyRecordings
+                    ? "Upload recordings and transcripts to Drive" : "Upload audio and video to Drive"))
+                precondition(selected.driveDocumentsDescription.contains("Markdown and JSON") == legacyDocuments)
+                precondition(selected.driveDocumentsDescription.contains("one Google Doc") == !legacyDocuments)
+                precondition(selected.driveRecordingsDescription.contains("available transcript files") == legacyRecordings)
+                precondition(selected.driveRecordingsDescription.contains("recording metadata") == legacyRecordings)
+                let afterRead = try Data(contentsOf: url)
+                precondition(afterRead == beforeRead, "Rendering legacy labels must not migrate formats or flags")
+                try setOutput("publish", false)
+                selected = try WorkflowPreferences(url: url)
+                precondition(!selected.driveDocumentsEnabled && selected.driveRecordingsEnabled)
+                if legacyRecordings {
+                    precondition(selected.driveDescription.contains("Recording, transcript and metadata uploads are on."))
+                    precondition(!selected.driveDescription.contains("Notes and transcript filing is off"))
+                }
+                try setOutput("publish", true)
+                try setOutput("archive", false)
+                try setOutput("archive", true)
+                let saved = try object()
+                precondition(NSDictionary(dictionary: saved).isEqual(to: combination),
+                             "Toggling legacy connections must not add or change text_format")
+            }
+        }
+        try write([String: Any]())
+        let unconfigured = try WorkflowPreferences(url: url)
+        precondition(unconfigured.driveDocumentsTitle == "Save notes and transcript to Drive")
+        precondition(unconfigured.driveRecordingsTitle == "Upload audio and video to Drive")
+
+        for key in ["publish", "archive"] {
+            let peer = key == "publish" ? "archive" : "publish"
+            for format: Any in [NSNull(), 1, true, "", "unknown", " legacy", ["legacy"], ["name": "legacy"]] {
+                var invalidFormat = configured(documents: false, recordings: false)
+                var stage = invalidFormat[key] as! [String: Any]
+                stage["text_format"] = format
+                invalidFormat[key] = stage
+                try write(invalidFormat)
+                let selected = try WorkflowPreferences(url: url)
+                precondition(key == "publish" ? !selected.driveDocumentsConfigured : !selected.driveRecordingsConfigured)
+                try rejected { try setOutput(key, true) }
+                try setOutput(peer, true)
+                var activeInvalid = try object()
+                stage["enabled"] = true
+                activeInvalid[key] = stage
+                try write(activeInvalid)
+                try setOutput(key, false, transcription: false)
+                let disabled = try object()
+                precondition((disabled[peer] as! [String: Any])["enabled"] as? Bool == true)
+                precondition((disabled[key] as! [String: Any])["enabled"] as? Bool == false)
+            }
+        }
+
+        for key in ["publish", "archive"] {
+            let peer = key == "publish" ? "archive" : "publish"
+            // Missing, unconfigured or differently rooted inactive peers do
+            // not block a separately configured connection.
+            let unusedPeers: [[String: Any]?] = [nil, [:], ["enabled": false, "type": "unconfigured"],
+                                                adapter.merging(["meetings_root_id": "other_root_12345"]) { _, new in new }]
+            for unused in unusedPeers {
+                var value = configured(documents: false, recordings: false)
+                value[peer] = unused
+                try write(value)
+                try setOutput(key, true)
+                let saved = try object()
+                precondition((saved[key] as! [String: Any])["enabled"] as? Bool == true)
+                precondition(NSDictionary(dictionary: saved[peer] as? [String: Any] ?? [:])
+                    .isEqual(to: unused ?? [:]))
+                precondition((saved[peer] == nil) == (unused == nil), "Missing peer must stay missing")
+                try setOutput(key, false)
+            }
+
+            // A currently enabled connection must remain compatible. An
+            // invalid adapter can always be disabled without fixing it first.
+            for other in [adapter.merging(["enabled": true, "meetings_root_id": "other_root_12345"]) { _, new in new },
+                          ["enabled": true, "type": "unconfigured"]] {
+                var value = configured(documents: false, recordings: false)
+                value[peer] = other
+                try write(value)
+                try rejected { try setOutput(key, true) }
+                try setOutput(peer, false, transcription: false)
+                let disabled = try object()
+                var expected = other
+                expected["enabled"] = false
+                precondition(NSDictionary(dictionary: disabled[peer] as! [String: Any]).isEqual(to: expected))
+                try setOutput(key, true)
+            }
+
+            try write(configured(documents: false, recordings: false))
+            try rejected { try setOutput(key, true, transcription: false) }
+            var invalidTarget = configured(documents: true, recordings: true)
+            invalidTarget[key] = ["enabled": true, "type": "unconfigured", "preserve": "yes"]
+            try write(invalidTarget)
+            try setOutput(key, false, transcription: false)
+            let disabled = try object()
+            precondition((disabled[peer] as! [String: Any])["enabled"] as? Bool == true)
+            precondition((disabled[key] as! [String: Any])["preserve"] as? String == "yes")
+            try rejected { try setOutput(key, true) }
+        }
+
         try write(original)
         var preferences = try WorkflowPreferences(url: url)
-        precondition(preferences.notesConfigured && preferences.driveConfigured)
-        try rejected { try WorkflowPreferences.setDrive(true, at: url, transcriptionEnabled: true) }
+        precondition(preferences.notesConfigured && preferences.driveDocumentsConfigured && preferences.driveRecordingsConfigured)
+        try rejected { try WorkflowPreferences.setDriveDocuments(true, at: url, transcriptionEnabled: true) }
+        try rejected { try WorkflowPreferences.setDriveRecordings(true, at: url, transcriptionEnabled: true) }
         try rejected { try WorkflowPreferences.setNotes(true, at: url, transcriptionEnabled: false) }
         try WorkflowPreferences.setNotes(true, at: url, transcriptionEnabled: true)
         preferences = try WorkflowPreferences(url: url)
         precondition(preferences.notesEnabled && !preferences.driveActive)
-        try WorkflowPreferences.setDrive(true, at: url, transcriptionEnabled: true)
+        try WorkflowPreferences.setDriveDocuments(true, at: url, transcriptionEnabled: true)
+        try WorkflowPreferences.setDriveRecordings(true, at: url, transcriptionEnabled: true)
         preferences = try WorkflowPreferences(url: url)
-        precondition(preferences.driveEnabled)
+        precondition(preferences.driveDocumentsEnabled && preferences.driveRecordingsEnabled)
         let enabledObject = try object()
         for key in ["custom", "recordings_root"] {
             precondition(NSDictionary(dictionary: [key: enabledObject[key]!]).isEqual(to: [key: original[key]!]))
@@ -63,10 +230,16 @@ enum WorkflowPreferenceChecks {
         try WorkflowPreferences.setNotes(true, at: url, transcriptionEnabled: true)
         preferences = try WorkflowPreferences(url: url)
         precondition(!preferences.driveActive, "Enabling notes must not enable uploads")
-        try WorkflowPreferences.setDrive(true, at: url, transcriptionEnabled: true)
-        try WorkflowPreferences.setDrive(false, at: url, transcriptionEnabled: true)
+        try WorkflowPreferences.setDriveDocuments(true, at: url, transcriptionEnabled: true)
+        try WorkflowPreferences.setDriveRecordings(true, at: url, transcriptionEnabled: true)
+        try WorkflowPreferences.setDriveDocuments(false, at: url, transcriptionEnabled: true)
         preferences = try WorkflowPreferences(url: url)
         precondition(preferences.notesEnabled, "Turning off Drive must keep notes enabled")
+        precondition(!preferences.driveDocumentsEnabled && preferences.driveRecordingsEnabled,
+                     "Turning off document filing must keep recording uploads enabled")
+        try WorkflowPreferences.setDriveRecordings(false, at: url, transcriptionEnabled: false)
+        preferences = try WorkflowPreferences(url: url)
+        precondition(!preferences.driveActive && preferences.notesEnabled)
 
         // A numeric 1 is not a valid opt-in, even though Foundation bridges it to Bool.
         var invalid = original
@@ -76,7 +249,7 @@ enum WorkflowPreferenceChecks {
         try write(["notes": []])
         try rejected { try WorkflowPreferences.setNotes(false, at: url, transcriptionEnabled: true) }
         try write([1, 2])
-        try rejected { try WorkflowPreferences.setDrive(false, at: url, transcriptionEnabled: true) }
+        try rejected { try WorkflowPreferences.setDriveDocuments(false, at: url, transcriptionEnabled: true) }
         try Data("broken JSON".utf8).write(to: url)
         try rejected { try WorkflowPreferences.setNotes(false, at: url, transcriptionEnabled: true) }
 
@@ -124,9 +297,10 @@ enum WorkflowPreferenceChecks {
             configured["route"] = route
             try write(configured)
             preferences = try WorkflowPreferences(url: url)
-            precondition(preferences.notesConfigured && preferences.driveConfigured)
+            precondition(preferences.notesConfigured && preferences.driveDocumentsConfigured && preferences.driveRecordingsConfigured)
             try WorkflowPreferences.setNotes(true, at: url, transcriptionEnabled: true)
-            try WorkflowPreferences.setDrive(true, at: url, transcriptionEnabled: true)
+            try WorkflowPreferences.setDriveDocuments(true, at: url, transcriptionEnabled: true)
+            try WorkflowPreferences.setDriveRecordings(true, at: url, transcriptionEnabled: true)
             let savedRoute = try object()["route"] as! [String: Any]
             let savedCompanies = savedRoute["companies"] as! [[String: Any]]
             precondition(NSDictionary(dictionary: savedCompanies[0]).isEqual(to: aliasedCompany))
@@ -144,7 +318,7 @@ enum WorkflowPreferenceChecks {
             invalid["route"] = route
             try write(invalid)
             preferences = try WorkflowPreferences(url: url)
-            precondition(!preferences.notesConfigured && !preferences.driveConfigured)
+            precondition(!preferences.notesConfigured && !preferences.driveDocumentsConfigured && !preferences.driveRecordingsConfigured)
             try rejected { try WorkflowPreferences.setNotes(true, at: url, transcriptionEnabled: true) }
         }
         invalid = original
@@ -153,7 +327,8 @@ enum WorkflowPreferenceChecks {
         invalid["publish"] = publish
         try write(invalid)
         try WorkflowPreferences.setNotes(true, at: url, transcriptionEnabled: true)
-        try rejected { try WorkflowPreferences.setDrive(true, at: url, transcriptionEnabled: true) }
+        try WorkflowPreferences.setDriveDocuments(true, at: url, transcriptionEnabled: true)
+        try rejected { try WorkflowPreferences.setDriveRecordings(true, at: url, transcriptionEnabled: true) }
         try write(original)
         let link = temporary.appendingPathComponent("linked.json")
         try fm.createSymbolicLink(at: link, withDestinationURL: url)

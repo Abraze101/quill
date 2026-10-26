@@ -198,6 +198,7 @@ struct RecordingControlChecks {
         settings.update(settingsState)
         expect(!settingsPause.isEnabled && settingsPause.title == "Resuming…", "Settings transitions cannot be repeated")
         legacySettingsChecks()
+        driveSettingsChecks()
         print("Recording controls: session-bound stop/pause/resume, stable controls, countdown, capture failures, saving, review and compact visibility passed.")
     }
 
@@ -245,6 +246,86 @@ struct RecordingControlChecks {
         NSApp.sendAction(action, to: retry.target, from: retry)
         expect(calls == 2, "A later eligible retry must be possible")
         controller.onRetryTranscriptions = nil
+    }
+
+    @MainActor
+    static func driveSettingsChecks() {
+        let controller = SettingsWindowController()
+        let content = controller.window!.contentView!
+        let buttons = allViews(content).compactMap { $0 as? NSButton }
+        let documents = buttons.first { $0.accessibilityIdentifier() == "quill-drive-documents" }!
+        let recordings = buttons.first { $0.accessibilityIdentifier() == "quill-drive-recordings" }!
+        var state = QuillSettingsState()
+        var documentChanges: [Bool] = [], recordingChanges: [Bool] = []
+        controller.onDriveDocumentsChange = { enabled in
+            documentChanges.append(enabled)
+            state.driveDocumentsActive = enabled
+            controller.update(state)
+        }
+        controller.onDriveRecordingsChange = { enabled in
+            recordingChanges.append(enabled)
+            state.driveRecordingsActive = enabled
+            controller.update(state)
+        }
+        controller.update(state)
+        documents.performClick(nil)
+        recordings.performClick(nil)
+        expect(documentChanges.isEmpty && recordingChanges.isEmpty,
+               "Unconfigured Drive controls must not request activation")
+
+        state.canEnableDriveDocuments = true
+        controller.update(state)
+        documents.performClick(nil)
+        expect(documents.state == .on && recordings.state == .off && !recordings.isEnabled,
+               "Document filing must work independently of an unconfigured recording uploader")
+        expect(documentChanges == [true] && recordingChanges.isEmpty,
+               "A document choice must reach only the document callback")
+
+        state.canEnableDriveRecordings = true
+        controller.update(state)
+        recordings.performClick(nil)
+        documents.performClick(nil)
+        expect(documents.state == .off && recordings.state == .on,
+               "Turning off documents must leave recording uploads checked")
+        expect(documentChanges == [true, false] && recordingChanges == [true],
+               "Each checkbox must send only its own explicit choice")
+
+        // A rejected save restores the persisted value without touching its peer.
+        controller.onDriveDocumentsChange = { _ in controller.update(state) }
+        documents.performClick(nil)
+        expect(documents.state == .off && recordings.state == .on,
+               "A rejected document change must not appear saved or change recordings")
+        controller.onDriveRecordingsChange = { _ in controller.update(state) }
+        recordings.performClick(nil)
+        expect(recordings.state == .on, "A rejected recording change must restore the saved checkbox")
+
+        // Even if a configured adapter becomes unavailable, an active choice can
+        // still be switched off. Neither control may trap a user in uploads.
+        state.canEnableDriveDocuments = false
+        state.canEnableDriveRecordings = false
+        state.driveDocumentsActive = true
+        controller.update(state)
+        expect(documents.isEnabled && recordings.isEnabled,
+               "Active upload choices must remain available to switch off")
+        controller.onDriveDocumentsChange = { enabled in
+            documentChanges.append(enabled)
+            state.driveDocumentsActive = enabled
+            controller.update(state)
+        }
+        documents.performClick(nil)
+        expect(documents.state == .off && !documents.isEnabled && recordings.state == .on,
+               "Disabling unavailable document filing must preserve active media uploads")
+        state.driveDocumentsTitle = "Save notes files to Drive"
+        state.driveRecordingsTitle = "Upload recordings and transcripts to Drive"
+        state.driveDocumentsStatus = "Saves separate Markdown and JSON notes files."
+        state.driveRecordingsStatus = "Includes recording metadata and available transcripts."
+        controller.update(state)
+        expect(documents.title == state.driveDocumentsTitle && recordings.title == state.driveRecordingsTitle,
+               "Legacy formats must display their actual upload choices")
+        expect(labels(content).contains(state.driveDocumentsStatus) && labels(content).contains(state.driveRecordingsStatus),
+               "The displayed explanations must retain legacy transcript scope")
+        expect(!controller.window!.isVisible, "Drive control checks must not open the real settings window")
+        print("Independent Drive controls: isolated actions, unavailable adapters and rejected saves passed")
     }
 
     @MainActor

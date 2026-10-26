@@ -7,6 +7,30 @@ its category folders, and a notes format before enabling it. Each job saves its
 settings and approved destination; later configuration changes do not rewrite
 existing decisions.
 
+Settings provides two independent choices:
+
+- **Save notes and transcript to Drive** controls `publish.enabled`.
+- **Upload audio and video to Drive** controls `archive.enabled`.
+
+For notes-only filing, enable the first and leave the second off. Recording-only
+uploads are also supported, but still require local transcription, notes generation
+and routing to establish the destination. Each option validates its own adapter;
+an unused adapter need not be configured. If both are enabled, their Meetings roots
+must match. A conflicting second choice is rejected without changing either setting.
+
+Turning either option off leaves the other and notes generation unchanged. Turning
+notes generation off turns both Drive options off; turning notes back on does not
+enable uploads. Updating the app preserves existing choices. These controls do not
+change saved destinations, release held work, or grant sharing access. Work already
+running may finish, and re-enabling an option applies to new completed meetings.
+
+Older configurations with `text_format: "legacy"` or no format retain their
+existing file selection. Their controls read **Save notes files to Drive**
+(Markdown and JSON notes) and **Upload recordings and transcripts to Drive**
+(audio, recorded video, metadata and available transcript files). The update does
+not convert these jobs or configurations to Google Docs. Each control describes
+its own format, including when the two stages use different supported formats.
+
 ## Native meeting-notes template
 
 The user-selected Google Doc template supplies the fonts, spacing, heading styles, lists and section order. A separate reusable native copy has placeholders for the meeting date, title, identified participants, attachment description, Summary, Decisions, Next steps, Details and the full Transcript. Past-meeting facts, attendee chips, screenshots and Gemini feedback links are removed from that reusable copy. The original reference is unchanged.
