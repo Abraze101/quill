@@ -17,6 +17,8 @@ final class AppController {
     private let recordingControls = RecordingStatusController()
     private let meetingReminder = MeetingReminderController()
     private let recordingHeartbeat = RecordingStatusHeartbeat()
+    private let warningHistory: RecordingWarningHistory
+    private let warningHistoryWindow = RecordingWarningHistoryWindowController()
     private var meetingWatchdog = MeetingRecordingWatchdog()
     private var uncoveredMeeting: String?
     private var safety: RecordingSafety?
@@ -69,8 +71,9 @@ final class AppController {
     private var captureLoading = false
     private var captureDetail: String?
 
-    init(root: URL) {
+    init(root: URL, warningHistory: RecordingWarningHistory = RecordingWarningHistory()) {
         self.root = root
+        self.warningHistory = warningHistory
         menuBar.onToggle = { [weak self] in self?.toggle() }
         menuBar.onStopRecording = { [weak self] id, revision in self?.stopDisplayedRecording(id, revision: revision) }
         menuBar.onPauseRecording = { [weak self] id, revision, paused in
@@ -81,6 +84,8 @@ final class AppController {
         menuBar.onQuit = { [weak self] in self?.shutdown() }
         menuBar.onSettings = { [weak self] in self?.showSettings() }
         menuBar.onShowControls = { [weak self] in self?.showRecordingControls() }
+        menuBar.onWarningHistory = { [weak self] in self?.showWarningHistory() }
+        recordingControls.onWarningHistory = { [weak self] in self?.showWarningHistory() }
         recordingControls.onSettings = { [weak self] in self?.showSettings() }
         recordingControls.onOpenFolder = { [weak self] _ in self?.openReviewFolder() }
         recordingControls.onStop = { [weak self] id, revision in self?.stopDisplayedRecording(id, revision: revision) }
@@ -290,6 +295,17 @@ final class AppController {
     func showRecordingControls() {
         refreshUI()
         recordingControls.show()
+    }
+
+    private func showWarningHistory() {
+        warningHistoryWindow.show(entries: warningHistory.entries, storageIssue: warningHistory.storageIssue)
+    }
+
+    private func rememberWarnings(source: RecordingWarningHistory.Source, contextID: String?,
+                                  warnings: [RecordingWarningHistory.Warning]) {
+        if warningHistory.observe(source: source, contextID: contextID, warnings: warnings) {
+            warningHistoryWindow.update(entries: warningHistory.entries, storageIssue: warningHistory.storageIssue)
+        }
     }
 
     private func toggle() {
@@ -787,6 +803,9 @@ final class AppController {
             : completionRecovery.exhausted ? "Processing needs attention" : "Restarting meeting processing"
         options.processingDetail = completionLaunchIssue ?? completionStatus?.processingDetail ?? ""
         options.processingNeedsAttention = completionLaunchIssue != nil || completionStatus?.needsAttention == true
+        rememberWarnings(source: .processing, contextID: "processing", warnings: options.processingNeedsAttention
+            ? [.init(id: "processing-attention", title: options.processingTitle ?? "Processing needs attention",
+                     detail: options.processingDetail)] : [])
         options.recordAutomatically = Config.meetingAutomationEnabled()
         options.includeScreenVideo = phase == .idle ? Config.screenVideoEnabled() : requestedScreenVideo
         options.recordingActionTitle = options.includeScreenVideo ? "Start audio + screen" : "Start audio recording"
@@ -1100,6 +1119,7 @@ final class AppController {
             meetingWatchdog.reset()
             uncoveredMeeting = nil
             meetingReminder.update(meetingID: nil)
+            rememberWarnings(source: .meetingReminder, contextID: nil, warnings: [])
             recordingHeartbeat.invalidate()
             return
         }
@@ -1145,6 +1165,8 @@ final class AppController {
         }
         meetingReminder.update(meetingID: warning?.meetingID,
             canStart: phase == .idle && !hasUnfinishedReview, canSkip: phase == .idle, detail: detail)
+        rememberWarnings(source: .meetingReminder, contextID: warning?.meetingID, warnings: warning == nil
+            ? [] : [.init(id: "meeting-not-recording", title: "Meeting is not recording", detail: detail)])
         if warning?.notify == true {
             notifyUser(title: "Quill — meeting is not recording", body: detail)
         }
@@ -1266,6 +1288,22 @@ final class AppController {
             actionRevision: safety == nil ? (pendingStartID == nil ? nil : 1) : recordingActionRevision, countdownSeconds: countdownSeconds, pendingReviews: localReviews.count,
             stopEnabled: stopEnabled, processEnabled: processEnabled, captureNeedsAttention: captureNeedsAttention,
             keepLocalEnabled: true, pauseEnabled: canChangePause)
+        var warnings: [RecordingWarningHistory.Warning] = []
+        let observingCapture = phase != .idle
+        if observingCapture && (snapshot.captureNeedsAttention || snapshot.phase == .attention) {
+            let tracks = "Microphone: \(microphoneStatus). System audio: \(systemAudioStatus). Screen video: \(videoStatus)."
+            warnings.append(.init(id: "capture-attention", title: snapshot.heading,
+                detail: [detail, tracks].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: "\n")))
+        }
+        if observingCapture && countdownSeconds != nil {
+            warnings.append(.init(id: "recording-check-in", title: "Recording check-in",
+                detail: "Choose Continue for 1 hour or Stop & save. Quill stops and saves when the five-minute check-in expires."))
+        }
+        if !observingCapture, let screenError {
+            warnings.append(.init(id: "capture-error", title: "Recording needs attention", detail: screenError))
+        }
+        let historyContext = observingCapture ? controlSessionID : screenError == nil ? nil : "idle-capture-error"
+        rememberWarnings(source: .recording, contextID: historyContext, warnings: warnings)
         recordingControls.update(snapshot)
         menuBar.updateStatus(snapshot)
     }

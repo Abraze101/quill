@@ -12,6 +12,7 @@ enum Fixture {
     static var startGate = Gate(open: true)
     static var stopGate = Gate(open: true)
     static var screenEnabled = false
+    static var captureCatalogUnavailable = false
     static var automationEnabled = true
     static var screenPauseGate = Gate(open: true)
     static var screenResumeGate = Gate(open: true)
@@ -39,7 +40,7 @@ enum Fixture {
         center = NotificationCenter()
         startGate = Gate(open: true)
         stopGate = Gate(open: true)
-        screenEnabled = false; automationEnabled = true
+        screenEnabled = false; captureCatalogUnavailable = false; automationEnabled = true
         screenPauseGate = Gate(open: true); screenResumeGate = Gate(open: true)
         screenRecorders = []
         micStarts = 0; micStops = 0; systemStarts = 0; systemStops = 0
@@ -192,6 +193,7 @@ final class MenuBarController {
     var onSettings: (() -> Void)?
     var onReviewMeetings: (() -> Void)?
     var onShowControls: (() -> Void)?
+    var onWarningHistory: (() -> Void)?
     var onStopRecording: ((String, Int?) -> Void)?
     var onPauseRecording: ((String, Int, Bool) -> Void)?
     func update(recording: Bool, elapsed: String?) {}
@@ -235,10 +237,17 @@ final class RecordingStatusController {
     var onProcess: ((String) -> Void)?
     var onOpenFolder: ((String) -> Void)?
     var onSettings: (() -> Void)?
+    var onWarningHistory: (() -> Void)?
     var snapshot = RecordingStatusSnapshot()
     var shown = 0
     func update(_ snapshot: RecordingStatusSnapshot) { self.snapshot = snapshot }
     func show() { shown += 1 }
+}
+
+@MainActor
+final class RecordingWarningHistoryWindowController {
+    func show(entries: [RecordingWarningHistory.Entry], storageIssue: String?) {}
+    func update(entries: [RecordingWarningHistory.Entry], storageIssue: String?) {}
 }
 
 /// In-memory boundary only: the production coordinator may update reminders,
@@ -410,6 +419,10 @@ enum ScreenVideoError: Error { case cancelled, targetUnavailable }
 @MainActor
 enum ScreenCaptureCatalog {
     static func availableChoices(requestPermission: Bool = false) async throws -> [ScreenCaptureChoice] {
+        if Fixture.captureCatalogUnavailable {
+            throw NSError(domain: "QuillCaptureFixture", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "The selected display is unavailable."])
+        }
         precondition(Fixture.screenEnabled, "Unexpected screen capture discovery")
         return [ScreenCaptureChoice(target: .display(id: 1), title: "Synthetic display",
             bounds: ScreenCaptureBounds(left: 0, top: 0, width: 640, height: 480))]

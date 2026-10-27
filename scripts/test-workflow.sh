@@ -19,6 +19,7 @@ sh integrations/meeting-workflow/tests/test-transcription-recovery.sh
 sh integrations/meeting-workflow/tests/test-transcription-lease.sh
 sh integrations/meeting-workflow/tests/test-speaker-identification.sh
 sh integrations/meeting-workflow/tests/test-recording-controls.sh
+sh integrations/meeting-workflow/tests/test-warning-history.sh
 sh integrations/meeting-workflow/tests/test-login-items.sh
 sh integrations/meeting-workflow/tests/test-run-instance.sh
 sh scripts/swift-local.sh build -c release --product quill

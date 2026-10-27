@@ -17,6 +17,8 @@ release or a notarized app download. The original MIT license is preserved;
   is crowded.
 - Warns when a joined meeting is not recording. The browser extension can also
   warn when the app or its connection is unavailable.
+- Keeps recent native recording and processing warnings in a local history,
+  so brief messages can be read after they disappear.
 - Transcribes on-device and optionally separates speakers. Names require clear
   spoken introductions; uncertain voices keep anonymous labels.
 - Retries unfinished, previously opted-in transcription from either Quill menu,

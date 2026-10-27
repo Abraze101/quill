@@ -14,7 +14,8 @@ extension AppController {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("quill-app-sleep-\(UUID())")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         Fixture.reset(root: root)
-        let app = AppController(root: root)
+        let app = AppController(root: root,
+            warningHistory: RecordingWarningHistory(path: root.appendingPathComponent("warnings.json")))
         defer {
             app.ticker?.invalidate()
             app.sleepController?.stopObserving()
@@ -547,10 +548,15 @@ extension AppController {
             precondition(app.meetingReminder.canStart && app.meetingReminder.canSkip)
             precondition(app.recordingHeartbeat.latest?.phase == "idle")
             precondition(Fixture.notices.filter { $0.contains("meeting is not recording") }.count == 1)
+            let initialWarnings = app.warningHistory.entries.filter { $0.source == .meetingReminder }
+            precondition(initialWarnings.count == 1 && initialWarnings[0].event == .appeared,
+                         "Visible missed-meeting reminder was not retained in history")
             app.refreshUI()
             app.refreshUI()
             precondition(Fixture.notices.filter { $0.contains("meeting is not recording") }.count == 1,
                          "Persistent reminder repeated its notification")
+            precondition(app.warningHistory.entries.filter { $0.source == .meetingReminder }.count == 1,
+                         "Repeated reminder ticks flooded warning history")
             Fixture.startGate = Gate(open: false)
             app.meetingReminder.onStart?("idle-call")
             precondition(app.phase == .starting && app.recordingHeartbeat.latest?.phase == "starting")
@@ -656,6 +662,8 @@ extension AppController {
 private struct AppSleepChecks {
     @MainActor
     static func main() async throws {
+        try await AppController.warningHistoryDoesNotControlCapture()
+        try await AppController.warningHistoryIncludesFailedStartup()
         try await AppController.crashCheckpointAndRestartReview()
         try await AppController.crashCheckpointFailureStopsCapture()
         try await AppController.crashBoundaryCheckpointFailureStopsCapture()
@@ -686,7 +694,62 @@ private struct AppSleepChecks {
         try await AppController.failedAutomaticStartCanBeManuallyStartedAfterAutomationDisabled()
         try await AppController.transcriptionRetryRequestGuards()
         try await AppController.transcriptionRetrySuppressesLateAlerts()
-        print("App sleep/recovery/pause/reminder/retry integration checks passed (31 production-coordinator scenarios; no devices, UI, user configuration, or external processing).")
+        print("App sleep/recovery/pause/reminder/retry/warning integration checks passed (33 production-coordinator scenarios; no devices, UI, user configuration, or external processing).")
+    }
+}
+
+extension AppController {
+    static func warningHistoryIncludesFailedStartup() async throws {
+        try await withFixture { app in
+            Fixture.screenEnabled = true
+            Fixture.captureCatalogUnavailable = true
+            app.requestStart()
+            try await waitFor { app.phase == .idle && app.screenError != nil }
+            let warning = app.warningHistory.entries.last!
+            precondition(warning.event == .appeared && warning.warningID == "capture-error")
+            precondition(warning.detail == "The selected display is unavailable.")
+            for _ in 0..<150 { app.refreshUI() }
+            precondition(app.warningHistory.entries.count == 1 && Fixture.micStarts == 0 && Fixture.systemStarts == 0)
+            Fixture.captureCatalogUnavailable = false
+            Fixture.screenEnabled = false
+            app.requestStart()
+            try await waitFor { app.phase == .recording }
+            precondition(app.warningHistory.entries.last?.event == .observationEnded,
+                         "A later start must end the idle-error observation without inventing a recovery")
+            app.requestStop(manually: true)
+            try await waitFor { app.phase == .idle }
+        }
+    }
+
+    static func warningHistoryDoesNotControlCapture() async throws {
+        try await withFixture { app in
+            app.requestStart()
+            try await waitFor { app.phase == .recording }
+            let ownedSession = app.session!
+            ownedSession.onMicStatusChange?(.recovering(attempt: 1))
+            let appeared = app.warningHistory.entries.last!
+            precondition(appeared.source == .recording && appeared.event == .appeared)
+            precondition(appeared.detail.contains("Microphone interrupted"))
+            let count = app.warningHistory.entries.count
+            for _ in 0..<150 { app.refreshUI() }
+            precondition(app.warningHistory.entries.count == count, "Timer updates repeated a capture warning")
+            precondition(app.phase == .recording && app.session === ownedSession && Fixture.micStops == 0,
+                         "History observation interrupted capture")
+            ownedSession.onMicStatusChange?(.recording)
+            precondition(app.warningHistory.entries.last?.event == .noLongerShown,
+                         "A transient warning disappeared without a history entry")
+            let system = Fixture.systemRecorders.last!
+            system.emit(.recovering(attempt: 1))
+            system.emit(.recording)
+            precondition(app.warningHistory.entries.last?.event == .changed,
+                         "Resumed system audio falsely cleared its required review warning")
+            precondition(app.warningHistory.entries.last!.detail.contains("System audio was interrupted"))
+            app.requestStop(manually: true)
+            try await waitFor { app.phase == .idle }
+            precondition(app.warningHistory.entries.last(where: { $0.source == .recording })?.event == .observationEnded,
+                         "Stopping must end observation, not claim capture recovered")
+            try app.assertSystemHeld(ownedSession.dir, finished: true)
+        }
     }
 }
 
@@ -786,7 +849,8 @@ extension AppController {
             app.captureLease = nil
             app.session = nil
             Fixture.reset(root: app.root)
-            let reopened = AppController(root: app.root)
+            let reopened = AppController(root: app.root,
+                warningHistory: RecordingWarningHistory(path: app.root.appendingPathComponent("warnings.json")))
             defer { reopened.ticker?.invalidate(); reopened.sleepController?.stopObserving() }
             let review = try RecordingReviewGate.read(session: dir)!
             precondition(review.sessionID == id && review.phase == .finished && review.reviewStatus == .pending)

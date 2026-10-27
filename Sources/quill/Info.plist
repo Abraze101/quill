@@ -7,9 +7,9 @@
     <key>CFBundleName</key>
     <string>quill</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.4</string>
+    <string>0.1.5</string>
     <key>CFBundleVersion</key>
-    <string>6</string>
+    <string>7</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>Quill records your microphone and saves audio on this Mac. Optional connections can upload recordings after you enable them.</string>
     <key>NSScreenCaptureUsageDescription</key>

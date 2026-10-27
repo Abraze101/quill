@@ -6,7 +6,7 @@ struct RecordingStatusSnapshot: Equatable {
     enum Phase: Equatable { case idle, starting, recording, pausing, paused, resuming, stopping, attention, review }
     let phase: Phase
     let sessionID: String?
-    let elapsed: String
+    private(set) var elapsed: String
     let microphoneStatus: String
     let systemAudioStatus: String
     let videoStatus: String
@@ -59,6 +59,14 @@ struct RecordingStatusSnapshot: Equatable {
             && sessionID != nil && actionRevision != nil
     }
 
+    /// The clock changes each second; its text does not change the controls,
+    /// warning presentation, or the session identity bound to an action.
+    func hasSameControls(as other: Self) -> Bool {
+        var comparison = self
+        comparison.elapsed = other.elapsed
+        return comparison == other
+    }
+
     var heading: String {
         switch phase {
         case .idle: "Ready to record"
@@ -87,6 +95,7 @@ final class RecordingStatusController: NSObject, NSWindowDelegate {
     var onProcess: ((String) -> Void)?
     var onOpenFolder: ((String) -> Void)?
     var onSettings: (() -> Void)?
+    var onWarningHistory: (() -> Void)?
 
     private let panel: RecordingControlPanel
     private let root = NSStackView()
@@ -169,14 +178,18 @@ final class RecordingStatusController: NSObject, NSWindowDelegate {
             compact = false
         }
         if next.phase == .idle && old.phase != .idle { manuallyShown = false }
-        render()
+        if next != old {
+            if next.hasSameControls(as: old) { renderElapsed() }
+            else { render() }
+        }
         if next.needsPersistentControl || manuallyShown {
             // Order without activation: another app keeps its keyboard focus.
             if displayUpdates && (!panel.isVisible || !old.needsPersistentControl) { panel.orderFrontRegardless() }
-        } else {
+        } else if panel.isVisible {
             panel.orderOut(nil)
         }
-        if displayUpdates { updateDockBadge() }
+        if displayUpdates && (next.phase != old.phase || next.needsAttention != old.needsAttention
+            || next.pendingReviews != old.pendingReviews) { updateDockBadge() }
     }
 
     func show() {
@@ -300,11 +313,19 @@ final class RecordingStatusController: NSObject, NSWindowDelegate {
         let settingsButton = RecordingActionButton(title: "Recording safeguards…")
         settingsButton.controlSize = .small
         settingsButton.onClick = { [weak self] in self?.onSettings?() }
+        let historyButton = RecordingActionButton(title: "Recent warnings…")
+        historyButton.controlSize = .small
+        historyButton.setAccessibilityIdentifier("quill-status-warning-history")
+        historyButton.onClick = { [weak self] in self?.onWarningHistory?() }
+        let history = NSStackView(views: [historyButton, spacer()])
+        history.orientation = .horizontal
+        history.alignment = .centerY
+        add(history, to: expanded)
         dismissButton.controlSize = .small
         dismissButton.onClick = { [weak self] in
             guard let self, !self.snapshot.needsPersistentControl else { return }
             self.manuallyShown = false
-            self.panel.orderOut(nil)
+            if self.panel.isVisible { self.panel.orderOut(nil) }
         }
         let footer = NSStackView(views: [settingsButton, spacer(), dismissButton])
         footer.orientation = .horizontal
@@ -326,8 +347,7 @@ final class RecordingStatusController: NSObject, NSWindowDelegate {
             : paused ? "pause.circle.fill" : snapshot.phase == .review ? "checkmark.circle.fill" : "record.circle.fill", accessibilityDescription: nil)
         marker.contentTintColor = snapshot.needsAttention || paused || changingPause ? .systemOrange : active ? .systemRed : .secondaryLabelColor
         elapsed.isHidden = snapshot.phase == .idle || snapshot.phase == .review
-        elapsed.stringValue = snapshot.elapsed
-        compactElapsed.stringValue = snapshot.elapsed
+        renderElapsed()
         expanded.isHidden = isCompact
         compactElapsed.isHidden = !isCompact
         compactStopButton.isHidden = !isCompact
@@ -394,6 +414,13 @@ final class RecordingStatusController: NSObject, NSWindowDelegate {
         processButton.onClick = { [weak self] in if let sessionID { self?.onProcess?(sessionID) } }
         openFolderButton.onClick = { [weak self] in if let sessionID { self?.onOpenFolder?(sessionID) } }
         resizeToContent(compact: isCompact)
+    }
+
+    private func renderElapsed() {
+        // Do not reset tooltips, symbols, button actions, or the panel frame
+        // while the user is reading or interacting with an unchanged control.
+        if elapsed.stringValue != snapshot.elapsed { elapsed.stringValue = snapshot.elapsed }
+        if compactElapsed.stringValue != snapshot.elapsed { compactElapsed.stringValue = snapshot.elapsed }
     }
 
     private func updateDockBadge() {

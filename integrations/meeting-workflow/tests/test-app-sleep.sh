@@ -37,6 +37,7 @@ xcrun swiftc -swift-version 6 -parse-as-library -target "$(uname -m)-apple-macos
   -Xlinker -rpath -Xlinker "$test_directory" \
   Sources/quill/RecordingSession.swift Sources/quill/RecordingCrashRecovery.swift Sources/quill/RecordingCaptureTimeline.swift Sources/quill/RecordingSleepController.swift \
   Sources/quill/RecordingSafetyClock.swift Sources/quill/Audio/MicCaptureState.swift \
+  Sources/quill/RecordingWarningHistory.swift \
   Sources/quill/Audio/SystemAudioCaptureState.swift \
   Sources/quill/WorkflowPreferences.swift Sources/quill/CompletionUIStatus.swift \
   "$test_directory/DisplayModels.swift" Tests/AppSleepChecks/BoundaryFakes.swift \

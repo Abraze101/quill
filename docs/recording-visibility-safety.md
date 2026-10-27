@@ -9,6 +9,29 @@ macOS can hide menu-bar items when space runs out. Quill's floating control give
 access independently of the feather; **Show Quill in Dock** is an optional Settings
 preference. There is no reserved menu-bar slot. See [Apple's status-item documentation](https://developer.apple.com/documentation/appkit/nsstatusitem/isvisible).
 
+## Recent warnings
+
+Open **Recent warnings…** from the feather menu or expanded recording controls
+to read native capture warnings, recording check-ins, missed-meeting reminders,
+and processing problems. Each entry shows when a warning appeared, changed, or
+stopped being shown. Ending a session is recorded separately; it is not evidence
+that an audio problem recovered.
+
+The last 200 changes are saved privately on this Mac in
+`~/.local/state/quill/warning-history/history.json`. Repeated timer updates do not add
+entries. History survives an app restart, but old entries are not presented as
+current capture status. It starts with this version and cannot reconstruct
+earlier flashes. Browser-only banners and macOS notifications are not included.
+History is diagnostic only: it does not control recording, clear review holds,
+or upload anything. If saving history fails, entries remain visible for the
+current run and the history window explains the storage problem.
+
+During steady recording, the floating timer updates only its elapsed text.
+Unchanged controls, symbols, tooltips, and layout are retained; an unchanged
+hidden reminder does not repeatedly issue window-hide operations. Actual
+warnings still appear immediately. These changes remove redundant redraw work;
+the original intermittent flash still needs confirmation during ordinary use.
+
 ## Meeting not recording reminder
 
 Fresh joined-call evidence without recording shows a floating **Meeting is not

@@ -60,6 +60,7 @@ final class MenuBarController {
     var onReviewMeetings: (() -> Void)?
     var onRetryTranscriptions: (() -> Void)?
     var onShowControls: (() -> Void)?
+    var onWarningHistory: (() -> Void)?
     var onStopRecording: ((String, Int?) -> Void)?
     var onPauseRecording: ((String, Int, Bool) -> Void)?
 
@@ -85,6 +86,8 @@ final class MenuBarController {
 
         let showControls = NSMenuItem(title: "Show recording controls", action: #selector(showControlsClicked), keyEquivalent: "")
         menu.addItem(showControls)
+        let warningHistory = NSMenuItem(title: "Recent warnings…", action: #selector(warningHistoryClicked), keyEquivalent: "")
+        menu.addItem(warningHistory)
         menu.addItem(.separator())
 
         automaticItem = NSMenuItem(
@@ -162,7 +165,7 @@ final class MenuBarController {
         )
         menu.addItem(quit)
 
-        for item in [processingItem, showControls, automaticItem, screenVideoItem, toggleItem, pauseItem, skipItem, retryItem, openFolder, reviewItem, transcriptionRetryItem, settings, about, quit] {
+        for item in [processingItem, showControls, warningHistory, automaticItem, screenVideoItem, toggleItem, pauseItem, skipItem, retryItem, openFolder, reviewItem, transcriptionRetryItem, settings, about, quit] {
             item.target = self
         }
 
@@ -323,6 +326,7 @@ final class MenuBarController {
         onRetryMeeting?(meeting)
     }
     @objc private func settingsClicked() { onSettings?() }
+    @objc private func warningHistoryClicked() { onWarningHistory?() }
     @objc private func aboutClicked() {
         NSApp.orderFrontStandardAboutPanel(nil)
         NSApp.activate(ignoringOtherApps: true)

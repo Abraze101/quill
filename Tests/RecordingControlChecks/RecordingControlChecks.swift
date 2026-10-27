@@ -9,6 +9,7 @@ struct RecordingControlChecks {
         checkMeetingReminder()
         checkRecordingHeartbeat()
         checkTranscriptionRetryMenu()
+        checkWarningHistoryMenu()
         let suiteName = "com.digimata.quill.control-tests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -33,6 +34,14 @@ struct RecordingControlChecks {
         render(content, name: "recording")
         expect(!panel.isVisible, "Offscreen checks must not reveal a panel")
         expect(stop.isEnabled && !stop.isHiddenOrHasHiddenAncestor, "Recording needs a visible Stop")
+        checkStableRecordingClock(control, panel: panel, content: content)
+        control.update(initial)
+        var historyRequests = 0
+        control.onWarningHistory = { historyRequests += 1 }
+        let history = button("quill-status-warning-history", in: content)
+        expect(!history.isHiddenOrHasHiddenAncestor, "Expanded controls must expose recent warnings")
+        history.performClick(nil)
+        expect(historyRequests == 1 && stopped.isEmpty, "Warning history must not change capture")
         let firstStop = stop.onClick
         control.update(.init(phase: .recording, sessionID: "second", elapsed: "00:00:03", actionRevision: 5, stopEnabled: true))
         firstStop?()
@@ -199,7 +208,82 @@ struct RecordingControlChecks {
         expect(!settingsPause.isEnabled && settingsPause.title == "Resuming…", "Settings transitions cannot be repeated")
         legacySettingsChecks()
         driveSettingsChecks()
-        print("Recording controls: session-bound stop/pause/resume, stable controls, countdown, capture failures, saving, review and compact visibility passed.")
+        print("Recording controls: session-bound stop/pause/resume, stable timer rendering, warning history, countdown, capture failures, saving, review and compact visibility passed.")
+    }
+
+    @MainActor
+    static func checkStableRecordingClock(_ controller: RecordingStatusController, panel: NSWindow, content: NSView) {
+        func state(_ elapsed: String, revision: Int = 20, attention: Bool = false) -> RecordingStatusSnapshot {
+            .init(phase: .recording, sessionID: "clock-test", elapsed: elapsed,
+                microphoneStatus: "Recording", systemAudioStatus: "Recording", videoStatus: "Entire display",
+                detail: attention ? "Meeting detection is unavailable. Recording continues." : nil,
+                actionRevision: revision, stopEnabled: true, captureNeedsAttention: attention, pauseEnabled: true)
+        }
+        controller.update(state("00:04:00"))
+        let stop = button("quill-status-stop", in: content)
+        let pause = button("quill-status-pause", in: content)
+        let collapse = allViews(content).compactMap { $0 as? RecordingActionButton }
+            .first { $0.accessibilityLabel() == "Collapse recording controls" }!
+        let marker = allViews(content).compactMap { $0 as? NSImageView }.first!
+        let originalStop = stop.onClick
+        var preservedActionCalls = 0
+        // A sentinel catches action rebinding, which object-identity checks
+        // alone miss when a timer update rewrites an existing button.
+        stop.onClick = { preservedActionCalls += 1 }
+        let originalTooltip = pause.toolTip
+        pause.toolTip = "Unchanged hover target"
+        let pauseImage = pause.image, collapseImage = collapse.image, markerImage = marker.image
+        let frame = panel.frame
+        for seconds in 1...30 {
+            let next = state(String(format: "00:04:%02d", seconds))
+            controller.update(next)
+            controller.update(next)
+            expect(panel.frame == frame, "Timer-only and duplicate updates must preserve the panel frame")
+            expect(pause.image === pauseImage && collapse.image === collapseImage && marker.image === markerImage,
+                "Timer-only updates must not replace symbol images")
+            expect(pause.toolTip == "Unchanged hover target", "Timer-only updates must not reset a hovered tooltip")
+        }
+        stop.performClick(nil)
+        expect(preservedActionCalls == 1, "Timer-only updates must preserve existing action bindings")
+        expect(labels(content).contains("00:04:30"), "The visible timer must keep advancing")
+        pause.toolTip = originalTooltip
+        stop.onClick = originalStop
+        collapse.performClick(nil)
+        controller.update(state("00:04:31", attention: true))
+        expect(labels(content).contains("Recording · Needs attention")
+            && labels(content).contains("Meeting detection is unavailable. Recording continues."),
+            "A real warning must expand and render immediately despite the timer fast path")
+        controller.update(state("00:04:32", revision: 21))
+        expect(labels(content).contains("Recording") && !labels(content).contains("Recording · Needs attention"),
+            "Warning recovery and action revisions must update immediately")
+        expect(pause.isEnabled && stop.isEnabled && !panel.isVisible,
+            "Clock checks must preserve functional controls without displaying a window")
+    }
+
+    @MainActor
+    static func checkWarningHistoryMenu() {
+        let menu = NSMenu()
+        let controller = MenuBarController(menu: menu)
+        guard let history = menu.item(withTitle: "Recent warnings…"), let action = history.action,
+              let controls = menu.item(withTitle: "Show recording controls") else {
+            fatalError("Warning history menu missing")
+        }
+        expect(history.isEnabled && history.keyEquivalent.isEmpty,
+            "Recent warnings should be available without a capture shortcut")
+        expect(menu.index(of: history) == menu.index(of: controls) + 1,
+            "Warning history belongs beside recording controls")
+        var historyRequests = 0, captureRequests = 0
+        controller.onWarningHistory = { historyRequests += 1 }
+        controller.onToggle = { captureRequests += 1 }
+        controller.onStopRecording = { _, _ in captureRequests += 1 }
+        controller.onPauseRecording = { _, _, _ in captureRequests += 1 }
+        NSApp.sendAction(action, to: history.target, from: history)
+        controller.updateStatus(.init(phase: .recording, sessionID: "menu-history", elapsed: "00:10:00",
+            actionRevision: 1, stopEnabled: true, pauseEnabled: true))
+        expect(history.isEnabled, "Reading warning history must remain available during recording")
+        NSApp.sendAction(action, to: history.target, from: history)
+        expect(historyRequests == 2 && captureRequests == 0,
+            "Warning history must open without toggling, stopping, or pausing capture")
     }
 
     @MainActor
@@ -472,6 +556,19 @@ struct RecordingControlChecks {
             detail: "You are in a meeting, but Quill has not started recording. Start it now, or skip this meeting.")
         expect(!panel.isVisible && start.title == "Start recording", "Reminder checks cannot open a real warning")
         expect(labels(content).contains("Meeting is not recording"), "Reminder needs an explicit missing-recording heading")
+        let originalStart = start.onClick
+        var unchangedCalls = 0
+        start.onClick = { unchangedCalls += 1 }
+        let frame = panel.frame
+        for _ in 0..<30 {
+            reminder.update(meetingID: "first", canStart: true,
+                detail: "You are in a meeting, but Quill has not started recording. Start it now, or skip this meeting.")
+        }
+        start.performClick(nil)
+        expect(unchangedCalls == 1 && panel.frame == frame,
+            "An unchanged reminder must not rebind controls or repeatedly reposition its window")
+        start.onClick = originalStart
+        expect(panel.animationBehavior == .none, "Reminders should not animate repeated presentation changes")
         let oldStart = start.onClick, oldSkip = skip.onClick
         reminder.update(meetingID: "second", canStart: false, canSkip: false,
             detail: "Quill has not finished starting. Check its recording controls and any permission request.")

@@ -11,7 +11,13 @@ final class MeetingReminderController {
     private let start = RecordingActionButton(title: "Start recording")
     private let skip = RecordingActionButton(title: "Skip this meeting")
     private let displayUpdates: Bool
-    private var displayedMeeting: String?
+    private struct Presentation: Equatable {
+        let meetingID: String
+        let canStart: Bool
+        let canSkip: Bool
+        let detail: String
+    }
+    private var presentation: Presentation?
 
     init(displayUpdates: Bool = true) {
         self.displayUpdates = displayUpdates
@@ -30,6 +36,7 @@ final class MeetingReminderController {
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
+        panel.animationBehavior = .none
         let material = NSVisualEffectView()
         material.material = .hudWindow
         material.state = .active
@@ -65,25 +72,32 @@ final class MeetingReminderController {
 
     func update(meetingID: String?, canStart: Bool = false, canSkip: Bool = true, detail text: String = "") {
         guard let meetingID else {
-            displayedMeeting = nil
-            start.onClick = nil
-            skip.onClick = nil
-            panel.orderOut(nil)
+            if presentation != nil {
+                presentation = nil
+                start.onClick = nil
+                skip.onClick = nil
+            }
+            if panel.isVisible { panel.orderOut(nil) }
             return
         }
-        let firstPresentation = displayedMeeting != meetingID
-        displayedMeeting = meetingID
-        detail.stringValue = text
-        start.title = canStart ? "Start recording" : "Check recording…"
-        skip.isEnabled = canSkip
-        start.onClick = { [weak self] in self?.onStart?(meetingID) }
-        skip.onClick = { [weak self] in if canSkip { self?.onSkip?(meetingID) } }
-        if let stack = panel.contentView?.subviews.first as? NSStackView {
-            panel.contentView?.layoutSubtreeIfNeeded()
-            let height = max(154, stack.fittingSize.height + 32)
-            let frame = panel.frame
-            panel.setFrame(NSRect(x: frame.minX, y: frame.maxY - height,
-                width: frame.width, height: height), display: displayUpdates)
+        let next = Presentation(meetingID: meetingID, canStart: canStart, canSkip: canSkip, detail: text)
+        let firstPresentation = presentation?.meetingID != meetingID
+        if presentation != next {
+            presentation = next
+            detail.stringValue = text
+            start.title = canStart ? "Start recording" : "Check recording…"
+            skip.isEnabled = canSkip
+            start.onClick = { [weak self] in self?.onStart?(meetingID) }
+            skip.onClick = { [weak self] in if canSkip { self?.onSkip?(meetingID) } }
+            if let stack = panel.contentView?.subviews.first as? NSStackView {
+                panel.contentView?.layoutSubtreeIfNeeded()
+                let height = max(154, stack.fittingSize.height + 32)
+                let frame = panel.frame
+                if abs(frame.height - height) > 0.5 {
+                    panel.setFrame(NSRect(x: frame.minX, y: frame.maxY - height,
+                        width: frame.width, height: height), display: displayUpdates)
+                }
+            }
         }
         if firstPresentation, let screen = NSScreen.main ?? NSScreen.screens.first {
             let visible = screen.visibleFrame
