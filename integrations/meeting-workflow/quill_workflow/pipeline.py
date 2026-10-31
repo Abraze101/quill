@@ -165,8 +165,7 @@ def configured(settings, stage):
                      and bool(settings["codex"].strip()))
                 and (settings.get("model") is None or isinstance(settings["model"], str)
                      and bool(settings["model"].strip()))
-                and (settings.get("account_link_id") is None
-                     or isinstance(settings["account_link_id"], str)
+                and (isinstance(settings.get("account_link_id"), str)
                      and re.fullmatch(r"link_[A-Za-z0-9_-]{1,200}", settings["account_link_id"]) is not None)
                 and settings.get("text_format", "legacy") in ("legacy", "combined_google_doc_v1", "native_template_google_doc_v1")
                 and (settings.get("text_format") != "native_template_google_doc_v1" or stage != "publish"
@@ -389,9 +388,16 @@ class Queue:
                     if routing is not None and stage in ("archive", "publish"):
                         settings["requires_route"] = True
                     status = "pending" if configured(settings, stage) else "held"
+                    setup_error = None
+                    if settings.get("type") == "codex_drive" and settings.get("enabled") is True:
+                        from quill_workflow.drive_accounts import require_verified_account
+                        try:
+                            require_verified_account(config, settings)
+                        except NeedsConfiguration as error:
+                            status, setup_error = "held", str(error)
                     self.db.execute(
-                        "INSERT INTO tasks(job,stage,status,settings) VALUES (?,?,?,?)",
-                        (job, stage, status, json.dumps(settings, sort_keys=True)))
+                        "INSERT INTO tasks(job,stage,status,settings,error) VALUES (?,?,?,?,?)",
+                        (job, stage, status, json.dumps(settings, sort_keys=True), setup_error))
                 from quill_workflow.local_naming import enabled, request_naming
                 if enabled(config):
                     request_naming(self, job, config)
@@ -966,9 +972,20 @@ class ConnectorRunner:
         # These adapters reuse the notes harness, which imports pipeline helpers.
         from quill_workflow.codex_drive_transport import CodexDriveTransport
         from quill_workflow.drive_upload import DriveUploader, UploadNeedsReview, UploadRetryable
+        verified_account = None
+        if self.config_path is not None:
+            from quill_workflow.drive_accounts import require_verified_account
+            verified_account = require_verified_account(load_config(self.config_path), settings)
 
         def guard():
             self.require_processing(job)
+            if not settings.get("account_link_id"):
+                raise NeedsConfiguration("Choose and verify a Google account in Quill Settings before Drive filing")
+            if self.config_path is not None:
+                from quill_workflow.drive_accounts import require_verified_account
+                current_account = require_verified_account(load_config(self.config_path), settings)
+                if any(current_account[key] != verified_account[key] for key in ("link_id", "profile_id", "email", "meetings_root_id")):
+                    raise NeedsConfiguration("Drive account changed during filing. Verify the connection before retrying.")
             if settings.get("account_link_id") is not None and self.config_path is not None:
                 live = load_config(self.config_path).get(stage, {})
                 if live.get("account_link_id") != settings["account_link_id"]:
@@ -1050,13 +1067,21 @@ class ConnectorRunner:
             account_link_id=settings.get("account_link_id"),
             timeout=min(7200, max(1, int(settings.get("timeout_seconds", 180)))))
         transport.cancelled = lambda: self.cancelled(job)
+        if verified_account is not None:
+            profile = transport.invoke("get_profile", {})
+            if (not isinstance(profile, dict) or profile.get("id") != verified_account["profile_id"]
+                    or not isinstance(profile.get("email"), str)
+                    or profile["email"].casefold() != verified_account["email"].casefold()):
+                raise NeedsConfiguration("The connected Google account changed. Verify it in Quill Settings before filing.")
         upload_options = {}
+        if verified_account is not None:
+            upload_options["expected_owner"] = verified_account["email"]
         if stage == "archive" and settings.get("large_files"):
             from quill_workflow.google_drive_auth import GoogleDriveAuth
             from quill_workflow.resumable_drive import ResumableDriveUploader
             auth = GoogleDriveAuth(settings["large_files"]["credentials_file"])
-            upload_options = {"large_upload": ResumableDriveUploader(auth.access_token),
-                              "large_upload_preflight": auth.preflight}
+            upload_options.update(large_upload=ResumableDriveUploader(auth.access_token),
+                                  large_upload_preflight=auth.preflight)
         uploader = DriveUploader(self.state, transport.invoke, settings["meetings_root_id"],
                                  guard=guard, account_link_id=settings.get("account_link_id"), **upload_options)
         try:

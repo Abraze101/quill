@@ -70,6 +70,9 @@ final class AppController {
     private var captureChoices: [ScreenCaptureChoice] = []
     private var captureLoading = false
     private var captureDetail: String?
+    private let driveAccountSetup = DriveAccountSetup()
+    private var driveAccountBusy = false
+    private var driveAccountIssue: String?
 
     init(root: URL, warningHistory: RecordingWarningHistory = RecordingWarningHistory()) {
         self.root = root
@@ -166,6 +169,7 @@ final class AppController {
         settings.onSetupConnection = { [weak self] _ in
             self?.openWorkflowConfiguration()
         }
+        settings.onChooseDriveAccount = { [weak self] in self?.chooseDriveAccount() }
         settings.onSetupNotes = { [weak self] in
             self?.openWorkflowConfiguration()
         }
@@ -901,11 +905,20 @@ final class AppController {
             state.driveRecordingsTitle = preferences.driveRecordingsTitle
             state.driveDocumentsStatus = preferences.driveDocumentsDescription
             state.driveRecordingsStatus = preferences.driveRecordingsDescription
+            state.driveAccountEmail = preferences.driveAccountEmail
+            state.driveAccountStatus = preferences.driveAccountDescription
             let canFile = preferences.notesConfigured && preferences.notesEnabled && state.localTranscription
             state.canEnableDriveDocuments = preferences.driveDocumentsConfigured && canFile
             state.canEnableDriveRecordings = preferences.driveRecordingsConfigured && canFile
         }
         state.isRecording = phase != .idle
+        state.driveAccountBusy = driveAccountBusy
+        if driveAccountBusy {
+            state.driveAccountStatus = (state.driveAccountEmail.map { "Current account: \($0)\n" } ?? "")
+                + "Checking your connected Google Drive accounts…"
+        } else if let driveAccountIssue {
+            state.driveAccountStatus = (state.driveAccountEmail.map { "Current account: \($0)\n" } ?? "") + driveAccountIssue
+        }
         state.isPaused = phase == .paused
         state.pauseEnabled = canChangePause
         state.pauseActionTitle = phase == .pausing ? "Pausing…" : phase == .resuming ? "Resuming…" : nil
@@ -962,6 +975,50 @@ final class AppController {
         } else {
             showInformation("Completion workflow configuration",
                 "The completion workflow has not been configured. Its settings file belongs at \(url.path). Use the meeting workflow setup guide to configure Call Summary and your company folders.")
+        }
+    }
+
+    private func chooseDriveAccount() {
+        guard !driveAccountBusy else { return }
+        driveAccountBusy = true
+        driveAccountIssue = nil
+        refreshUI()
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let catalog = try await driveAccountSetup.accounts()
+                driveAccountBusy = false
+                refreshUI()
+                guard !shuttingDown, settings.window?.isVisible == true else { return }
+                guard !catalog.accounts.isEmpty else {
+                    driveAccountIssue = "No Google Drive account is connected. Connect Google Drive in Codex, then choose your account here."
+                    refreshUI()
+                    return
+                }
+                settings.chooseDriveAccount(catalog.accounts, currentEmail: completionStatus?.preferences?.driveAccountEmail) { [weak self] account in
+                    guard let self, let account else { return }
+                    self.saveDriveAccount(account, revision: catalog.revision)
+                }
+            } catch {
+                driveAccountBusy = false
+                driveAccountIssue = error.localizedDescription
+                refreshUI()
+            }
+        }
+    }
+
+    private func saveDriveAccount(_ account: DriveAccountChoice, revision: String) {
+        guard !driveAccountBusy else { return }
+        driveAccountBusy = true
+        driveAccountIssue = nil
+        refreshUI()
+        Task { [weak self] in
+            guard let self else { return }
+            do { try await driveAccountSetup.select(account, revision: revision) }
+            catch { driveAccountIssue = error.localizedDescription }
+            driveAccountBusy = false
+            completionStatusChecked = .distantPast
+            refreshUI()
         }
     }
 

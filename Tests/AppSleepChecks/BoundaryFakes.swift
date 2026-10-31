@@ -214,6 +214,7 @@ final class SettingsWindowController {
     var onTranscriptionChange: ((Bool) -> Void)?
     var onSpeakerIdentificationChange: ((Bool) -> Void)?
     var onSetupConnection: ((QuillConnection) -> Void)?
+    var onChooseDriveAccount: (() -> Void)?
     var onSetupNotes: (() -> Void)?
     var onReviewProcessing: (() -> Void)?
     var onNotesChange: ((Bool) -> Void)?
@@ -226,6 +227,16 @@ final class SettingsWindowController {
     var window: NSWindow? { nil }
     func update(_ state: QuillSettingsState) {}
     func show() { preconditionFailure("Unexpected settings UI") }
+    func chooseDriveAccount(_ accounts: [DriveAccountChoice], currentEmail: String?, completion: @escaping (DriveAccountChoice?) -> Void) {
+        preconditionFailure("Sleep checks must not open account setup")
+    }
+}
+
+struct DriveAccountCatalog { let accounts: [DriveAccountChoice]; let revision: String }
+@MainActor
+final class DriveAccountSetup {
+    func accounts() async throws -> DriveAccountCatalog { preconditionFailure("Sleep checks must not read Drive accounts") }
+    func select(_ account: DriveAccountChoice, revision: String) async throws { preconditionFailure("Sleep checks must not change Drive accounts") }
 }
 
 @MainActor

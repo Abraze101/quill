@@ -224,14 +224,20 @@ def native_document_text(document, identity):
 
 class DriveUploader:
     def __init__(self, state, invoke, meetings_root_id, guard=None,
-                 large_upload=None, large_upload_preflight=None, account_link_id=None):
+                 large_upload=None, large_upload_preflight=None, account_link_id=None,
+                 expected_owner=None):
         if account_link_id is not None and (not isinstance(account_link_id, str)
                 or not re.fullmatch(r"link_[A-Za-z0-9_-]{1,200}", account_link_id)):
             raise UploadNeedsReview("Expected a fixed connected Google Drive account link ID")
+        if expected_owner is not None and (not isinstance(expected_owner, str)
+                or len(expected_owner) > 254 or not expected_owner.isprintable()
+                or not re.fullmatch(r"[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+", expected_owner)):
+            raise UploadNeedsReview("Expected the verified Google Drive account email")
         self.state = Path(state).expanduser()
         self.invoke = invoke
         self.root_id = _id(meetings_root_id)
         self.account_link_id = account_link_id
+        self.expected_owner = expected_owner
         self.guard = guard or (lambda: None)
         self.large_upload = large_upload
         self.large_upload_preflight = large_upload_preflight
@@ -488,6 +494,8 @@ class DriveUploader:
             self.guard()
             root = self._metadata(self.root_id)
             owner = self._private(root, meeting["owner"] or journal["owner"], mime=FOLDER_MIME)
+            if self.expected_owner is not None and owner.casefold() != self.expected_owner.casefold():
+                raise UploadNeedsReview("The Meetings folder owner differs from the verified Google Drive account")
             if direct_account and direct_account["email"].casefold() != owner.casefold():
                 raise UploadNeedsReview("The direct Drive account must match the approved Meetings folder owner")
             # Search filters verify liveness because normalized metadata omits

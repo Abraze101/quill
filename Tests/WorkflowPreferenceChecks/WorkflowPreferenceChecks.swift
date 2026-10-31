@@ -1,20 +1,31 @@
+import Darwin
 import Foundation
 
 @main
 enum WorkflowPreferenceChecks {
     static func main() throws {
+        if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--toggle-documents" {
+            try WorkflowPreferences.setDriveDocuments(true, at: URL(fileURLWithPath: CommandLine.arguments[2]),
+                                                      transcriptionEnabled: true)
+            return
+        }
         let fm = FileManager.default
         let temporary = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try fm.createDirectory(at: temporary, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: temporary) }
         let url = temporary.appendingPathComponent("workflow.json")
         let company: [String: Any] = ["id": "test-company", "name": "Test company", "drive_folder_id": "folder_1234567890"]
+        let account: [String: Any] = ["link_id": "link_test_account", "email": "meetings@example.test",
+                                     "profile_id": "profile_123456", "verified_at": 1_700_000_000.0,
+                                     "meetings_root_id": "root_1234567890"]
         let adapter: [String: Any] = ["type": "codex_drive", "enabled": false, "requires_route": true,
                                     "meetings_root_id": "root_1234567890", "codex": "/usr/bin/true",
+                                    "account_link_id": "link_test_account",
                                     "text_format": "combined_google_doc_v1"]
         let original: [String: Any] = [
             "recordings_root": "/not-opened",
             "custom": ["preserve": [1, 2, 3]],
+            "drive_account": account,
             "notes": ["enabled": false, "command": ["/usr/bin/true", "{input}"]],
             "route": ["enabled": false, "command": ["/usr/bin/true", "{companies}"],
                       "review_required": true, "companies": [company]],
@@ -50,6 +61,120 @@ enum WorkflowPreferenceChecks {
             }
             return value
         }
+
+        try write(original)
+        let connected = try WorkflowPreferences(url: url)
+        precondition(connected.driveAccountEmail == "meetings@example.test")
+        precondition(connected.driveAccountDescription == "Connected as meetings@example.test.")
+        var missingAccount = configured(documents: true, recordings: true)
+        missingAccount.removeValue(forKey: "drive_account")
+        try write(missingAccount)
+        let missingSelection = try WorkflowPreferences(url: url)
+        precondition(missingSelection.driveAccountEmail == nil)
+        precondition(missingSelection.driveAccountDescription.contains("Choose a Google Drive account"))
+        precondition(!missingSelection.driveDocumentsConfigured && !missingSelection.driveRecordingsConfigured)
+        try rejected { try setOutput("publish", true) }
+        try rejected { try setOutput("archive", true) }
+        try setOutput("publish", false, transcription: false)
+        try setOutput("archive", false, transcription: false)
+
+        var invalidAccounts: [[String: Any]] = []
+        for key in account.keys {
+            var incomplete = account
+            incomplete.removeValue(forKey: key)
+            invalidAccounts.append(incomplete)
+        }
+        let invalidAccountFields: [(String, [Any])] = [
+            ("link_id", [NSNull(), "", "link_", "link_account\n", "link_a/b", String(repeating: "a", count: 206)]),
+            ("email", [NSNull(), "", "not-an-email", " name@example.test", "name@example.test\n", "na\u{7f}me@example.test"]),
+            ("profile_id", [NSNull(), "", "profile id", "profile/id", 123]),
+            ("verified_at", [NSNull(), true, false, 0, -1, "1700000000"]),
+            ("meetings_root_id", [NSNull(), "", "short", "root/path", "root_1234567890\n"])
+        ]
+        for (key, values) in invalidAccountFields {
+            for value in values {
+                var invalid = account
+                invalid[key] = value
+                invalidAccounts.append(invalid)
+            }
+        }
+        for invalidAccount in invalidAccounts {
+            var value = configured(documents: true, recordings: true)
+            value["drive_account"] = invalidAccount
+            try write(value)
+            let selected = try WorkflowPreferences(url: url)
+            precondition(selected.notesConfigured && selected.notesEnabled)
+            precondition(!selected.driveDocumentsConfigured && !selected.driveRecordingsConfigured)
+            precondition(selected.driveAccountEmail == nil && selected.driveAccountDescription.contains("Verify"))
+            for key in ["publish", "archive"] {
+                try rejected { try setOutput(key, true) }
+                try setOutput(key, false, transcription: false)
+                var stage = value[key] as! [String: Any]
+                stage["enabled"] = false
+                value[key] = stage
+                let saved = try object()
+                precondition(NSDictionary(dictionary: saved).isEqual(to: value),
+                             "Disabling an invalid account must change only the selected flag")
+            }
+        }
+        for key in ["archive", "publish"] {
+            for field in ["account_link_id", "meetings_root_id"] {
+                for replacement: Any in [NSNull(), "", field == "account_link_id" ? "link_other_account" : "other_root_123456"] {
+                    var value = configured(documents: true, recordings: true)
+                    var changed = value[key] as! [String: Any]
+                    changed[field] = replacement
+                    value[key] = changed
+                    try write(value)
+                    let selected = try WorkflowPreferences(url: url)
+                    precondition(selected.driveAccountEmail == nil)
+                    precondition(!selected.driveDocumentsConfigured && !selected.driveRecordingsConfigured)
+                    try rejected { try setOutput("publish", true) }
+                    try rejected { try setOutput("archive", true) }
+                    try setOutput(key, false, transcription: false)
+                }
+            }
+        }
+
+        // A toggle waits for the account picker lock, then reads its completed
+        // selection. Reading before the lock would overwrite the new account.
+        try write(configured(documents: false, recordings: false))
+        let lockDescriptor = open(url.path + ".lock", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        precondition(lockDescriptor >= 0)
+        let lockHandle = FileHandle(fileDescriptor: lockDescriptor, closeOnDealloc: true)
+        precondition(flock(lockDescriptor, LOCK_EX) == 0)
+        let toggle = Process()
+        toggle.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
+        toggle.arguments = ["--toggle-documents", url.path]
+        toggle.standardOutput = FileHandle.nullDevice
+        toggle.standardError = FileHandle.nullDevice
+        try toggle.run()
+        Thread.sleep(forTimeInterval: 0.15)
+        precondition(toggle.isRunning, "The toggle must wait for the account-selection lock")
+        var concurrentSelection = configured(documents: false, recordings: false)
+        var newAccount = account
+        newAccount["link_id"] = "link_reselected_account"
+        newAccount["email"] = "selected@example.test"
+        concurrentSelection["drive_account"] = newAccount
+        concurrentSelection["selection_marker"] = "preserve the latest selection"
+        for key in ["archive", "publish"] {
+            var stage = concurrentSelection[key] as! [String: Any]
+            stage["account_link_id"] = "link_reselected_account"
+            concurrentSelection[key] = stage
+        }
+        try write(concurrentSelection)
+        precondition(flock(lockDescriptor, LOCK_UN) == 0)
+        try lockHandle.close()
+        let deadline = Date().addingTimeInterval(5)
+        while toggle.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.02) }
+        if toggle.isRunning { toggle.terminate() }
+        toggle.waitUntilExit()
+        precondition(toggle.terminationStatus == 0)
+        var enabledPublish = concurrentSelection["publish"] as! [String: Any]
+        enabledPublish["enabled"] = true
+        concurrentSelection["publish"] = enabledPublish
+        let concurrentSaved = try object()
+        precondition(NSDictionary(dictionary: concurrentSaved).isEqual(to: concurrentSelection),
+                     "A toggle must preserve an account selection completed while it waited for the lock")
 
         // Loading all four combinations preserves their exact choice; each
         // control changes only its own activation flag in either direction.
@@ -212,7 +337,7 @@ enum WorkflowPreferenceChecks {
         preferences = try WorkflowPreferences(url: url)
         precondition(preferences.driveDocumentsEnabled && preferences.driveRecordingsEnabled)
         let enabledObject = try object()
-        for key in ["custom", "recordings_root"] {
+        for key in ["custom", "recordings_root", "drive_account"] {
             precondition(NSDictionary(dictionary: [key: enabledObject[key]!]).isEqual(to: [key: original[key]!]))
         }
         for key in ["notes", "route", "archive", "publish"] {
@@ -327,8 +452,8 @@ enum WorkflowPreferenceChecks {
         invalid["publish"] = publish
         try write(invalid)
         try WorkflowPreferences.setNotes(true, at: url, transcriptionEnabled: true)
-        try WorkflowPreferences.setDriveDocuments(true, at: url, transcriptionEnabled: true)
-        try rejected { try WorkflowPreferences.setDriveRecordings(true, at: url, transcriptionEnabled: true) }
+        try rejected { try WorkflowPreferences.setDriveDocuments(true, at: url, transcriptionEnabled: true) }
+        try WorkflowPreferences.setDriveRecordings(true, at: url, transcriptionEnabled: true)
         try write(original)
         let link = temporary.appendingPathComponent("linked.json")
         try fm.createSymbolicLink(at: link, withDestinationURL: url)

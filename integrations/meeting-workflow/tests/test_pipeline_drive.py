@@ -38,8 +38,12 @@ class PipelineDriveTests(unittest.TestCase):
         atomic_json(self.session / "transcript.json", {
             "segments": [{"start_ms": 0, "text": "Acme will provide the agenda."}]})
         self.companies = [{"id": "acme", "name": "Acme", "drive_folder_id": "company_folder_123"}]
-        self.settings = {"enabled": True, "type": "codex_drive", "meetings_root_id": "meetings_root_123"}
+        self.settings = {"enabled": True, "type": "codex_drive", "meetings_root_id": "meetings_root_123",
+                         "account_link_id": "link_account_a"}
         self.config = {"recordings_root": str(self.session.parent),
+                       "drive_account": {"link_id": "link_account_a", "email": "owner@example.com",
+                                         "profile_id": "profile_a", "verified_at": 1,
+                                         "meetings_root_id": "meetings_root_123"},
                        "archive": dict(self.settings),
                        "publish": dict(self.settings),
                        "route": {"enabled": True, "companies": self.companies, "command": ["unused"]}}
@@ -48,6 +52,7 @@ class PipelineDriveTests(unittest.TestCase):
         self.runner = ConnectorRunner(self.queue.state, ROOT / "skills/call-summary/SKILL.md")
         self.uploader = Mock()
         self.transport = Mock()
+        self.transport.invoke.return_value = {"id": "profile_a", "email": "owner@example.com"}
         self.uploader_factory = Mock(return_value=self.uploader)
         self.transport_factory = Mock(return_value=self.transport)
         upload_module = types.ModuleType("quill_workflow.drive_upload")
@@ -110,7 +115,7 @@ class PipelineDriveTests(unittest.TestCase):
             self.assertFalse(configured(dict(self.settings, large_files=value), "archive"))
 
     def test_drive_account_configuration_and_transport_binding(self):
-        for value in (False, "", "owner@example.com", "link_", "link_a/b", "link_" + "a" * 201):
+        for value in (None, False, "", "owner@example.com", "link_", "link_a/b", "link_" + "a" * 201):
             self.assertFalse(configured(dict(self.settings, account_link_id=value), "archive"))
         settings = dict(self.settings, account_link_id="link_account_a")
         self.assertTrue(configured(settings, "archive"))
@@ -125,20 +130,26 @@ class PipelineDriveTests(unittest.TestCase):
         config_path = self.root / "workflow.json"
         atomic_json(config_path, dict(self.config, archive=dict(settings, account_link_id="link_account_b")))
         self.runner.config_path = config_path
-        with self.assertRaisesRegex(NeedsConfiguration, "Drive account changed"):
+        with self.assertRaisesRegex(NeedsConfiguration, "Drive account|Drive settings"):
             self.runner("archive", job, settings)
         self.transport_factory.assert_not_called()
         self.uploader.upload.assert_not_called()
 
     def test_release_preserves_account_binding_and_legacy_absence(self):
-        config = dict(self.config, archive=dict(self.settings, account_link_id="link_account_a"))
+        legacy = dict(self.settings)
+        legacy.pop("account_link_id")
+        config = dict(self.config, publish=legacy)
         job, _ = self.prepare(config)
         changed = dict(config, archive=dict(self.settings, account_link_id="link_account_b"),
                        publish=dict(self.settings, account_link_id="link_account_b"))
         for stage in ("archive", "publish"):
             with self.queue.db:
                 self.queue.db.execute("UPDATE tasks SET status='failed' WHERE job=? AND stage=?", (job, stage))
-            self.queue.release(job, stage, changed)
+            if stage == "publish":
+                with self.assertRaises(NeedsConfiguration):
+                    self.queue.release(job, stage, changed)
+            else:
+                self.queue.release(job, stage, changed)
         tasks = {item["stage"]: json.loads(item["settings"]) for item in self.queue.tasks(job)}
         self.assertEqual(tasks["archive"]["account_link_id"], "link_account_a")
         self.assertNotIn("account_link_id", tasks["publish"])
@@ -151,8 +162,8 @@ class PipelineDriveTests(unittest.TestCase):
         with self.queue.db:
             self.queue.db.execute("UPDATE tasks SET status='failed' WHERE job=? AND stage='archive'", (job,))
         before = self.queue.tasks(job)
-        for selected in (dict(self.settings), dict(self.settings, account_link_id="link_account_b")):
-            with self.assertRaisesRegex(NeedsConfiguration, "Drive account changed"):
+        for selected in (dict(self.settings, account_link_id=None), dict(self.settings, account_link_id="link_account_b")):
+            with self.assertRaises(NeedsConfiguration):
                 self.queue.retry_failed(job, retry_revision(before), dict(config, archive=selected))
             self.assertEqual(self.queue.tasks(job), before)
 
@@ -212,7 +223,7 @@ class PipelineDriveTests(unittest.TestCase):
                 self.assertIn("input_sha256", receipt)
                 self.assertIn("route_sha256", receipt)
         self.transport_factory.assert_called_with(
-            "/Applications/Codex.app/Contents/Resources/codex", model=None, account_link_id=None, timeout=180)
+            "/Applications/Codex.app/Contents/Resources/codex", model=None, account_link_id="link_account_a", timeout=180)
         args, kwargs = self.uploader_factory.call_args
         self.assertEqual(args, (self.queue.state, self.transport.invoke, "meetings_root_123"))
         self.assertTrue(callable(kwargs["guard"]))
@@ -222,7 +233,45 @@ class PipelineDriveTests(unittest.TestCase):
         job, _ = self.prepare()
         settings = dict(self.settings, codex="/fixture/codex", model="configured-model", timeout_seconds=90)
         self.runner("archive", job, settings)
-        self.transport_factory.assert_called_once_with("/fixture/codex", model="configured-model", account_link_id=None, timeout=90)
+        self.transport_factory.assert_called_once_with("/fixture/codex", model="configured-model", account_link_id="link_account_a", timeout=90)
+
+    def test_missing_verified_setup_holds_new_drive_jobs_without_blocking_other_stages(self):
+        config = dict(self.config)
+        config.pop("drive_account")
+        job, _ = self.prepare(config)
+        tasks = {task["stage"]: task for task in self.queue.tasks(job)}
+        for stage in ("archive", "publish"):
+            self.assertEqual(tasks[stage]["status"], "held")
+            self.assertIn("Choose and verify", tasks[stage]["error"])
+        self.assertEqual(tasks["notes"]["status"], "succeeded")
+        self.assertEqual(tasks["route"]["status"], "succeeded")
+
+    def test_worker_rejects_unverified_configuration_before_drive_access(self):
+        job, _ = self.prepare()
+        config = dict(self.config)
+        config.pop("drive_account")
+        self.runner.config_path = self.root / "workflow.json"
+        atomic_json(self.runner.config_path, config)
+        with self.assertRaisesRegex(NeedsConfiguration, "Choose and verify"):
+            self.runner("archive", job, self.settings)
+        self.transport_factory.assert_not_called()
+
+    def test_worker_rejects_reauthorized_connection_before_upload(self):
+        job, _ = self.prepare()
+        self.runner.config_path = self.root / "workflow.json"
+        atomic_json(self.runner.config_path, self.config)
+        self.transport.invoke.return_value = {"id": "different_profile", "email": "other@example.com"}
+        with self.assertRaisesRegex(NeedsConfiguration, "connected Google account changed"):
+            self.runner("archive", job, self.settings)
+        self.uploader_factory.assert_not_called()
+
+    def test_worker_binds_initial_folder_owner_to_verified_account(self):
+        job, _ = self.prepare()
+        self.runner.config_path = self.root / "workflow.json"
+        atomic_json(self.runner.config_path, self.config)
+        self.runner("archive", job, self.settings)
+        self.transport.invoke.assert_called_once_with("get_profile", {})
+        self.assertEqual(self.uploader_factory.call_args.kwargs["expected_owner"], "owner@example.com")
 
     def recorded_date_fixture(self):
         self.started = "2026-09-28T05:12:41Z"

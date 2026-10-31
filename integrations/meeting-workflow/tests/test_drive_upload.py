@@ -188,6 +188,52 @@ class DriveUploadTests(unittest.TestCase):
         self.assertEqual(meeting["identity"], {key: expected[key]
             for key in ("job", "meetings_root_id", "route", "started")})
 
+    def test_verified_owner_rejects_fresh_different_account_before_any_write(self):
+        self.uploader = DriveUploader(self.uploader.state, self.drive, FakeDrive.ROOT,
+                                      account_link_id="link_selected", expected_owner="different@example.test")
+        with self.assertRaisesRegex(UploadNeedsReview, "owner differs from the verified"):
+            self.upload()
+        self.assertEqual(self.drive.writes, [])
+        _, journal = self.archive_journal()
+        self.assertIsNone(journal["owner"])
+        self.assertEqual(journal["operations"], {})
+
+    def test_verified_matching_owner_keeps_legacy_identity_and_retry_behavior(self):
+        archived = self.upload()
+        directory = self.uploader.state / "results" / self.job
+        identities = {name: json.loads((directory / ("drive-" + name + ".json")).read_text())["identity"]
+                      for name in ("archive", "meeting")}
+        writes = copy.deepcopy(self.drive.writes)
+        self.uploader = DriveUploader(self.uploader.state, self.drive, FakeDrive.ROOT,
+                                      expected_owner=FakeDrive.OWNER.upper())
+        retried = self.upload()
+        self.assertEqual(retried["files"], archived["files"])
+        self.assertEqual(self.drive.writes, writes)
+        for name, identity in identities.items():
+            self.assertEqual(json.loads((directory / ("drive-" + name + ".json")).read_text())["identity"], identity)
+        published = self.upload("publish")
+        self.assertEqual(published["meeting_folder_id"], archived["meeting_folder_id"])
+
+    def test_new_expected_owner_cannot_override_saved_journal_owner(self):
+        self.upload()
+        writes = copy.deepcopy(self.drive.writes)
+        for item in self.drive.items.values():
+            item["permissions"][0]["emailAddress"] = "new-owner@example.test"
+        self.uploader = DriveUploader(self.uploader.state, self.drive, FakeDrive.ROOT,
+                                      expected_owner="new-owner@example.test")
+        with self.assertRaisesRegex(UploadNeedsReview, "owner changed"):
+            self.upload()
+        self.assertEqual(self.drive.writes, writes)
+
+    def test_invalid_expected_owner_is_rejected_before_any_access(self):
+        for owner in ("", "not-an-email", "user@example.test\n", " user@example.test",
+                      "user@exam\x00ple.test", "user@exa\x85mple.test", "user<>@example.test",
+                      "x" * 250 + "@example.test", 1, True, {}):
+            with self.subTest(owner=owner), self.assertRaisesRegex(UploadNeedsReview, "verified Google Drive account email"):
+                DriveUploader(self.uploader.state, self.drive, FakeDrive.ROOT, expected_owner=owner)
+        self.assertEqual(self.drive.calls, [])
+        self.assertFalse(self.uploader.state.exists())
+
     def test_pinned_account_survives_restart_and_both_stages_without_duplicate_writes(self):
         account = "link_account_a"
         self.uploader = DriveUploader(self.uploader.state, self.drive, FakeDrive.ROOT,

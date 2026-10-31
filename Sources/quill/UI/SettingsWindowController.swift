@@ -14,6 +14,17 @@ enum QuillConnection {
     case googleDrive
 }
 
+struct DriveAccountChoice: Decodable, Equatable {
+    let linkID: String
+    let email: String
+    let profileID: String
+    let name: String
+
+    enum CodingKeys: String, CodingKey {
+        case linkID = "link_id", email, profileID = "profile_id", name
+    }
+}
+
 /// The app owns persistence, capture discovery, and connector setup. This window
 /// only displays that state and reports explicit user actions.
 struct QuillSettingsState {
@@ -41,6 +52,9 @@ struct QuillSettingsState {
     var driveRecordingsTitle = "Upload audio and video to Drive"
     var driveDocumentsStatus = "Configure Google Drive to save notes and transcripts."
     var driveRecordingsStatus = "Configure Google Drive to upload audio and video."
+    var driveAccountEmail: String?
+    var driveAccountStatus = "Choose and verify a Google account before enabling Drive filing."
+    var driveAccountBusy = false
     var processingTitle = "No processing status yet"
     var processingDetail = ""
     var processingNeedsAttention = false
@@ -68,6 +82,7 @@ final class SettingsWindowController: NSWindowController {
     var onTranscriptionChange: ((Bool) -> Void)?
     var onSpeakerIdentificationChange: ((Bool) -> Void)?
     var onSetupConnection: ((QuillConnection) -> Void)?
+    var onChooseDriveAccount: (() -> Void)?
     var onSetupNotes: (() -> Void)?
     var onReviewProcessing: (() -> Void)?
     var onNotesChange: ((Bool) -> Void)?
@@ -99,6 +114,10 @@ final class SettingsWindowController: NSWindowController {
     private let processingButton = NSButton(title: "Review processing…", target: nil, action: nil)
     private let driveDocumentsStatus = NSTextField(wrappingLabelWithString: "")
     private let driveRecordingsStatus = NSTextField(wrappingLabelWithString: "")
+    private let driveAccountStatus = NSTextField(wrappingLabelWithString: "")
+    private let driveAccountButton = NSButton(title: "Choose account…", target: nil, action: nil)
+    private var accountAlert: NSAlert?
+    private var accountPopup: NSPopUpButton?
     private let notesSwitch = NSButton(checkboxWithTitle: "Create notes and suggest a company", target: nil, action: nil)
     private let driveDocumentsSwitch = NSButton(checkboxWithTitle: "Save notes and transcript to Drive", target: nil, action: nil)
     private let driveRecordingsSwitch = NSButton(checkboxWithTitle: "Upload audio and video to Drive", target: nil, action: nil)
@@ -193,6 +212,9 @@ final class SettingsWindowController: NSWindowController {
         processingButton.isEnabled = state.processingReviewAvailable
         driveDocumentsStatus.stringValue = state.driveDocumentsStatus
         driveRecordingsStatus.stringValue = state.driveRecordingsStatus
+        driveAccountStatus.stringValue = state.driveAccountStatus
+        driveAccountButton.title = state.driveAccountBusy ? "Checking…" : state.driveAccountEmail == nil ? "Choose account…" : "Change / verify…"
+        driveAccountButton.isEnabled = !state.driveAccountBusy
         driveDocumentsSwitch.title = state.driveDocumentsTitle
         driveRecordingsSwitch.title = state.driveRecordingsTitle
         notesSwitch.state = state.notesActive ? .on : .off
@@ -374,6 +396,12 @@ final class SettingsWindowController: NSWindowController {
         let driveButton = NSButton(title: "Configuration…", target: self, action: #selector(driveSetupClicked))
         driveButton.setAccessibilityLabel("Open Google Drive configuration")
         add(row(label: "Google Drive", control: driveButton), to: root)
+        driveAccountButton.target = self
+        driveAccountButton.action = #selector(chooseDriveAccountClicked)
+        driveAccountButton.setAccessibilityIdentifier("quill-drive-account-choose")
+        driveAccountStatus.setAccessibilityIdentifier("quill-drive-account-status")
+        add(row(label: "Google account", control: driveAccountButton), to: root)
+        add(detail(driveAccountStatus), to: root)
         driveDocumentsSwitch.target = self
         driveDocumentsSwitch.action = #selector(driveDocumentsChanged)
         driveDocumentsSwitch.setAccessibilityIdentifier("quill-drive-documents")
@@ -477,6 +505,39 @@ final class SettingsWindowController: NSWindowController {
     @objc private func notesSetupClicked() { onSetupNotes?() }
     @objc private func processingClicked() { onReviewProcessing?() }
     @objc private func driveSetupClicked() { onSetupConnection?(.googleDrive) }
+    @objc private func chooseDriveAccountClicked() { onChooseDriveAccount?() }
+
+    func chooseDriveAccount(_ accounts: [DriveAccountChoice], currentEmail: String?, completion: @escaping (DriveAccountChoice?) -> Void) {
+        guard let window, accountAlert == nil else { return }
+        let alert = NSAlert()
+        alert.messageText = "Choose your Google Drive account"
+        alert.informativeText = "Quill will verify that this account owns your configured meeting folders. This does not move or restart existing meetings."
+        alert.addButton(withTitle: "Use this account")
+        alert.addButton(withTitle: "Cancel")
+        alert.buttons[0].isEnabled = false
+        let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 390, height: 30), pullsDown: false)
+        popup.addItem(withTitle: "Choose an account…")
+        for account in accounts {
+            popup.addItem(withTitle: account.email + (account.email == currentEmail ? " (current)" : ""))
+        }
+        popup.target = self
+        popup.action = #selector(driveAccountSelectionChanged)
+        popup.setAccessibilityLabel("Google account for meeting files")
+        popup.setAccessibilityIdentifier("quill-drive-account-picker")
+        alert.accessoryView = popup
+        accountAlert = alert
+        accountPopup = popup
+        alert.beginSheetModal(for: window) { [weak self] response in
+            let index = popup.indexOfSelectedItem - 1
+            self?.accountAlert = nil
+            self?.accountPopup = nil
+            completion(response == .alertFirstButtonReturn && accounts.indices.contains(index) ? accounts[index] : nil)
+        }
+    }
+
+    @objc private func driveAccountSelectionChanged() {
+        accountAlert?.buttons.first?.isEnabled = (accountPopup?.indexOfSelectedItem ?? 0) > 0
+    }
     @objc private func notesChanged() {
         guard state.notesActive || state.canEnableNotes else { return }
         onNotesChange?(notesSwitch.state == .on)

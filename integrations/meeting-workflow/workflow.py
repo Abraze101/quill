@@ -402,6 +402,12 @@ def main(argv=None):
     parser.add_argument("--config", default=str(Path.home() / ".config/quill/workflow.json"))
     parser.add_argument("--state", default=str(Path.home() / ".local/state/quill/workflow"))
     sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("drive-accounts", help="List connected Drive accounts without selecting one")
+    drive_select = sub.add_parser("drive-select", help="Verify and save one explicitly selected Drive account")
+    drive_select.add_argument("--link-id", required=True)
+    drive_select.add_argument("--revision", required=True)
+    drive_select.add_argument("--profile-id", required=True)
+    drive_select.add_argument("--email", required=True)
     for name in ("enqueue", "complete"):
         child = sub.add_parser(name)
         child.add_argument("session")
@@ -442,6 +448,25 @@ def main(argv=None):
     name_local.add_argument("job")
     name_local.add_argument("--refresh", action="store_true", help="Update an already named folder to the current date format")
     args = parser.parse_args(argv)
+    if args.command in ("drive-accounts", "drive-select"):
+        # Account setup must not open or migrate the meeting queue. Native UI
+        # consumers receive one bounded JSON response, including failures.
+        from quill_workflow.drive_accounts import list_accounts, select_account
+        from quill_workflow.codex_drive_transport import DriveTransportError
+        try:
+            if args.command == "drive-accounts":
+                result = list_accounts(args.config)
+            else:
+                result = {"drive_account": select_account(args.config, args.state, args.link_id, args.revision,
+                    expected_profile_id=args.profile_id, expected_email=args.email)}
+            print(json.dumps(result, ensure_ascii=False, allow_nan=False))
+            return 0
+        except (WorkflowError, DriveTransportError, OSError, ValueError) as error:
+            print(json.dumps({"error": str(error)[:1000]}, ensure_ascii=False))
+            return 1
+        except Exception:
+            print(json.dumps({"error": "Could not finish Google Drive account setup. Try again."}))
+            return 1
     config = load_config(args.config)
     queue = Queue(args.state)
     try:

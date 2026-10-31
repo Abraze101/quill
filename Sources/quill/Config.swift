@@ -56,6 +56,23 @@ enum Config {
         return command
     }
 
+    /// Reuse the configured workflow entry point, never a shell command.
+    static func driveAccountCommand(_ arguments: [String]) -> [String]? {
+        let configured = load()?["drive_setup"] as? [String]
+        let base: [String]
+        if let configured, !configured.isEmpty {
+            base = configured
+        } else if let review = meetingReviewCommand(),
+                  let index = review.firstIndex(where: { URL(fileURLWithPath: $0).lastPathComponent == "workflow.py" }) {
+            base = Array(review.prefix(through: index))
+        } else { return nil }
+        guard let executable = base.first, executable.hasPrefix("/"),
+              FileManager.default.isExecutableFile(atPath: executable),
+              base.allSatisfy({ !$0.isEmpty }) else { return nil }
+        return base + ["--config", workflowSettingsURL().path,
+                       "--state", completionStatusURL().deletingLastPathComponent().path] + arguments
+    }
+
     static func completionStatusURL() -> URL {
         let path = load()?["completion_status_file"] as? String
             ?? "~/.local/state/quill/workflow/status.json"

@@ -357,6 +357,25 @@ struct RecordingControlChecks {
         expect(documentChanges.isEmpty && recordingChanges.isEmpty,
                "Unconfigured Drive controls must not request activation")
 
+        let accountButton = buttons.first { $0.accessibilityIdentifier() == "quill-drive-account-choose" }!
+        var accountChoices = 0
+        controller.onChooseDriveAccount = { accountChoices += 1 }
+        expect(accountButton.title == "Choose account…" && accountButton.isEnabled,
+               "Unconfigured Drive must offer account selection")
+        accountButton.performClick(nil)
+        expect(accountChoices == 1 && documentChanges.isEmpty && recordingChanges.isEmpty,
+               "Choosing an account must not enable filing")
+        state.driveAccountEmail = "owner@example.com"
+        state.driveAccountStatus = "Connected as owner@example.com."
+        state.driveAccountBusy = true
+        controller.update(state)
+        expect(!accountButton.isEnabled && accountButton.title == "Checking…",
+               "Account verification cannot be started twice")
+        state.driveAccountBusy = false
+        controller.update(state)
+        expect(labels(content).contains("Connected as owner@example.com.") && accountButton.title == "Change / verify…",
+               "Settings must show the selected email and offer verification")
+
         state.canEnableDriveDocuments = true
         controller.update(state)
         documents.performClick(nil)

@@ -1,4 +1,5 @@
 import CoreFoundation
+import Darwin
 import Foundation
 
 /// Only edits activation flags. Adapters, destination decisions, and queued jobs
@@ -45,6 +46,24 @@ struct WorkflowPreferences {
     var driveDocumentsConfigured: Bool { driveConfigured("publish", other: "archive") }
     var driveRecordingsConfigured: Bool { driveConfigured("archive", other: "publish") }
 
+    var driveAccountEmail: String? {
+        guard let account = verifiedDriveAccount,
+              ["archive", "publish"].allSatisfy({ key in
+                  let settings = stage(key)
+                  return settings["type"] as? String != "codex_drive"
+                      || matchesAccount(settings, account)
+              }) else { return nil }
+        return account.email
+    }
+
+    var driveAccountDescription: String {
+        if let email = driveAccountEmail { return "Connected as \(email)." }
+        if object["drive_account"] != nil {
+            return "Verify your Google Drive account and meeting folder before enabling filing."
+        }
+        return "Choose a Google Drive account before enabling filing."
+    }
+
     var notesDescription: String {
         if !notesConfigured { return "Configure Call Summary, company folders, and folder review before enabling notes." }
         if notesEnabled { return "Call Summary and company suggestions are on for new completed meetings." }
@@ -54,6 +73,7 @@ struct WorkflowPreferences {
 
     var driveDocumentsDescription: String {
         if !driveDocumentsConfigured {
+            if verifiedDriveAccount == nil { return driveAccountDescription }
             return "Configure the document connection and company folders. Any enabled recording uploads must use the same meeting folder."
         }
         if !driveDocumentsEnabled { return documentFilingName + " is off." }
@@ -66,6 +86,7 @@ struct WorkflowPreferences {
 
     var driveRecordingsDescription: String {
         if !driveRecordingsConfigured {
+            if verifiedDriveAccount == nil { return driveAccountDescription }
             return "Configure the recording connection and company folders. Any enabled document filing must use the same meeting folder."
         }
         if !driveRecordingsEnabled { return recordingUploadName + " are off." }
@@ -122,26 +143,28 @@ struct WorkflowPreferences {
 
     private func driveConfigured(_ key: String, other: String) -> Bool {
         let selected = stage(key)
-        guard Self.driveAdapter(selected), companiesValid else { return false }
+        guard driveAdapter(selected), companiesValid else { return false }
         // An unused connection is optional. If both outputs are enabled, they
         // must share the validated private meeting folder.
         guard enabled(other) else { return true }
         let peer = stage(other)
-        return Self.driveAdapter(peer)
+        return driveAdapter(peer)
             && (selected["meetings_root_id"] as? String) == (peer["meetings_root_id"] as? String)
     }
 
     static func setNotes(_ enabled: Bool, at url: URL, transcriptionEnabled: Bool) throws {
-        var preferences = try Self(url: url)
-        if enabled {
-            guard transcriptionEnabled else { throw PreferenceError("Turn on local transcription before enabling meeting notes.") }
-            guard preferences.notesConfigured else { throw PreferenceError(preferences.notesDescription) }
+        try withSettingsLock(at: url) {
+            var preferences = try Self(url: url)
+            if enabled {
+                guard transcriptionEnabled else { throw PreferenceError("Turn on local transcription before enabling meeting notes.") }
+                guard preferences.notesConfigured else { throw PreferenceError(preferences.notesDescription) }
+            }
+            preferences.set(enabled, stages: ["notes", "route"])
+            // Drive filing depends on reviewed notes and routing. This dependency is
+            // stated beside the switch; turning notes back on does not enable Drive.
+            if !enabled { preferences.set(false, stages: ["archive", "publish"]) }
+            try preferences.write(to: url)
         }
-        preferences.set(enabled, stages: ["notes", "route"])
-        // Drive filing depends on reviewed notes and routing. This dependency is
-        // stated beside the switch; turning notes back on does not enable Drive.
-        if !enabled { preferences.set(false, stages: ["archive", "publish"]) }
-        try preferences.write(to: url)
     }
 
     static func setDriveDocuments(_ enabled: Bool, at url: URL, transcriptionEnabled: Bool) throws {
@@ -153,18 +176,36 @@ struct WorkflowPreferences {
     }
 
     private static func setDriveOutput(_ enabled: Bool, stage: String, at url: URL, transcriptionEnabled: Bool) throws {
-        var preferences = try Self(url: url)
-        if enabled {
-            guard transcriptionEnabled && preferences.notesConfigured && preferences.notesEnabled else {
-                throw PreferenceError("Enable local transcription and meeting notes before turning on Drive filing.")
+        try withSettingsLock(at: url) {
+            var preferences = try Self(url: url)
+            if enabled {
+                guard transcriptionEnabled && preferences.notesConfigured && preferences.notesEnabled else {
+                    throw PreferenceError("Enable local transcription and meeting notes before turning on Drive filing.")
+                }
+                let documents = stage == "publish"
+                guard documents ? preferences.driveDocumentsConfigured : preferences.driveRecordingsConfigured else {
+                    throw PreferenceError(documents ? preferences.driveDocumentsDescription : preferences.driveRecordingsDescription)
+                }
             }
-            let documents = stage == "publish"
-            guard documents ? preferences.driveDocumentsConfigured : preferences.driveRecordingsConfigured else {
-                throw PreferenceError(documents ? preferences.driveDocumentsDescription : preferences.driveRecordingsDescription)
-            }
+            preferences.set(enabled, stages: [stage])
+            try preferences.write(to: url)
         }
-        preferences.set(enabled, stages: [stage])
-        try preferences.write(to: url)
+    }
+
+    private static func withSettingsLock(at url: URL, _ body: () throws -> Void) throws {
+        // The account picker uses this same sibling lock. Hold it across the
+        // read and write so a toggle cannot restore an older account selection.
+        let descriptor = open(url.path + ".lock", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard descriptor >= 0 else { throw PreferenceError("The completion settings could not be locked. Try again.") }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        defer { try? handle.close() }
+        var info = stat()
+        guard fstat(descriptor, &info) == 0, info.st_mode & S_IFMT == S_IFREG,
+              flock(descriptor, LOCK_EX) == 0 else {
+            throw PreferenceError("The completion settings could not be locked. Try again.")
+        }
+        defer { _ = flock(descriptor, LOCK_UN) }
+        try body()
     }
 
     private func stage(_ key: String) -> [String: Any] { object[key] as? [String: Any] ?? [:] }
@@ -202,12 +243,41 @@ struct WorkflowPreferences {
         return FileManager.default.isExecutableFile(atPath: executable)
     }
 
-    private static func driveAdapter(_ settings: [String: Any]) -> Bool {
-        guard settings["type"] as? String == "codex_drive",
-              driveTextFormat(settings) != nil,
-              boolean(settings["requires_route"]) == true,
+    private struct VerifiedDriveAccount {
+        let linkID: String
+        let email: String
+        let meetingsRootID: String
+    }
+
+    private var verifiedDriveAccount: VerifiedDriveAccount? {
+        guard let account = object["drive_account"] as? [String: Any],
+              let link = account["link_id"] as? String,
+              Self.matches(link, "\\Alink_[A-Za-z0-9_-]{1,200}\\z"),
+              let email = account["email"] as? String, email.utf8.count <= 254,
+              Self.matches(email, "\\A[^\\s@]+@[^\\s@]+\\.[^\\s@]+\\z"),
+              email.unicodeScalars.allSatisfy({ $0.value >= 32 && !(127...159).contains($0.value) }),
+              let profile = account["profile_id"] as? String,
+              Self.matches(profile, "\\A[A-Za-z0-9_-]{1,200}\\z"),
+              let verifiedAt = account["verified_at"] as? NSNumber,
+              CFGetTypeID(verifiedAt) != CFBooleanGetTypeID(),
+              verifiedAt.doubleValue.isFinite, verifiedAt.doubleValue > 0,
+              let root = account["meetings_root_id"] as? String,
+              Self.matches(root, "\\A[A-Za-z0-9_-]{10,200}\\z") else { return nil }
+        return VerifiedDriveAccount(linkID: link, email: email, meetingsRootID: root)
+    }
+
+    private func matchesAccount(_ settings: [String: Any], _ account: VerifiedDriveAccount) -> Bool {
+        settings["account_link_id"] as? String == account.linkID
+            && settings["meetings_root_id"] as? String == account.meetingsRootID
+    }
+
+    private func driveAdapter(_ settings: [String: Any]) -> Bool {
+        guard let account = verifiedDriveAccount, matchesAccount(settings, account),
+              settings["type"] as? String == "codex_drive",
+              Self.driveTextFormat(settings) != nil,
+              Self.boolean(settings["requires_route"]) == true,
               let root = settings["meetings_root_id"] as? String,
-              matches(root, "\\A[A-Za-z0-9_-]{10,200}\\z"),
+              Self.matches(root, "\\A[A-Za-z0-9_-]{10,200}\\z"),
               let codex = settings["codex"] as? String, codex.hasPrefix("/"),
               FileManager.default.isExecutableFile(atPath: codex) else { return false }
         if let model = settings["model"], !(model is NSNull) {

@@ -25,7 +25,7 @@ from quill_workflow.processing_lease import child_lease_fds
 CONNECTOR = "connector_5f3c8c41a1e54ad7a76272c89e2554fa"
 WRITE_TOOLS = frozenset(("create_folder", "upload_file", "import_document",
                          "copy_file", "batch_update_document"))
-TOOLS = frozenset(("get_file_metadata", "get_document", "search", "list_folder")) | WRITE_TOOLS
+TOOLS = frozenset(("get_profile", "get_file_metadata", "get_document", "search", "list_folder")) | WRITE_TOOLS
 DISABLED_FEATURES = (
     "shell_tool", "unified_exec", "shell_snapshot", "hooks", "browser_use",
     "browser_use_external", "in_app_browser", "computer_use", "image_generation",
@@ -88,6 +88,47 @@ def operation_error(detail, fallback):
     return DriveOperationError(fallback)
 
 
+def _profile_fields(identity, email, name):
+    if not isinstance(identity, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", identity):
+        raise DriveProtocolError("Google Drive returned an invalid account profile identity")
+    if (not isinstance(email, str) or len(email) > 254 or not email.isprintable()
+            or not re.fullmatch(r"[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+", email)):
+        raise DriveProtocolError("Google Drive returned an invalid account email")
+    if (not isinstance(name, str) or not name or name != name.strip()
+            or len(name) > 500 or not name.isprintable()):
+        raise DriveProtocolError("Google Drive returned an invalid account name")
+    return {"id": identity, "email": email, "name": name}
+
+
+def _account_catalog(tool):
+    """Read account candidates only from the exact connector's structured metadata."""
+    if not isinstance(tool, dict) or tool.get("name") != "google_drive.get_profile":
+        raise DriveProtocolError("Google Drive account discovery returned an unexpected tool")
+    metadata = tool.get("_meta")
+    if not isinstance(metadata, dict) or metadata.get("connector_id") != CONNECTOR:
+        raise DriveProtocolError("Google Drive account discovery returned a different connector")
+    candidates = metadata.get("link_accounts")
+    if not isinstance(candidates, list) or len(candidates) > 100:
+        raise DriveProtocolError("Google Drive returned an invalid connected-account list")
+    accounts, links, profiles, emails = [], set(), set(), set()
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            raise DriveProtocolError("Google Drive returned an invalid connected account")
+        link = validate_account_link_id(candidate.get("link_id"))
+        if link is None:
+            raise DriveProtocolError("Google Drive connected account has no account link")
+        profile = _profile_fields(candidate.get("profile_id"), candidate.get("profile_email"),
+                                  candidate.get("profile_name"))
+        if link in links or profile["id"] in profiles or profile["email"].casefold() in emails:
+            raise DriveProtocolError("Google Drive returned duplicate connected-account identities")
+        links.add(link)
+        profiles.add(profile["id"])
+        emails.add(profile["email"].casefold())
+        accounts.append({"link_id": link, "profile_id": profile["id"],
+                         "email": profile["email"], "name": profile["name"]})
+    return sorted(accounts, key=lambda account: (account["email"].casefold(), account["link_id"]))
+
+
 def _json(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"),
                       ensure_ascii=False, allow_nan=False)
@@ -114,6 +155,7 @@ def validate_arguments(tool_name, arguments, *, account_link_id=None):
         raise DriveProtocolError("Unsupported Drive operation or arguments")
     arguments = account_arguments(arguments, account_link_id)
     allowed = {
+        "get_profile": set(),
         "get_file_metadata": {"fileId", "fields", "supportsAllDrives"},
         "get_document": {"document_id"},
         "search": {"query", "item_type", "page_token", "special_filter_query_str",
@@ -126,6 +168,7 @@ def validate_arguments(tool_name, arguments, *, account_link_id=None):
         "batch_update_document": {"document_id", "requests", "write_control"},
     }[tool_name] | {"link_id"}
     required = {
+        "get_profile": set(),
         "get_file_metadata": {"fileId", "fields"},
         "get_document": {"document_id"},
         "search": {"best_effort_fetch", "special_filter_query_str", "topn"},
@@ -248,6 +291,9 @@ def _native_result(result, tool, arguments):
         raise DriveProtocolError("Drive response has no structured connector result")
     if set(native) == {"result"} and isinstance(native["result"], dict):
         native = native["result"]
+    if tool == "get_profile":
+        _profile_fields(native.get("id"), native.get("email"), native.get("name"))
+        return native
     if tool == "import_document":
         # The import connector uses Google API camelCase fields, unlike raw
         # upload_file's normalized id/mime_type response. Accept only the
@@ -401,6 +447,60 @@ class _RPC:
             self.done = True
 
 
+class _AccountsRPC(_RPC):
+    """Bounded connector catalog reads, without starting a model turn."""
+
+    def __init__(self, directory):
+        self.accounts = None
+        self.pages = 0
+        self.cursors = set()
+        super().__init__(directory, "get_profile", {})
+
+    def queue(self, message):
+        if message.get("method") == "mcpServer/tool/call":
+            message = {"id": 3, "method": "mcpServerStatus/list", "params": {
+                "threadId": self.thread, "detail": "toolsAndAuthOnly", "limit": 20}}
+        super().queue(message)
+
+    def consume(self, line):
+        try:
+            message = _load_json(line)
+        except (ValueError, UnicodeError) as error:
+            raise DriveProtocolError("Codex emitted invalid account-discovery JSON-RPC") from error
+        if (not isinstance(message, dict) or "method" in message
+                or type(message.get("id")) is not int or message["id"] < 3
+                or message["id"] != self.expected_id or self.done or "error" in message):
+            return super().consume(line)
+        result = message.get("result")
+        if not isinstance(result, dict) or not isinstance(result.get("data"), list) or len(result["data"]) > 100:
+            raise DriveProtocolError("Codex returned an invalid account-discovery catalog")
+        self.pages += 1
+        for server in result["data"]:
+            if not isinstance(server, dict):
+                raise DriveProtocolError("Codex returned an invalid connector catalog entry")
+            if server.get("name") != "codex_apps":
+                continue
+            tools = server.get("tools")
+            if not isinstance(tools, dict):
+                raise DriveProtocolError("Codex returned an invalid connector tool catalog")
+            if "google_drive.get_profile" in tools:
+                if self.accounts is not None:
+                    raise DriveProtocolError("Codex returned a duplicate Google Drive account catalog")
+                self.accounts = _account_catalog(tools["google_drive.get_profile"])
+        cursor = result.get("nextCursor")
+        if cursor is None:
+            self.result = self.accounts if self.accounts is not None else []
+            self.done = True
+            return
+        if (not isinstance(cursor, str) or not cursor or len(cursor) > 4096
+                or cursor in self.cursors or self.pages >= 10):
+            raise DriveProtocolError("Codex account-discovery pagination exceeded its bounds")
+        self.cursors.add(cursor)
+        self.expected_id += 1
+        self.queue({"id": self.expected_id, "method": "mcpServerStatus/list", "params": {
+            "threadId": self.thread, "detail": "toolsAndAuthOnly", "limit": 20, "cursor": cursor}})
+
+
 def _stream(process, rpc, timeout, max_output_bytes, cancelled=None):
     deadline = time.monotonic() + timeout
     buffer = bytearray()
@@ -483,6 +583,15 @@ class CodexDriveTransport:
         self.cancelled = cancelled
         self.account_link_id = validate_account_link_id(account_link_id)
 
+    def discover_accounts(self):
+        """List connected Drive account candidates; verify selection with get_profile."""
+        if self.cancelled and self.cancelled():
+            raise DriveOperationError("Google Drive account discovery was stopped")
+        executable = shutil.which(self.executable)
+        if not executable:
+            raise DriveTransportError("Codex CLI is not installed; connect Google Drive in Codex")
+        return self._run_rpc(executable, "get_profile", {}, discovery=True)
+
     def invoke(self, tool_name, arguments):
         arguments = validate_arguments(tool_name, arguments, account_link_id=self.account_link_id)
         if self.cancelled and self.cancelled():
@@ -498,10 +607,13 @@ class CodexDriveTransport:
                               timeout=self.timeout, max_output_bytes=self.max_output_bytes,
                               tool_name=tool_name, cancelled=self.cancelled,
                               account_link_id=self.account_link_id)
+        return self._run_rpc(executable, tool_name, arguments)
+
+    def _run_rpc(self, executable, tool_name, arguments, *, discovery=False):
         with tempfile.TemporaryDirectory(prefix="quill-codex-drive-") as temporary:
             directory = Path(temporary)
             directory.chmod(0o700)
-            rpc = _RPC(directory, tool_name, arguments)
+            rpc = _AccountsRPC(directory) if discovery else _RPC(directory, tool_name, arguments)
             process = None
             with _interruptions():
                 try:
@@ -509,9 +621,9 @@ class CodexDriveTransport:
                                                cwd=directory, env=child_environment(executable),
                                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                                stderr=subprocess.PIPE, start_new_session=True, pass_fds=child_lease_fds())
-                    # Full native document readback includes per-run styles.
-                    # A normal long meeting can exceed the metadata limit.
-                    output_limit = max(self.max_output_bytes, 8_000_000) if tool_name == "get_document" else self.max_output_bytes
+                    # Full documents and connector catalogs can exceed the
+                    # normal metadata limit while still remaining bounded.
+                    output_limit = max(self.max_output_bytes, 8_000_000) if discovery or tool_name == "get_document" else self.max_output_bytes
                     return _stream(process, rpc, self.timeout, output_limit, self.cancelled)
                 except DriveTransportError as error:
                     error.outcome_unknown = tool_name in WRITE_TOOLS and rpc.dispatched

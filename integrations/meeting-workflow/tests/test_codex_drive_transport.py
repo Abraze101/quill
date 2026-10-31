@@ -33,7 +33,7 @@ class CodexDriveTransportTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def fake(self, native=None, *, startup="", call="", before="", thread=None):
+    def fake(self, native=None, *, startup="", call="", before="", thread=None, catalog=None, catalog_code=""):
         native = self.native if native is None else native
         setup = {"thread": {"id": "ephemeral-test"}} if thread is None else thread
         response = {"content": [{"type": "text", "text": "Action completed."}],
@@ -50,6 +50,10 @@ class CodexDriveTransportTests(unittest.TestCase):
         code += "    if method == 'initialize':\n        send({'id': 1, 'result': {'userAgent': 'fixture'}})\n"
         code += "    elif method == 'initialized':\n        continue\n"
         code += "    elif method == 'thread/start':\n        send({'id': 2, 'result': " + repr(setup) + "})\n"
+        code += "    elif method == 'mcpServerStatus/list':\n"
+        code += textwrap.indent(catalog_code or "send({'id':request['id'],'result':"
+                               + repr(catalog if catalog is not None else {"data": [], "nextCursor": None})
+                               + "})", "        ") + "\n"
         code += "    elif method == 'mcpServer/tool/call':\n"
         code += textwrap.indent(call or "send({'id': 3, 'result': " + repr(response) + "})", "        ") + "\n"
         code += "    else:\n        raise AssertionError('Unexpected request: ' + method)\n"
@@ -117,6 +121,92 @@ class CodexDriveTransportTests(unittest.TestCase):
             self.run_read(call=call)
         self.assertNotIn("untrusted", str(caught.exception))
         self.assertFalse(caught.exception.outcome_unknown)
+
+    def account_catalog(self, accounts=None):
+        if accounts is None:
+            accounts = [
+                {"link_id": "link_zeta", "profile_id": "user_zeta", "profile_email": "zeta@example.test", "profile_name": "Zeta"},
+                {"link_id": "link_alpha", "profile_id": "user_alpha", "profile_email": "alpha@example.test", "profile_name": "Alpha"},
+            ]
+        tool = {"name": "google_drive.get_profile", "inputSchema": {"type": "object"},
+                "_meta": {"connector_id": CONNECTOR, "link_accounts": accounts}}
+        return {"data": [{"name": "codex_apps", "tools": {"google_drive.get_profile": tool}}], "nextCursor": None}
+
+    def test_discovers_structured_accounts_without_model_turn_or_profile_call(self):
+        process_capture = self.root / "discovery-process.json"
+        startup = "Path(" + repr(str(process_capture)) + ").write_text(json.dumps(sys.argv))"
+        transport = CodexDriveTransport(executable=self.fake(catalog=self.account_catalog(), startup=startup),
+                                       account_link_id="link_zeta")
+        self.assertEqual(transport.discover_accounts(), [
+            {"link_id": "link_alpha", "profile_id": "user_alpha", "email": "alpha@example.test", "name": "Alpha"},
+            {"link_id": "link_zeta", "profile_id": "user_zeta", "email": "zeta@example.test", "name": "Zeta"},
+        ])
+        requests = self.requests()
+        self.assertEqual([r["method"] for r in requests],
+                         ["initialize", "initialized", "thread/start", "mcpServerStatus/list"])
+        self.assertEqual(requests[-1]["params"], {
+            "threadId": "ephemeral-test", "detail": "toolsAndAuthOnly", "limit": 20})
+        argv = json.loads(process_capture.read_text())
+        self.assertEqual([arg for arg in argv if ".tools." in arg], [
+            f"apps.{CONNECTOR}.tools.get_profile.enabled=true",
+            f'apps.{CONNECTOR}.tools.get_profile.approval_mode="auto"'])
+
+    def test_account_discovery_paginates_and_returns_empty_for_no_connected_drive(self):
+        first = {"data": [{"name": "other_server", "tools": {}}], "nextCursor": "next-page"}
+        code = "send({'id':request['id'],'result': " + repr(first) + " if request['id']==3 else " + repr(self.account_catalog()) + "})"
+        result = CodexDriveTransport(executable=self.fake(catalog_code=code)).discover_accounts()
+        self.assertEqual(len(result), 2)
+        self.assertEqual(self.requests()[-1]["params"]["cursor"], "next-page")
+        for catalog in ({"data": [], "nextCursor": None}, self.account_catalog([])):
+            with self.subTest(catalog=catalog):
+                self.assertEqual(CodexDriveTransport(executable=self.fake(catalog=catalog)).discover_accounts(), [])
+
+    def test_account_discovery_rejects_wrong_connector_and_unstructured_default_fallback(self):
+        for change in ({"connector_id": "another_connector"}, {"link_accounts": None},
+                       {"link_accounts": "do not parse this text"}, {"link_accounts": [{}]}):
+            catalog = self.account_catalog()
+            metadata = catalog["data"][0]["tools"]["google_drive.get_profile"]["_meta"]
+            metadata.update(change, link_id="link_default")
+            with self.subTest(change=change), self.assertRaises(DriveProtocolError):
+                CodexDriveTransport(executable=self.fake(catalog=catalog)).discover_accounts()
+
+    def test_account_discovery_rejects_malformed_or_duplicate_account_identities(self):
+        original = self.account_catalog()["data"][0]["tools"]["google_drive.get_profile"]["_meta"]["link_accounts"]
+        changes = [{"link_id": None}, {"link_id": "invalid"}, {"profile_id": "unsafe/id"},
+                   {"profile_email": "not-an-email"}, {"profile_email": "a@example.test\n"},
+                   {"profile_name": ""}, {"profile_name": "Invisible\x00name"},
+                   {"link_id": original[1]["link_id"]}, {"profile_id": original[1]["profile_id"]},
+                   {"profile_email": original[1]["profile_email"].upper()}]
+        for change in changes:
+            accounts = [dict(original[0], **change), original[1]]
+            with self.subTest(change=change), self.assertRaises(DriveProtocolError):
+                CodexDriveTransport(executable=self.fake(catalog=self.account_catalog(accounts))).discover_accounts()
+        with self.assertRaises(DriveProtocolError):
+            CodexDriveTransport(executable=self.fake(catalog=self.account_catalog(original * 51))).discover_accounts()
+
+    def test_account_discovery_rejects_repeated_or_unbounded_pagination(self):
+        for code in ("send({'id':request['id'],'result':{'data':[],'nextCursor':'repeated'}})",
+                     "send({'id':request['id'],'result':{'data':[],'nextCursor':'page-'+str(request['id'])}})"):
+            if self.capture.exists():
+                self.capture.unlink()
+            with self.subTest(code=code), self.assertRaisesRegex(DriveProtocolError, "pagination"):
+                CodexDriveTransport(executable=self.fake(catalog_code=code)).discover_accounts()
+            self.assertLessEqual(sum(r["method"] == "mcpServerStatus/list" for r in self.requests()), 10)
+
+    def test_profile_read_uses_selected_link_and_validates_native_identity(self):
+        profile = {"id": "google_profile_123", "email": "person@example.test", "name": "Person", "picture": None}
+        self.assertEqual(invoke("get_profile", {}, executable=self.fake(native=profile),
+                                account_link_id="link_selected"), profile)
+        call = self.requests()[-1]
+        self.assertEqual(call["params"]["tool"], "google_drive.get_profile")
+        self.assertEqual(call["params"]["arguments"], {"link_id": "link_selected"})
+        self.assertEqual(validate_arguments("get_profile", {}), {})
+        for change in ({"id": ""}, {"id": "x" * 201}, {"email": "unknown"}, {"name": None}):
+            with self.subTest(change=change), self.assertRaises(DriveProtocolError):
+                invoke("get_profile", {}, executable=self.fake(native=dict(profile, **change)),
+                       account_link_id="link_selected")
+        with self.assertRaises(DriveProtocolError):
+            validate_arguments("get_profile", {"arbitrary": "argument"}, account_link_id="link_selected")
 
     def test_saved_auth_private_process_only_config_and_no_model_override(self):
         capture = self.root / "process.json"

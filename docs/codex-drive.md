@@ -7,22 +7,63 @@ its category folders, and a notes format before enabling it. Each job saves its
 settings and approved destination; later configuration changes do not rewrite
 existing decisions.
 
-If Codex has more than one Google Drive account connected, set
-`account_link_id` on both `archive` and `publish` to the connection that owns the
-existing Meetings root. Obtain the exact `link_...` ID from Codex's connected
-Drive tools; it is a connection ID, not an email address or folder ID. Quill
-passes that account to every Drive request. Use the same connection for both
-stages and verify the root and category folders through that connection before
-enabling filing. A company folder's name does not select a Google account.
+In **Settings → Google Drive**, choose the connected account that owns the
+Meetings folder. Choose an account even when the list contains only one. If the
+account is missing, connect Google Drive in Codex, then refresh Quill's list.
+Configure the Meetings root before saving the selection. Both configured Drive
+outputs must use that root.
+
+Quill checks the selected account's profile, the root's private ownership, the
+category folders, and any configured notes template. If the separate recording
+uploader is configured, its account must match too. Settings then shows the
+verified email address. A company folder's name does not select a Google account.
+
+Choosing an account leaves all processing and upload switches unchanged. It
+saves `account_link_id` on the configured `archive` and `publish` stages and a
+`drive_account` verification record in `workflow.json`. Quill requires that
+verified connection before enabling Drive filing. A changed account or Meetings
+root needs verification again. If an upload is running, let it finish before
+changing accounts. Account setup never stops a recording.
 
 New jobs save the selected connection in their settings and upload journals.
 Retries and releases preserve it; changing the live account holds a saved upload
 for review. Existing jobs retain their original account binding, including its
 absence. Adding a connection to an older job requires an explicit reconciliation
 of its journals and existing remote files; changing the config alone does not
-migrate it. Without a configured connection, single-account installations retain
-their existing behavior. If the connector requires an account selection, Quill
-reports that requirement instead of choosing one.
+migrate it. Existing activation switches and completed receipts remain unchanged
+after an update. Without a verified account, new Drive work waits for setup;
+local recording and configured notes processing continue. Selecting an account
+does not release older held work or retry failed jobs.
+
+The setup commands are also available for an installation agent:
+
+```sh
+python3 integrations/meeting-workflow/workflow.py drive-accounts
+python3 integrations/meeting-workflow/workflow.py drive-select \
+  --link-id SELECTED_LINK_ID --revision REVISION_FROM_ACCOUNT_LIST \
+  --profile-id SELECTED_PROFILE_ID --email SELECTED_EMAIL
+```
+
+`drive-accounts` returns account choices, the existing selection if any, and the
+configuration revision. `drive-select` requires that revision and the displayed
+account's profile ID and email, then returns the verified account. A connection
+that changed accounts after the list was shown requires a fresh selection.
+Both commands return JSON, including errors, and leave the
+meeting queue untouched. They do not connect new accounts or grant Drive access.
+
+The Settings account picker reuses the `workflow.py` entry point from
+`config.json`'s `meeting_review` command. If that command uses a different entry
+point, configure `drive_setup` explicitly:
+
+```json
+"drive_setup": [
+  "/usr/bin/python3",
+  "/absolute/path/to/quill/integrations/meeting-workflow/workflow.py"
+]
+```
+
+Quill appends the current workflow config and state locations, followed by the
+account command. Supply an argument array; no shell command is needed.
 
 Settings provides two independent choices:
 
@@ -70,6 +111,7 @@ uploads disabled:
   "archive": {
     "enabled": false,
     "type": "codex_drive",
+    "requires_route": true,
     "text_format": "combined_google_doc_v1",
     "document_timezone": "America/Los_Angeles",
     "meetings_root_id": "REPLACE_WITH_REAL_MEETINGS_FOLDER_ID",
@@ -79,6 +121,7 @@ uploads disabled:
   "publish": {
     "enabled": false,
     "type": "codex_drive",
+    "requires_route": true,
     "text_format": "combined_google_doc_v1",
     "notes_layout": "clean",
     "document_timezone": "America/Los_Angeles",
@@ -187,7 +230,7 @@ After successful authorization, add this property to the existing `archive` sett
 ```json
 "large_files": {
   "type": "google_drive_resumable",
-  "credentials_file": "~/.config/quill/drive-upload-credentials.json"
+    "credentials_file": "/absolute/path/to/drive-upload-credentials.json"
 }
 ```
 
