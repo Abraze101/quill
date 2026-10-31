@@ -899,15 +899,23 @@ final class AppController {
         if let preferences = completionStatus?.preferences {
             state.notesActive = preferences.notesActive
             state.canEnableNotes = preferences.notesConfigured && state.localTranscription
+            state.notesStatus = !preferences.notesConfigured || (preferences.notesActive && !preferences.notesEnabled)
+                ? preferences.notesDescription : ""
+            if !state.localTranscription { state.notesStatus = "Turn on local transcription to create notes." }
             state.driveDocumentsActive = preferences.driveDocumentsEnabled
             state.driveRecordingsActive = preferences.driveRecordingsEnabled
             state.driveDocumentsTitle = preferences.driveDocumentsTitle
             state.driveRecordingsTitle = preferences.driveRecordingsTitle
-            state.driveDocumentsStatus = preferences.driveDocumentsDescription
-            state.driveRecordingsStatus = preferences.driveRecordingsDescription
+            state.driveDocumentsStatus = preferences.driveDocumentsConfigured ? "" : preferences.driveDocumentsDescription
+            state.driveRecordingsStatus = preferences.driveRecordingsConfigured ? "" : preferences.driveRecordingsDescription
             state.driveAccountEmail = preferences.driveAccountEmail
             state.driveAccountStatus = preferences.driveAccountDescription
             let canFile = preferences.notesConfigured && preferences.notesEnabled && state.localTranscription
+            if !canFile {
+                state.driveRequirement = !state.localTranscription
+                    ? "Turn on local transcription and meeting notes to use Drive."
+                    : "Turn on meeting notes to use Drive."
+            }
             state.canEnableDriveDocuments = preferences.driveDocumentsConfigured && canFile
             state.canEnableDriveRecordings = preferences.driveRecordingsConfigured && canFile
         }
@@ -1313,7 +1321,7 @@ final class AppController {
             microphoneStatus = "Paused"
             systemAudioStatus = "Paused"
             videoStatus = requestedScreenVideo ? (phase == .paused ? "Paused" : phase == .pausing ? "Stopping" : "Starting") : "Off"
-            detail = "Paused time is left out of the saved recording. Resume when ready, or Stop & save."
+            detail = "Paused time is excluded from the recording."
             if !safetyReasons.isEmpty { detail = safetyReasons.joined(separator: " ") }
             if case .recovering = micStatus { microphoneStatus = "Reconnecting" }
             if case .failed = micStatus { microphoneStatus = "Unavailable" }
@@ -1326,7 +1334,7 @@ final class AppController {
         case .stopping:
             controlPhase = .stopping
             detail = (safetyReasons.isEmpty ? "" : safetyReasons.joined(separator: " ") + " ")
-                + "Finishing the saved recording. Keep Quill open."
+                + "Keep Quill open until saving finishes."
             microphoneStatus = "Stopped"
             systemAudioStatus = "Stopping"
             videoStatus = requestedScreenVideo ? "Saving" : "Off"

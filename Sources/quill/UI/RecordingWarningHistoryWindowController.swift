@@ -45,7 +45,7 @@ final class RecordingWarningHistoryWindowController: NSWindowController {
     private func buildContent() {
         guard let content = window?.contentView else { return }
         let explanation = NSTextField(wrappingLabelWithString:
-            "Warnings shown by Quill on this Mac, newest first. “No longer shown” means the warning left the interface; it does not confirm that an issue was fixed.")
+            "Newest first. “No longer shown” does not confirm the issue was fixed.")
         explanation.font = .systemFont(ofSize: 12)
         explanation.textColor = .secondaryLabelColor
         storageLabel.font = .systemFont(ofSize: 12)
@@ -70,7 +70,7 @@ final class RecordingWarningHistoryWindowController: NSWindowController {
         textView.setAccessibilityIdentifier("quill-warning-history")
         scroll.documentView = textView
         let privacy = NSTextField(wrappingLabelWithString:
-            "Saved locally. Browser-only reminders and warnings from earlier versions are not included.")
+            "Saved on this Mac. Excludes browser-only reminders and warnings from earlier versions.")
         privacy.font = .systemFont(ofSize: 11)
         privacy.textColor = .secondaryLabelColor
         let stack = NSStackView(views: [explanation, storageLabel, scroll, privacy])
@@ -111,8 +111,6 @@ final class RecordingWarningHistoryWindowController: NSWindowController {
         }
         if entries.isEmpty {
             append("No warnings recorded yet", font: .systemFont(ofSize: 16, weight: .semibold))
-            append("Quill will save new warnings here. Earlier flashes cannot be reconstructed.",
-                font: .systemFont(ofSize: 13), color: .secondaryLabelColor)
         } else {
             for entry in entries.reversed() {
                 append("\(dateFormatter.string(from: entry.timestamp)) · \(entry.source.displayTitle) · \(entry.event.displayTitle)",

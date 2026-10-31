@@ -464,11 +464,11 @@ enum WorkflowPreferenceChecks {
         let status = CompletionUIStatus(settingsURL: url, statusURL: statusURL)
         precondition(status.pendingReviews == 2 && status.preferences?.notesConfigured == true)
         precondition(!status.notes.isEmpty && !status.drive.isEmpty)
-        func processing(_ state: String, revision: String? = nil) throws -> CompletionUIStatus {
+        func processing(_ state: String, revision: String? = nil, pendingReviews: Int = 1) throws -> CompletionUIStatus {
             var value: [String: Any] = ["state": state, "title": "Meeting processing", "detail": "Synthetic status",
                                         "retryable_jobs": 1]
             if let revision { value["alert_revision"] = revision }
-            try JSONSerialization.data(withJSONObject: ["processing": value, "pending_reviews": 1]).write(to: statusURL)
+            try JSONSerialization.data(withJSONObject: ["processing": value, "pending_reviews": pendingReviews]).write(to: statusURL)
             return CompletionUIStatus(settingsURL: url, statusURL: statusURL)
         }
         for state in ["idle", "queued", "running", "retrying", "waiting_for_company"] {
@@ -477,15 +477,20 @@ enum WorkflowPreferenceChecks {
             precondition(!current.needsAttention && current.alertRevision == nil,
                          "Healthy processing and company review must not produce failure alerts")
         }
+        let upToDate = try processing("idle", pendingReviews: 0)
+        precondition(upToDate.processingTitle == "Up to date" && upToDate.processingDetail.isEmpty)
         let failed = try processing("needs_attention", revision: "stable-failure-id")
         precondition(failed.needsAttention && failed.alertRevision == "stable-failure-id" && failed.retryableJobs == 1)
-        try JSONSerialization.data(withJSONObject: ["processing": [
-            "state": "running", "title": "Writing notes", "detail": "Current meeting",
-            "attention_detail": "An older meeting needs review", "alert_revision": "older-failure"]]).write(to: statusURL)
-        let activeWithFailure = CompletionUIStatus(settingsURL: url, statusURL: statusURL)
-        precondition(activeWithFailure.processingTitle == "Writing notes" && activeWithFailure.needsAttention)
-        precondition(activeWithFailure.attentionDetail == "An older meeting needs review"
-                     && activeWithFailure.alertRevision == "older-failure")
+        for state in ["running", "idle"] {
+            try JSONSerialization.data(withJSONObject: ["processing": [
+                "state": state, "title": "Writing notes", "detail": "Current meeting",
+                "attention_detail": "An older meeting needs review", "alert_revision": "older-failure"]]).write(to: statusURL)
+            let activeWithFailure = CompletionUIStatus(settingsURL: url, statusURL: statusURL)
+            precondition(activeWithFailure.processingTitle == "Writing notes" && activeWithFailure.needsAttention)
+            precondition(activeWithFailure.processingDetail == "Current meeting")
+            precondition(activeWithFailure.attentionDetail == "An older meeting needs review"
+                         && activeWithFailure.alertRevision == "older-failure")
+        }
         let unknown = try processing("unrecognized")
         precondition(unknown.processingTitle == nil)
         let statusLink = temporary.appendingPathComponent("status-link.json")

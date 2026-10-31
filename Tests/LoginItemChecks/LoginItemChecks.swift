@@ -50,12 +50,13 @@ enum LoginItemChecks {
         let controller = service.controller()
         let off = controller.snapshot()
         precondition(!off.enabled && !off.requiresApproval && off.canChange)
-        precondition(off.detail.hasPrefix("Off."))
+        precondition(off.detail.isEmpty)
         precondition(service.registerCalls == 0 && service.unregisterCalls == 0)
 
         controller.setEnabled(true)
         let on = controller.snapshot()
         precondition(on.enabled && !on.requiresApproval && on.canChange)
+        precondition(on.detail.isEmpty)
         precondition(service.registerCalls == 1 && service.unregisterCalls == 0)
         controller.setEnabled(true)
         precondition(service.registerCalls == 1, "Repeated enable must not register twice")
@@ -91,7 +92,7 @@ enum LoginItemChecks {
         let absent = absentService.controller()
         let firstUse = absent.snapshot()
         precondition(!firstUse.enabled && !firstUse.requiresApproval && firstUse.canChange)
-        precondition(firstUse.detail.contains("Not set up."))
+        precondition(firstUse.detail.isEmpty)
         precondition(absentService.registerCalls == 0 && absentService.unregisterCalls == 0,
                      "A missing background-task record must not register automatically")
         absent.setEnabled(false)
@@ -152,7 +153,7 @@ enum LoginItemChecks {
         failing.setEnabled(true)
         let failedEnable = failing.snapshot()
         precondition(!failedEnable.enabled && failing.error != nil)
-        precondition(failedEnable.detail.contains("Test registration refused") && failedEnable.detail.contains("Off."))
+        precondition(failedEnable.detail.contains("Test registration refused"))
         failingService.registerFails = false
         failing.setEnabled(true)
         precondition(failing.error == nil && failing.snapshot().enabled, "A successful retry must clear the error")

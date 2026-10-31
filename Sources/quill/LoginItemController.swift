@@ -57,16 +57,10 @@ final class LoginItemController {
             enabled: status == .enabled,
             requiresApproval: status == .requiresApproval,
             canChange: status != .unavailable,
-            detail: "Off. Turn on to open Quill in the menu bar when you log in."
+            detail: ""
         )
-        if state.enabled { state.detail = "Quill will open in the menu bar when you log in." }
         if state.requiresApproval {
             state.detail = "Waiting for approval in System Settings → General → Login Items."
-        }
-        if status == .notFound {
-            // macOS can return this before the app has its first background-task
-            // record. Only an explicit user action may attempt registration.
-            state.detail = "Not set up. Turn on to open Quill in the menu bar when you log in."
         }
         if status == .unavailable { state.detail = "macOS could not find this Quill login item. Reopen Quill from Applications." }
         // An existing native item may still be disabled while a legacy one exists.
@@ -74,7 +68,7 @@ final class LoginItemController {
             state.canChange = false
             state.detail = "An older Quill login agent is installed. Remove that agent before enabling this option."
         }
-        if let error { state.detail = error + " " + state.detail }
+        if let error { state.detail = state.detail.isEmpty ? error : error + " " + state.detail }
         return state
     }
 

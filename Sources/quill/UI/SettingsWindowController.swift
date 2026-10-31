@@ -55,6 +55,7 @@ struct QuillSettingsState {
     var driveAccountEmail: String?
     var driveAccountStatus = "Choose and verify a Google account before enabling Drive filing."
     var driveAccountBusy = false
+    var driveRequirement = ""
     var processingTitle = "No processing status yet"
     var processingDetail = ""
     var processingNeedsAttention = false
@@ -104,6 +105,7 @@ final class SettingsWindowController: NSWindowController {
     private let targetLabel = NSTextField(labelWithString: "Meeting window")
     private let captureHelp = NSTextField(wrappingLabelWithString: "")
     private let captureDetail = NSTextField(wrappingLabelWithString: "")
+    private var captureControls: [NSView] = []
     private let refreshButton = NSButton(title: "Refresh", target: nil, action: nil)
     private let transcriptionButton = NSButton(checkboxWithTitle: "Transcribe locally", target: nil, action: nil)
     private let speakersButton = NSButton(checkboxWithTitle: "Identify speakers locally", target: nil, action: nil)
@@ -115,6 +117,7 @@ final class SettingsWindowController: NSWindowController {
     private let driveDocumentsStatus = NSTextField(wrappingLabelWithString: "")
     private let driveRecordingsStatus = NSTextField(wrappingLabelWithString: "")
     private let driveAccountStatus = NSTextField(wrappingLabelWithString: "")
+    private let driveRequirement = NSTextField(wrappingLabelWithString: "")
     private let driveAccountButton = NSButton(title: "Choose account…", target: nil, action: nil)
     private var accountAlert: NSAlert?
     private var accountPopup: NSPopUpButton?
@@ -190,29 +193,32 @@ final class SettingsWindowController: NSWindowController {
         targetPopup.isEnabled = canSelectScreen && !state.captureTargets.isEmpty
         refreshButton.isEnabled = canSelectScreen
         refreshButton.title = state.captureTargetsLoading ? "Refreshing…" : "Refresh"
-        captureHelp.stringValue = !state.includeScreenVideo
-            ? "Screen video is off. Only microphone and system audio will be recorded. Turn on Include screen video to capture the selected window or display."
-            : state.captureScope == .meetingWindow
-            ? "Keep the meeting in its own Chrome window. Other windows stay out of the video. Switching tabs here may appear briefly before video stops."
-            : "Records everything visible on the selected display, including other windows."
+        for control in captureControls { control.isHidden = !state.includeScreenVideo }
+        captureHelp.stringValue = state.captureScope == .meetingWindow
+            ? "Only this window is captured. Switching tabs may expose other content."
+            : "Everything visible on this display is recorded."
         captureDetail.stringValue = state.captureTargetDetail ?? ""
         captureDetail.isHidden = !state.includeScreenVideo || state.captureTargetDetail?.isEmpty != false
         transcriptionButton.state = state.localTranscription ? .on : .off
         transcriptionButton.isEnabled = !state.isRecording
         speakersButton.state = state.identifySpeakers ? .on : .off
         speakersButton.isEnabled = state.localTranscription && !state.isRecording
-        recordingDetail.stringValue = state.isRecording
-            ? "Capture and transcription settings can be changed after recording stops."
-            : "Transcription runs on this Mac after recording stops."
+        recordingDetail.stringValue = "Stop recording to change capture or transcription settings."
+        recordingDetail.isHidden = !renderedRecording
         notesStatus.stringValue = state.notesStatus
+        notesStatus.isHidden = state.notesStatus.isEmpty
         processingStatus.stringValue = state.processingTitle
         processingStatus.textColor = state.processingNeedsAttention ? .systemOrange : .labelColor
         processingDetail.stringValue = state.processingDetail
         processingDetail.isHidden = state.processingDetail.isEmpty
         processingButton.isEnabled = state.processingReviewAvailable
         driveDocumentsStatus.stringValue = state.driveDocumentsStatus
+        driveDocumentsStatus.isHidden = state.driveDocumentsStatus.isEmpty || state.driveDocumentsStatus == state.driveAccountStatus
         driveRecordingsStatus.stringValue = state.driveRecordingsStatus
+        driveRecordingsStatus.isHidden = state.driveRecordingsStatus.isEmpty || state.driveRecordingsStatus == state.driveAccountStatus
         driveAccountStatus.stringValue = state.driveAccountStatus
+        driveRequirement.stringValue = state.driveRequirement
+        driveRequirement.isHidden = state.driveRequirement.isEmpty
         driveAccountButton.title = state.driveAccountBusy ? "Checking…" : state.driveAccountEmail == nil ? "Choose account…" : "Change / verify…"
         driveAccountButton.isEnabled = !state.driveAccountBusy
         driveDocumentsSwitch.title = state.driveDocumentsTitle
@@ -226,6 +232,7 @@ final class SettingsWindowController: NSWindowController {
         loginSwitch.state = state.loginItem.requiresApproval ? .mixed : state.loginItem.enabled ? .on : .off
         loginSwitch.isEnabled = state.loginItem.canChange
         loginDetail.stringValue = state.loginItem.detail
+        loginDetail.isHidden = state.loginItem.detail.isEmpty
         loginSettingsButton.isHidden = !state.loginItem.requiresApproval
         checkInPopup.selectItem(withTag: state.checkInHours)
         checkInPopup.isEnabled = !renderedRecording
@@ -319,7 +326,6 @@ final class SettingsWindowController: NSWindowController {
         recordingActions.distribution = .fillEqually
         recordingActions.spacing = 8
         add(recordingActions, to: root)
-        add(detail(NSTextField(wrappingLabelWithString: "Manual recording works with Discord and other apps. Use Stop recording when the call ends.")), to: root)
 
         let apps = NSTextField(labelWithString: "Meet & Zoom in Chrome")
         apps.textColor = .secondaryLabelColor
@@ -329,7 +335,8 @@ final class SettingsWindowController: NSWindowController {
         scopePopup.target = self
         scopePopup.action = #selector(scopeChanged)
         scopePopup.setAccessibilityLabel("Screen capture scope")
-        add(row(label: "Capture", control: scopePopup), to: root)
+        let scopeRow = row(label: "Capture", control: scopePopup)
+        add(scopeRow, to: root)
 
         targetPopup.target = self
         targetPopup.action = #selector(targetChanged)
@@ -348,15 +355,17 @@ final class SettingsWindowController: NSWindowController {
         targetPopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 260).isActive = true
         add(detail(captureHelp), to: root)
         add(detail(captureDetail), to: root)
+        captureControls = [scopeRow, targetLabel, targetControls, captureHelp]
 
         transcriptionButton.target = self
         transcriptionButton.action = #selector(transcriptionChanged)
+        transcriptionButton.toolTip = "Transcribes on this Mac after recording stops."
         add(transcriptionButton, to: root)
         add(detail(recordingDetail), to: root)
         speakersButton.target = self
         speakersButton.action = #selector(speakersChanged)
+        speakersButton.toolTip = "Names require clear introductions. Other voices use speaker numbers; overlapping speech may remain unidentified."
         add(speakersButton, to: root)
-        add(detail(NSTextField(wrappingLabelWithString: "Names come from clear introductions. Other voices keep speaker numbers; overlapping speech may remain unidentified.")), to: root)
 
         add(separator(), to: root)
         add(heading("Recording safeguards"), to: root)
@@ -367,13 +376,12 @@ final class SettingsWindowController: NSWindowController {
         checkInPopup.target = self
         checkInPopup.action = #selector(checkInChanged)
         checkInPopup.setAccessibilityLabel("Recording check-in after")
-        add(row(label: "Check in after", control: checkInPopup), to: root)
-        add(detail(NSTextField(wrappingLabelWithString: "After 5 minutes without a reply, Quill stops and saves locally for review. Continue adds 1 hour. This applies to automatic and manual Quill recordings.")), to: root)
-        add(row(label: "Recording indicator", control: NSTextField(labelWithString: "Always visible")), to: root)
+        checkInPopup.toolTip = "Applies to all recordings. Choosing Continue adds one hour."
+        add(row(label: "Remind me after", control: checkInPopup), to: root)
+        add(detail(NSTextField(wrappingLabelWithString: "Stops and saves locally after 5 minutes without a reply.")), to: root)
         dockSwitch.target = self
         dockSwitch.action = #selector(dockChanged)
         add(dockSwitch, to: root)
-        add(detail(NSTextField(wrappingLabelWithString: "Click Quill in the Dock to show recording controls. macOS can hide menu-bar icons when space is limited.")), to: root)
         add(separator(), to: root)
         add(heading("After the meeting"), to: root)
         processingButton.target = self
@@ -387,9 +395,9 @@ final class SettingsWindowController: NSWindowController {
         add(row(label: "Meeting notes & action items", control: notesButton), to: root)
         notesSwitch.target = self
         notesSwitch.action = #selector(notesChanged)
+        notesSwitch.toolTip = "Requires local transcription. Turning off notes also turns off Drive filing."
         add(notesSwitch, to: root)
         add(detail(notesStatus), to: root)
-        add(detail(NSTextField(wrappingLabelWithString: "Requires local transcription. Turning off notes also turns off Drive filing.")), to: root)
 
         add(separator(), to: root)
         add(heading("Connections"), to: root)
@@ -402,18 +410,20 @@ final class SettingsWindowController: NSWindowController {
         driveAccountStatus.setAccessibilityIdentifier("quill-drive-account-status")
         add(row(label: "Google account", control: driveAccountButton), to: root)
         add(detail(driveAccountStatus), to: root)
+        add(detail(driveRequirement), to: root)
         driveDocumentsSwitch.target = self
         driveDocumentsSwitch.action = #selector(driveDocumentsChanged)
         driveDocumentsSwitch.setAccessibilityIdentifier("quill-drive-documents")
+        driveDocumentsSwitch.toolTip = "New completed meetings only. Existing holds stay on hold; uploads already running may finish."
         add(driveDocumentsSwitch, to: root)
         add(detail(driveDocumentsStatus), to: root)
         driveRecordingsSwitch.target = self
         driveRecordingsSwitch.action = #selector(driveRecordingsChanged)
         driveRecordingsSwitch.setAccessibilityIdentifier("quill-drive-recordings")
+        driveRecordingsSwitch.toolTip = driveDocumentsSwitch.toolTip
         add(driveRecordingsSwitch, to: root)
         add(detail(driveRecordingsStatus), to: root)
-        add(detail(NSTextField(wrappingLabelWithString: "Both options require meeting notes and a filing category. Files stay private; sharing with attendees needs a separate approval.")), to: root)
-        add(detail(NSTextField(wrappingLabelWithString: "Switching on applies to new completed meetings. Work held while off stays on hold. Work already running may finish.")), to: root)
+        add(detail(NSTextField(wrappingLabelWithString: "Files stay private until you approve sharing.")), to: root)
         add(separator(), to: root)
         add(heading("Startup"), to: root)
         loginSwitch.allowsMixedState = true
@@ -511,7 +521,7 @@ final class SettingsWindowController: NSWindowController {
         guard let window, accountAlert == nil else { return }
         let alert = NSAlert()
         alert.messageText = "Choose your Google Drive account"
-        alert.informativeText = "Quill will verify that this account owns your configured meeting folders. This does not move or restart existing meetings."
+        alert.informativeText = "Choose the account that owns your meeting folders."
         alert.addButton(withTitle: "Use this account")
         alert.addButton(withTitle: "Cancel")
         alert.buttons[0].isEnabled = false

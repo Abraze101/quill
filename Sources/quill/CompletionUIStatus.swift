@@ -29,6 +29,10 @@ struct CompletionUIStatus {
                     alertRevision = Self.text(processing["alert_revision"], limit: 200)
                 }
                 if needsAttention && attentionDetail.isEmpty { attentionDetail = processingDetail }
+                if state == "idle" && !needsAttention && pendingReviews == 0 {
+                    processingTitle = "Up to date"
+                    processingDetail = ""
+                }
             }
         }
         preferences = try? WorkflowPreferences(url: settingsURL)
