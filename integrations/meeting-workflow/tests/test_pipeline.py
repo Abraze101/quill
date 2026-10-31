@@ -2,18 +2,20 @@ import hashlib
 import importlib.util
 import io
 import json
+from contextlib import redirect_stdout
 from pathlib import Path
 import struct
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from quill_workflow.pipeline import (ConnectorRunner, NeedsConfiguration, Queue, RecoverableUploadError,
                                      WorkflowError, atomic_json, render_notes)
+import workflow
 
 spec = importlib.util.spec_from_file_location("native_host", ROOT / "native-host.py")
 native = importlib.util.module_from_spec(spec)
@@ -401,20 +403,44 @@ class PipelineTests(unittest.TestCase):
                                   "{output}", str(count), "{job}", "{idempotency_key}"]}
         config = self.root / "workflow.json"
         atomic_json(config, self.config)
-        argv = [sys.executable, str(ROOT / "workflow.py"), "--state", str(self.queue.state),
-                "--config", str(config), "complete", str(self.session)]
-        first = subprocess.run(argv, check=True, text=True, capture_output=True, timeout=5).stdout.strip()
-        second = subprocess.run(argv, check=True, text=True, capture_output=True, timeout=5).stdout.strip()
-        self.assertEqual(first, second)
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
+        argv = ["--state", str(self.queue.state), "--config", str(config), "complete", str(self.session)]
+        workers = []
+        start_worker = workflow.start_worker
+
+        def track_worker(*args, **kwargs):
+            worker = start_worker(*args, **kwargs)
+            if worker is not None:
+                workers.append(worker)
+            return worker
+
+        def complete():
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                self.assertEqual(workflow.main(argv), 0)
+            return stdout.getvalue().strip()
+
+        try:
+            with patch.object(workflow, "start_worker", side_effect=track_worker):
+                first, second = complete(), complete()
+            self.assertEqual(first, second)
+            self.assertEqual(len(workers), 2)
+            # A succeeded task precedes final status writes and worker exit.
+            # Reap both actual children before inspecting or removing state.
+            for worker in workers:
+                self.assertEqual(worker.wait(timeout=10), 0)
             archive = next(t for t in self.queue.tasks(first) if t["stage"] == "archive")
-            if archive["status"] == "succeeded":
-                break
-            time.sleep(0.05)
-        self.assertEqual(archive["status"], "succeeded")
-        self.assertEqual(count.read_text(), "1")
-        self.assertTrue(all(t["status"] == "held" for t in self.queue.tasks(first) if t["stage"] != "archive"))
+            self.assertEqual(archive["status"], "succeeded")
+            self.assertEqual(count.read_text(), "1")
+            self.assertTrue(all(t["status"] == "held" for t in self.queue.tasks(first) if t["stage"] != "archive"))
+        finally:
+            for worker in workers:
+                if worker.poll() is None:
+                    worker.terminate()
+                try:
+                    worker.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    worker.kill()
+                    worker.wait(timeout=5)
 
 
 class NativeHostTests(unittest.TestCase):
