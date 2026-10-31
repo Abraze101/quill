@@ -55,6 +55,39 @@ class DriveTimeoutError(DriveTransportError):
     """The bounded invocation expired; reconcile writes before retrying."""
 
 
+def validate_account_link_id(value):
+    if value is not None and (not isinstance(value, str)
+            or not re.fullmatch(r"link_[A-Za-z0-9_-]{1,200}", value)):
+        raise DriveProtocolError("Configure a valid Google Drive account_link_id")
+    return value
+
+
+def account_arguments(arguments, account_link_id=None):
+    """Pin the connector account without allowing a call to change it."""
+    account_link_id = validate_account_link_id(account_link_id)
+    if not isinstance(arguments, dict):
+        raise DriveProtocolError("Unsupported Drive arguments")
+    if "link_id" in arguments and (account_link_id is None
+            or arguments["link_id"] != account_link_id):
+        raise DriveProtocolError("Drive arguments conflict with the configured account_link_id")
+    result = dict(arguments)
+    if account_link_id is not None:
+        result["link_id"] = account_link_id
+    return result
+
+
+def operation_error(detail, fallback):
+    """Recognize one contract failure without exposing untrusted error text."""
+    if isinstance(detail, dict):
+        detail = detail.get("message")
+    if (isinstance(detail, str)
+            and "link_id is required for this multi-link tool" in detail.lower()):
+        return DriveOperationError(
+            "Google Drive account selection is required; configure account_link_id "
+            "for the approved account before retrying")
+    return DriveOperationError(fallback)
+
+
 def _json(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"),
                       ensure_ascii=False, allow_nan=False)
@@ -75,10 +108,11 @@ def _load_json(value):
     return json.loads(value, object_pairs_hook=pairs, parse_constant=constant)
 
 
-def validate_arguments(tool_name, arguments):
+def validate_arguments(tool_name, arguments, *, account_link_id=None):
     """Restrict this private filing adapter to the documented connector surface."""
     if not isinstance(tool_name, str) or tool_name not in TOOLS or not isinstance(arguments, dict):
         raise DriveProtocolError("Unsupported Drive operation or arguments")
+    arguments = account_arguments(arguments, account_link_id)
     allowed = {
         "get_file_metadata": {"fileId", "fields", "supportsAllDrives"},
         "get_document": {"document_id"},
@@ -90,7 +124,7 @@ def validate_arguments(tool_name, arguments):
         "import_document": {"source_file", "title", "parent_folder_id", "upload_mode"},
         "copy_file": {"url", "new_title", "parent_folder"},
         "batch_update_document": {"document_id", "requests", "write_control"},
-    }[tool_name]
+    }[tool_name] | {"link_id"}
     required = {
         "get_file_metadata": {"fileId", "fields"},
         "get_document": {"document_id"},
@@ -337,7 +371,7 @@ class _RPC:
             detail = error.get("message", "") if isinstance(error, dict) else ""
             if isinstance(detail, str) and "approval" in detail.lower():
                 raise DriveOperationError("Codex requires approval for this Drive operation")
-            raise DriveOperationError("Codex rejected the Drive setup or operation request")
+            raise operation_error(detail, "Codex rejected the Drive setup or operation request")
         result = message.get("result")
         if not isinstance(result, dict):
             raise DriveProtocolError("Codex returned an unreadable RPC response")
@@ -437,7 +471,8 @@ def _stream(process, rpc, timeout, max_output_bytes, cancelled=None):
 
 
 class CodexDriveTransport:
-    def __init__(self, executable="codex", model=None, timeout=180, max_output_bytes=2_000_000, cancelled=None):
+    def __init__(self, executable="codex", model=None, timeout=180, max_output_bytes=2_000_000, cancelled=None,
+                 *, account_link_id=None):
         if not math.isfinite(timeout) or timeout <= 0:
             raise DriveProtocolError("Codex Drive timeout must be positive")
         if type(max_output_bytes) is not int or not 1024 <= max_output_bytes <= 10_000_000:
@@ -446,9 +481,10 @@ class CodexDriveTransport:
         self.model = model  # Used only by the runtime-mediated file upload.
         self.timeout, self.max_output_bytes = timeout, max_output_bytes
         self.cancelled = cancelled
+        self.account_link_id = validate_account_link_id(account_link_id)
 
     def invoke(self, tool_name, arguments):
-        arguments = validate_arguments(tool_name, arguments)
+        arguments = validate_arguments(tool_name, arguments, account_link_id=self.account_link_id)
         if self.cancelled and self.cancelled():
             raise DriveOperationError("Local deletion requested; no new Drive operation was started")
         executable = shutil.which(self.executable)
@@ -460,7 +496,8 @@ class CodexDriveTransport:
             from quill_workflow.codex_file_upload import run_upload
             return run_upload(arguments, executable=executable, model=self.model,
                               timeout=self.timeout, max_output_bytes=self.max_output_bytes,
-                              tool_name=tool_name, cancelled=self.cancelled)
+                              tool_name=tool_name, cancelled=self.cancelled,
+                              account_link_id=self.account_link_id)
         with tempfile.TemporaryDirectory(prefix="quill-codex-drive-") as temporary:
             directory = Path(temporary)
             directory.chmod(0o700)
@@ -493,5 +530,6 @@ class CodexDriveTransport:
 
 
 def invoke(tool_name, arguments, *, executable="codex", model=None, timeout=180,
-           max_output_bytes=2_000_000):
-    return CodexDriveTransport(executable, model, timeout, max_output_bytes).invoke(tool_name, arguments)
+           max_output_bytes=2_000_000, account_link_id=None):
+    return CodexDriveTransport(executable, model, timeout, max_output_bytes,
+                              account_link_id=account_link_id).invoke(tool_name, arguments)

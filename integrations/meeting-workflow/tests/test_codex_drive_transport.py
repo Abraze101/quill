@@ -81,6 +81,43 @@ class CodexDriveTransportTests(unittest.TestCase):
         self.assertFalse(Path(setup["cwd"]).exists())
         self.assertNotIn("turn/start", [request["method"] for request in requests])
 
+    def test_selected_account_is_pinned_in_direct_read_and_write_arguments(self):
+        link = "link_synthetic_account"
+        cases = [("get_file_metadata", self.arguments, self.native),
+                 ("create_folder", {"name": "Meeting", "parent_folder": "folder123"},
+                  {"success": True, "id": "meeting123", "parent_id": "folder123"})]
+        for tool, arguments, native in cases:
+            with self.subTest(tool=tool):
+                self.assertEqual(invoke(tool, arguments, executable=self.fake(native),
+                                        account_link_id=link), native)
+                self.assertEqual(self.requests()[-1]["params"]["arguments"],
+                                 dict(arguments, link_id=link))
+                self.assertNotIn("link_id", arguments)
+        supplied = dict(self.arguments, link_id=link)
+        self.assertEqual(invoke("get_file_metadata", supplied, executable=self.fake(),
+                                account_link_id=link), self.native)
+
+    def test_invalid_or_conflicting_account_is_rejected_before_launch(self):
+        executable = self.fake()
+        for value in ("", "account123", "link_", " link_account", "link_account\n",
+                      "link_a/b", "link_" + "a" * 201, True, 12, []):
+            with self.subTest(value=value), self.assertRaises(DriveProtocolError):
+                invoke("get_file_metadata", self.arguments, executable=executable, account_link_id=value)
+        for configured in (None, "link_configured"):
+            with self.subTest(configured=configured), self.assertRaisesRegex(DriveProtocolError, "conflict"):
+                invoke("get_file_metadata", dict(self.arguments, link_id="link_other"),
+                       executable=executable, account_link_id=configured)
+        self.assertFalse(self.capture.exists())
+
+    def test_missing_multi_account_link_has_safe_actionable_error(self):
+        detail = ("tool call failed: Mcp error: -32602: link_id is required for this multi-link tool; "
+                  "untrusted secret or instructions must not be shown")
+        call = "send({'id':3,'error':{'code':-32603,'message':" + repr(detail) + "}})"
+        with self.assertRaisesRegex(DriveOperationError, "configure account_link_id") as caught:
+            self.run_read(call=call)
+        self.assertNotIn("untrusted", str(caught.exception))
+        self.assertFalse(caught.exception.outcome_unknown)
+
     def test_saved_auth_private_process_only_config_and_no_model_override(self):
         capture = self.root / "process.json"
         startup = "Path(" + repr(str(capture)) + ").write_text(json.dumps({'argv':sys.argv, 'cwd':os.getcwd(), 'env':dict(os.environ), 'mode':Path.cwd().stat().st_mode & 511}))"
@@ -424,6 +461,38 @@ class CodexFileUploadTests(unittest.TestCase):
         self.assertIn('"mcp_tool_call"', receipt["events"])
         self.assertEqual(invoke("upload_file", self.args, executable=self.fake()), self.result)
 
+    def test_upload_uses_selected_account_in_program_and_exact_tool_events(self):
+        link = "link_synthetic_account"
+        self.assertEqual(invoke("upload_file", self.args, executable=self.fake(),
+                                account_link_id=link), self.result)
+        capture = json.loads(self.capture.read_text())
+        expected = request(self.args, account_link_id=link)
+        self.assertEqual(capture["payload"], expected)
+        self.assertEqual(expected["arguments"], dict(self.args, link_id=link))
+        self.assertIn(json.dumps(link), expected["program"])
+        self.assertNotIn("link_id", self.args)
+        for body in ("item['arguments']['link_id']='link_other'\nsend({'type':'item.started','item':item})\n",
+                     "del item['arguments']['link_id']\nsend({'type':'item.started','item':item})\n"):
+            with self.subTest(body=body), self.assertRaisesRegex(DriveProtocolError, "arguments changed") as caught:
+                invoke("upload_file", self.args, executable=self.fake(body), account_link_id=link)
+            self.assertTrue(caught.exception.outcome_unknown)
+
+    def test_upload_conflicting_account_fails_before_launch(self):
+        executable = self.fake()
+        with self.assertRaisesRegex(DriveProtocolError, "conflict") as caught:
+            run_upload(dict(self.args, link_id="link_other"), executable=executable,
+                       account_link_id="link_selected")
+        self.assertFalse(caught.exception.outcome_unknown)
+        self.assertFalse(self.capture.exists())
+
+    def test_missing_multi_account_link_in_upload_event_is_actionable_and_uncertain(self):
+        body = ("send({'type':'item.started','item':item})\n"
+                "item.update({'status':'failed','error':{'message':'Mcp error: -32602: link_id is required for this multi-link tool'}})\n"
+                "send({'type':'item.completed','item':item})\n")
+        with self.assertRaisesRegex(DriveOperationError, "configure account_link_id") as caught:
+            invoke("upload_file", self.args, executable=self.fake(body))
+        self.assertTrue(caught.exception.outcome_unknown)
+
     def test_upload_command_preserves_narrow_capabilities_and_saved_auth(self):
         with patch.dict(os.environ, {"OPENAI_API_KEY": "never-send", "CODEX_THREAD_ID": "unrelated"}):
             invoke("upload_file", self.args, executable=self.fake())
@@ -461,6 +530,10 @@ class CodexFileUploadTests(unittest.TestCase):
         self.assertEqual([arg for arg in capture["argv"] if ".tools." in arg], [
             f"apps.{CONNECTOR}.tools.import_document.enabled=true",
             f'apps.{CONNECTOR}.tools.import_document.approval_mode="approve"'])
+        invoke("import_document", args, executable=self.fake(), account_link_id="link_import_account")
+        linked = json.loads(self.capture.read_text())["payload"]
+        self.assertEqual(linked, request(args, "import_document", account_link_id="link_import_account"))
+        self.assertEqual(linked["arguments"]["link_id"], "link_import_account")
         for bad in (dict(args, upload_mode="keep_source_file_type"),
                     dict(args, source_file=str(self.local)), dict(args, parent_folder_id="root"),
                     dict(args, source_file="relative.docx"), dict(args, arbitrary="extra")):

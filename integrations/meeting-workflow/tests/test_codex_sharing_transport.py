@@ -30,6 +30,36 @@ class SharingTransportTests(unittest.TestCase):
         self.assertEqual(messages[-1]["params"]["tool"], "google_drive.share_file")
         self.assertEqual(messages[-1]["params"]["arguments"], self.arguments)
 
+    def test_selected_account_is_preserved_for_sharing_and_prepare_reads(self):
+        link = "link_sharing_account"
+        cases = [("share_file", self.arguments, {"success": True}),
+                 ("get_file_metadata", self.fixture.arguments, self.fixture.native)]
+        for tool, arguments, native in cases:
+            with self.subTest(tool=tool):
+                result = CodexSharingTransport(executable=self.fixture.fake(native=native),
+                                              account_link_id=link).invoke(tool, arguments)
+                self.assertEqual(result, native)
+                self.assertEqual(self.fixture.requests()[-1]["params"]["arguments"],
+                                 dict(arguments, link_id=link))
+                self.assertNotIn("link_id", arguments)
+
+    def test_sharing_cannot_override_selected_account_before_launch(self):
+        transport = CodexSharingTransport(executable=self.fixture.fake(native={"success": True}),
+                                          account_link_id="link_selected")
+        for tool, arguments in (("share_file", self.arguments),
+                                ("get_file_metadata", self.fixture.arguments)):
+            with self.subTest(tool=tool), self.assertRaisesRegex(private.DriveProtocolError, "conflict"):
+                transport.invoke(tool, dict(arguments, link_id="link_other"))
+        self.assertFalse(self.fixture.capture.exists())
+
+    def test_missing_account_error_stays_actionable_without_retrying_share(self):
+        call = "send({'id':3,'error':{'code':-32603,'message':'Mcp error: -32602: link_id is required for this multi-link tool'}})"
+        transport = CodexSharingTransport(executable=self.fixture.fake(call=call))
+        with self.assertRaisesRegex(private.DriveOperationError, "configure account_link_id") as caught:
+            transport.invoke("share_file", self.arguments)
+        self.assertTrue(caught.exception.outcome_unknown)
+        self.assertEqual(sum(m["method"] == "mcpServer/tool/call" for m in self.fixture.requests()), 1)
+
     def test_private_filing_transport_still_rejects_sharing(self):
         with self.assertRaises(private.DriveProtocolError):
             private.validate_arguments("share_file", self.arguments)

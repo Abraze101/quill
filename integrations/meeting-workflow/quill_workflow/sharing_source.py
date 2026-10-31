@@ -46,6 +46,19 @@ def _bytes_hash(value):
     return hashlib.sha256(value).hexdigest()
 
 
+def _account_link_id(settings, config):
+    # A new filing pins its account. Older receipts remain unchanged, but
+    # their selected connection is still part of the sharing review snapshot.
+    from .codex_drive_transport import DriveProtocolError, validate_account_link_id
+    account = settings.get("account_link_id")
+    if account is None:
+        account = config.get("publish", {}).get("account_link_id")
+    try:
+        return validate_account_link_id(account)
+    except DriveProtocolError as error:
+        raise SharingSourceError(str(error)) from error
+
+
 def _nonfinite(value):
     raise ValueError("Non-finite JSON value")
 
@@ -131,6 +144,7 @@ def _snapshot(state, config_path, job):
              "Sharing requires an already-filed native meeting document")
     frozen = route_settings(tasks["route"]["settings"])
     config = load_config(config_path)
+    account_link_id = _account_link_id(settings, config)
     current_route = route_settings(config.get("route", {}))
     _require(frozen.get("enabled") is True and current_route.get("enabled") is True
              and preserves_company_map(current_route["companies"], frozen["companies"]),
@@ -193,6 +207,8 @@ def _snapshot(state, config_path, job):
                          "template_sha256": settings.get("template_sha256"), "document_title": private_payload["title"]}
     if settings.get("meeting_timezone") is not None:
         expected_identity["meeting_timezone"] = settings["meeting_timezone"]
+    if settings.get("account_link_id") is not None:
+        expected_identity["account_link_id"] = settings["account_link_id"]
     _require(identity == expected_identity and journal.get("identity_sha256") == _hash(identity),
              "The notes changed after Drive filing; create a new review")
     published = receipts["publish"]
@@ -251,6 +267,8 @@ def _snapshot(state, config_path, job):
                     "processing_approval_sha256": _hash(approval),
                     "routing_review_sha256": _hash(review), "private_payload_sha256": payload_hash,
                     "journal_sha256": _bytes_hash(reads[result / "drive-publish.json"])}}
+    if account_link_id is not None:
+        snapshot["account_link_id"] = account_link_id
     # Detect changes while assembling the preview, including a withdrawn
     # recording decision. Re-read only bounded source files already selected.
     for relative in tuple(reads):
@@ -267,7 +285,10 @@ def _snapshot(state, config_path, job):
                  and json.loads(fresh[stage]["settings"]) == tasks[stage]["settings"]
                  and json.loads(fresh[stage]["receipt"]) == tasks[stage]["receipt"],
                  "The meeting's processing status changed during review")
-    current_route = route_settings(load_config(config_path).get("route", {}))
+    current_config = load_config(config_path)
+    _require(_account_link_id(settings, current_config) == account_link_id,
+             "The Drive account changed during review")
+    current_route = route_settings(current_config.get("route", {}))
     _require(current_route.get("enabled") is True
              and preserves_company_map(current_route["companies"], frozen["companies"]),
              "Company folders changed during review")

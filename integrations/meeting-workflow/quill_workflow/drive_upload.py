@@ -224,10 +224,14 @@ def native_document_text(document, identity):
 
 class DriveUploader:
     def __init__(self, state, invoke, meetings_root_id, guard=None,
-                 large_upload=None, large_upload_preflight=None):
+                 large_upload=None, large_upload_preflight=None, account_link_id=None):
+        if account_link_id is not None and (not isinstance(account_link_id, str)
+                or not re.fullmatch(r"link_[A-Za-z0-9_-]{1,200}", account_link_id)):
+            raise UploadNeedsReview("Expected a fixed connected Google Drive account link ID")
         self.state = Path(state).expanduser()
         self.invoke = invoke
         self.root_id = _id(meetings_root_id)
+        self.account_link_id = account_link_id
         self.guard = guard or (lambda: None)
         self.large_upload = large_upload
         self.large_upload_preflight = large_upload_preflight
@@ -402,6 +406,10 @@ class DriveUploader:
             identity = {"job": job, "stage": stage, "idempotency_key": job + ":" + stage,
                         "meetings_root_id": self.root_id, "route": route, "started": started,
                         "files": files, "source": str(source)}
+            # Omit the key for legacy jobs: even a null value changes their
+            # frozen identity. Account enrollment requires an explicit review.
+            if self.account_link_id is not None:
+                identity["account_link_id"] = self.account_link_id
             if meeting_timezone is not None:
                 identity["meeting_timezone"] = meeting_timezone
             if text_format != "legacy":
@@ -413,8 +421,15 @@ class DriveUploader:
                     identity.update(template_document_id=template_document_id,
                                     template_sha256=template_sha256, document_title=document_title)
             signature = _hash(identity)
+            meeting_path = directory / "drive-meeting.json"
+            meeting = read_json(meeting_path) if meeting_path.exists() else None
+            if (meeting is not None
+                    and meeting.get("identity", {}).get("account_link_id") != self.account_link_id):
+                raise UploadNeedsReview("The meeting's Drive account changed; review its saved account binding")
             if path.exists():
                 journal = read_json(path)
+                if journal.get("identity", {}).get("account_link_id") != self.account_link_id:
+                    raise UploadNeedsReview("The upload's Drive account changed; review its saved account binding")
                 if journal.get("identity_sha256") != signature or journal.get("identity") != identity:
                     raise UploadNeedsReview("Upload inputs or destination changed; create an explicit revision")
             else:
@@ -441,12 +456,12 @@ class DriveUploader:
                         or not direct_account["email"].strip()):
                     raise UploadNeedsReview("The direct Drive account could not be verified")
 
-            meeting_path = directory / "drive-meeting.json"
             meeting_identity = {key: identity[key] for key in ("job", "meetings_root_id", "route", "started")}
+            if self.account_link_id is not None:
+                meeting_identity["account_link_id"] = self.account_link_id
             if meeting_timezone is not None:
                 meeting_identity["meeting_timezone"] = meeting_timezone
-            if meeting_path.exists():
-                meeting = read_json(meeting_path)
+            if meeting is not None:
                 if meeting.get("identity") != meeting_identity:
                     raise UploadNeedsReview("The meeting folder belongs to a different approved route")
                 # Legacy journals used UTC plus the job ID. Preserve that name

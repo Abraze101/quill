@@ -24,11 +24,12 @@ def recipient_email(value):
     return value.casefold()
 
 
-def validate_arguments(tool_name, arguments):
+def validate_arguments(tool_name, arguments, *, account_link_id=None):
     if tool_name in READ_AND_PREPARE:
-        return private.validate_arguments(tool_name, arguments)
+        return private.validate_arguments(tool_name, arguments, account_link_id=account_link_id)
+    arguments = private.account_arguments(arguments, account_link_id)
     if (tool_name != "share_file" or not isinstance(arguments, dict)
-            or set(arguments) != {"url", "user_email", "permission", "anyone_at_company"}
+            or set(arguments) - {"link_id"} != {"url", "user_email", "permission", "anyone_at_company"}
             or arguments.get("permission") != "reader" or arguments.get("anyone_at_company") is not False
             or not isinstance(arguments.get("url"), str)
             or not re.fullmatch(r"https://docs\.google\.com/document/d/[A-Za-z0-9_-]{10,200}/edit", arguments["url"])):
@@ -70,7 +71,7 @@ class _SharingRPC(private._RPC):
 
 class CodexSharingTransport(private.CodexDriveTransport):
     def invoke(self, tool_name, arguments):
-        arguments = validate_arguments(tool_name, arguments)
+        arguments = validate_arguments(tool_name, arguments, account_link_id=self.account_link_id)
         if self.cancelled and self.cancelled():
             raise private.DriveOperationError("Local deletion requested; sharing was stopped")
         if tool_name != "share_file":

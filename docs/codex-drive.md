@@ -7,6 +7,23 @@ its category folders, and a notes format before enabling it. Each job saves its
 settings and approved destination; later configuration changes do not rewrite
 existing decisions.
 
+If Codex has more than one Google Drive account connected, set
+`account_link_id` on both `archive` and `publish` to the connection that owns the
+existing Meetings root. Obtain the exact `link_...` ID from Codex's connected
+Drive tools; it is a connection ID, not an email address or folder ID. Quill
+passes that account to every Drive request. Use the same connection for both
+stages and verify the root and category folders through that connection before
+enabling filing. A company folder's name does not select a Google account.
+
+New jobs save the selected connection in their settings and upload journals.
+Retries and releases preserve it; changing the live account holds a saved upload
+for review. Existing jobs retain their original account binding, including its
+absence. Adding a connection to an older job requires an explicit reconciliation
+of its journals and existing remote files; changing the config alone does not
+migrate it. Without a configured connection, single-account installations retain
+their existing behavior. If the connector requires an account selection, Quill
+reports that requirement instead of choosing one.
+
 Settings provides two independent choices:
 
 - **Save notes and transcript to Drive** controls `publish.enabled`.

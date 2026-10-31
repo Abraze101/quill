@@ -176,6 +176,122 @@ class DriveUploadTests(unittest.TestCase):
         return self.uploader.upload(self.job, stage, self.notes if stage == "publish" else self.source,
                                     self.route, self.started, meeting_title=meeting_title)
 
+    def test_unconfigured_account_preserves_exact_legacy_journal_identities(self):
+        self.upload()
+        directory = self.uploader.state / "results" / self.job
+        stage = json.loads((directory / "drive-archive.json").read_text())
+        expected = {"job": self.job, "stage": "archive", "idempotency_key": self.job + ":archive",
+                    "meetings_root_id": FakeDrive.ROOT, "route": self.route, "started": self.started,
+                    "files": inventory(self.source, "archive"), "source": str(self.source)}
+        self.assertEqual(stage["identity"], expected)
+        meeting = json.loads((directory / "drive-meeting.json").read_text())
+        self.assertEqual(meeting["identity"], {key: expected[key]
+            for key in ("job", "meetings_root_id", "route", "started")})
+
+    def test_pinned_account_survives_restart_and_both_stages_without_duplicate_writes(self):
+        account = "link_account_a"
+        self.uploader = DriveUploader(self.uploader.state, self.drive, FakeDrive.ROOT,
+                                      account_link_id=account)
+        archived = self.upload()
+        self.uploader = DriveUploader(self.uploader.state, self.drive, FakeDrive.ROOT,
+                                      account_link_id=account)
+        published = self.upload("publish")
+        writes = copy.deepcopy(self.drive.writes)
+        for stage, original in (("archive", archived), ("publish", published)):
+            retried = self.upload(stage)
+            self.assertEqual(retried["meeting_folder_id"], original["meeting_folder_id"])
+            self.assertEqual(retried["folder_id"], original["folder_id"])
+            self.assertEqual(retried["files"], original["files"])
+        self.assertEqual(self.drive.writes, writes)
+        self.assertEqual(archived["meeting_folder_id"], published["meeting_folder_id"])
+        directory = self.uploader.state / "results" / self.job
+        for name in ("archive", "publish", "meeting"):
+            journal = json.loads((directory / ("drive-" + name + ".json")).read_text())
+            self.assertEqual(journal["identity"]["account_link_id"], account)
+
+    def test_invalid_account_link_fails_before_creating_state_or_calling_drive(self):
+        for account in ("", "account_a", "link_", "link_" + "a" * 201,
+                        "link_a/b", "link_a b", "link_a\n", 123, True, {}):
+            with self.subTest(account=account):
+                with self.assertRaisesRegex(UploadNeedsReview, "account link ID"):
+                    DriveUploader(self.uploader.state, self.drive, FakeDrive.ROOT,
+                                  account_link_id=account)
+        self.assertEqual(self.drive.calls, [])
+        self.assertFalse(self.uploader.state.exists())
+
+    def test_account_change_or_legacy_enrollment_never_reuses_an_existing_stage(self):
+        for old, new in ((None, "link_account_a"), ("link_account_a", None),
+                         ("link_account_a", "link_account_b")):
+            with self.subTest(old=old, new=new):
+                state = self.root / (str(old) + "-" + str(new))
+                self.drive = FakeDrive()
+                self.uploader = DriveUploader(state, self.drive, FakeDrive.ROOT, account_link_id=old)
+                self.upload()
+                directory = state / "results" / self.job
+                before = {path.name: path.read_bytes() for path in directory.glob("*.json")}
+                calls = copy.deepcopy(self.drive.calls)
+                self.uploader = DriveUploader(state, self.drive, FakeDrive.ROOT, account_link_id=new)
+                with self.assertRaisesRegex(UploadNeedsReview, "Drive account changed"):
+                    self.upload()
+                self.assertEqual(self.drive.calls, calls)
+                self.assertEqual({path.name: path.read_bytes() for path in directory.glob("*.json")}, before)
+
+    def test_empty_legacy_journal_requires_explicit_account_enrollment(self):
+        self.drive.before = Mock(side_effect=SimulatedTransportFailure(outcome_unknown=False))
+        with self.assertRaises(SimulatedTransportFailure):
+            self.upload()
+        directory = self.uploader.state / "results" / self.job
+        before = {path.name: path.read_bytes() for path in directory.glob("*.json")}
+        stage = json.loads(before["drive-archive.json"])
+        self.assertIsNone(stage["owner"])
+        self.assertEqual(stage["operations"], {})
+        self.drive.before = None
+        calls = copy.deepcopy(self.drive.calls)
+        self.uploader = DriveUploader(self.uploader.state, self.drive, FakeDrive.ROOT,
+                                      account_link_id="link_account_a")
+        with self.assertRaisesRegex(UploadNeedsReview, "Drive account changed"):
+            self.upload()
+        self.assertEqual(self.drive.calls, calls)
+        self.assertEqual({path.name: path.read_bytes() for path in directory.glob("*.json")}, before)
+
+    def test_account_mismatch_between_stages_does_not_create_journal_or_contact_drive(self):
+        for first in ("archive", "publish"):
+            second = "publish" if first == "archive" else "archive"
+            for old, new in ((None, "link_account_a"), ("link_account_a", None),
+                             ("link_account_a", "link_account_b")):
+                with self.subTest(first=first, old=old, new=new):
+                    state = self.root / (first + "-" + str(old) + "-" + str(new))
+                    self.drive = FakeDrive()
+                    self.uploader = DriveUploader(state, self.drive, FakeDrive.ROOT, account_link_id=old)
+                    self.upload(first)
+                    directory = state / "results" / self.job
+                    before = {path.name: path.read_bytes() for path in directory.glob("*.json")}
+                    calls = copy.deepcopy(self.drive.calls)
+                    preflight = Mock(return_value={"email": FakeDrive.OWNER})
+                    self.uploader = DriveUploader(state, self.drive, FakeDrive.ROOT,
+                        account_link_id=new, large_upload=Mock(), large_upload_preflight=preflight)
+                    with self.assertRaisesRegex(UploadNeedsReview, "meeting's Drive account changed"):
+                        self.upload(second)
+                    self.assertEqual(self.drive.calls, calls)
+                    preflight.assert_not_called()
+                    self.assertEqual({path.name: path.read_bytes() for path in directory.glob("*.json")}, before)
+
+    def test_stage_account_is_checked_even_if_shared_meeting_journal_is_missing(self):
+        self.uploader = DriveUploader(self.uploader.state, self.drive, FakeDrive.ROOT,
+                                      account_link_id="link_account_a")
+        self.upload()
+        directory = self.uploader.state / "results" / self.job
+        (directory / "drive-meeting.json").unlink()
+        before = (directory / "drive-archive.json").read_bytes()
+        calls = copy.deepcopy(self.drive.calls)
+        self.uploader = DriveUploader(self.uploader.state, self.drive, FakeDrive.ROOT,
+                                      account_link_id="link_account_b")
+        with self.assertRaisesRegex(UploadNeedsReview, "upload's Drive account changed"):
+            self.upload()
+        self.assertEqual(self.drive.calls, calls)
+        self.assertEqual((directory / "drive-archive.json").read_bytes(), before)
+        self.assertFalse((directory / "drive-meeting.json").exists())
+
     def test_recording_timezone_keeps_archive_publish_and_retries_on_one_date(self):
         self.started = "2026-09-28T05:12:41Z"
         title = "Portal planning - Alex"

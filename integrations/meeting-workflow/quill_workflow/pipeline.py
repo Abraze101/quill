@@ -165,6 +165,9 @@ def configured(settings, stage):
                      and bool(settings["codex"].strip()))
                 and (settings.get("model") is None or isinstance(settings["model"], str)
                      and bool(settings["model"].strip()))
+                and (settings.get("account_link_id") is None
+                     or isinstance(settings["account_link_id"], str)
+                     and re.fullmatch(r"link_[A-Za-z0-9_-]{1,200}", settings["account_link_id"]) is not None)
                 and settings.get("text_format", "legacy") in ("legacy", "combined_google_doc_v1", "native_template_google_doc_v1")
                 and (settings.get("text_format") != "native_template_google_doc_v1" or stage != "publish"
                      or isinstance(settings.get("template_document_id"), str)
@@ -420,7 +423,7 @@ class Queue:
             # the exact frozen presence/value, including absent legacy fields,
             # so old upload inventories and receipts remain resumable after a
             # new default format or timezone is configured for future meetings.
-            for key in ("text_format", "document_timezone", "meeting_timezone", "notes_layout", "template_document_id", "template_sha256"):
+            for key in ("text_format", "document_timezone", "meeting_timezone", "notes_layout", "template_document_id", "template_sha256", "account_link_id"):
                 if key in previous:
                     settings[key] = previous[key]
                 else:
@@ -532,6 +535,9 @@ class Queue:
                 for key in ("type", "remote", "folder", "meetings_root_id", "requires_route"):
                     if key in frozen and key in current and frozen[key] != current[key]:
                         raise NeedsConfiguration("Processing destination changed; review this meeting before retrying")
+                if (frozen.get("account_link_id") is not None
+                        and frozen["account_link_id"] != current.get("account_link_id")):
+                    raise NeedsConfiguration("Drive account changed; restore this meeting's saved connection before retrying")
                 route = next((item for item in tasks if item["stage"] == "route"), None)
                 if route:
                     frozen_route = route_settings(json.loads(route["settings"]))
@@ -963,6 +969,10 @@ class ConnectorRunner:
 
         def guard():
             self.require_processing(job)
+            if settings.get("account_link_id") is not None and self.config_path is not None:
+                live = load_config(self.config_path).get(stage, {})
+                if live.get("account_link_id") != settings["account_link_id"]:
+                    raise NeedsConfiguration("Drive account changed; the saved upload is on hold")
             if settings.get("large_files") and self.config_path is not None:
                 live = load_config(self.config_path).get(stage, {})
                 if live.get("enabled") is not True or live.get("large_files") != settings["large_files"]:
@@ -1037,6 +1047,7 @@ class ConnectorRunner:
         transport = CodexDriveTransport(
             settings.get("codex", "/Applications/Codex.app/Contents/Resources/codex"),
             model=settings.get("model"),
+            account_link_id=settings.get("account_link_id"),
             timeout=min(7200, max(1, int(settings.get("timeout_seconds", 180)))))
         transport.cancelled = lambda: self.cancelled(job)
         upload_options = {}
@@ -1047,7 +1058,7 @@ class ConnectorRunner:
             upload_options = {"large_upload": ResumableDriveUploader(auth.access_token),
                               "large_upload_preflight": auth.preflight}
         uploader = DriveUploader(self.state, transport.invoke, settings["meetings_root_id"],
-                                 guard=guard, **upload_options)
+                                 guard=guard, account_link_id=settings.get("account_link_id"), **upload_options)
         try:
             options = {"meeting_title": display_title}
             if date_zone is not None:

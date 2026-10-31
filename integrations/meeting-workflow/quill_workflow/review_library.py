@@ -347,7 +347,7 @@ def _confirmed(sources, job, stage, tasks, transcript_hash, route, metadata, not
         return None
     expected = {"job": job, "stage": stage, "idempotency_key": job + ":" + stage,
                 "meetings_root_id": settings.get("meetings_root_id"), "route": route,
-                "started": metadata.get("started")}
+                "started": metadata.get("started"), "account_link_id": settings.get("account_link_id")}
     if any(identity.get(key) != value for key, value in expected.items()):
         return None
     text_format = settings.get("text_format", "legacy")

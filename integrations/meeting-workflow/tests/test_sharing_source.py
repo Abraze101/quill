@@ -86,6 +86,8 @@ class SharingSourceTests(unittest.TestCase):
                          'text_format': 'native_template_google_doc_v1',
                          'template_document_id': 'template_document_123',
                          'template_sha256': self.config['publish']['template_sha256'], 'document_title': payload['title']}
+        if self.config['publish'].get('account_link_id') is not None:
+            self.identity['account_link_id'] = self.config['publish']['account_link_id']
         remote = dict(self.identity['files'][0], id='private_document_123', verification='metadata_and_template_content')
         self.external_receipt = {'job': self.job, 'stage': 'publish', 'idempotency_key': self.job + ':publish',
                                 'folder_id': 'notes_folder_123', 'meeting_folder_id': 'meeting_folder_123',
@@ -164,6 +166,54 @@ class SharingSourceTests(unittest.TestCase):
             self.queue.db.execute('INSERT INTO tasks (job,stage,status,settings) VALUES (?,?,?,?)',
                                   (self.job, 'archive', 'failed', '{}'))
         self.assertEqual(self.snapshot()['job'], self.job)
+
+    def test_frozen_account_survives_current_default_change(self):
+        self.config['publish']['account_link_id'] = 'link_filed_account'
+        self.publish_fixture()
+        atomic_json(self.config_path, self.config)
+        before = self.snapshot()
+        self.assertEqual(before['account_link_id'], 'link_filed_account')
+        self.config['publish']['account_link_id'] = 'link_another_account'
+        atomic_json(self.config_path, self.config)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_legacy_receipt_stays_unchanged_but_selected_account_binds_review(self):
+        before = self.snapshot()
+        self.assertNotIn('account_link_id', before)
+        tasks = self.queue.tasks(self.job)
+        journal = (self.result / 'drive-publish.json').read_bytes()
+        self.config['publish']['account_link_id'] = 'link_selected_account'
+        atomic_json(self.config_path, self.config)
+        selected = self.snapshot()
+        self.assertEqual(selected['account_link_id'], 'link_selected_account')
+        self.assertEqual({key: value for key, value in selected.items() if key != 'account_link_id'}, before)
+        self.config['publish']['account_link_id'] = 'link_another_account'
+        atomic_json(self.config_path, self.config)
+        self.assertNotEqual(self.snapshot(), selected)
+        self.assertEqual(self.queue.tasks(self.job), tasks)
+        self.assertEqual((self.result / 'drive-publish.json').read_bytes(), journal)
+
+    def test_account_change_during_legacy_snapshot_is_rejected(self):
+        changed = copy.deepcopy(self.config)
+        changed['publish']['account_link_id'] = 'link_another_account'
+        with patch('quill_workflow.sharing_source.load_config', side_effect=[self.config, changed]):
+            with self.assertRaisesRegex(SharingSourceError, 'Drive account changed during review'):
+                self.snapshot()
+
+    def test_invalid_legacy_connection_is_rejected(self):
+        self.config['publish']['account_link_id'] = 'not-a-link'
+        atomic_json(self.config_path, self.config)
+        with self.assertRaisesRegex(SharingSourceError, 'valid Google Drive account_link_id'):
+            self.snapshot()
+
+    def test_journal_cannot_switch_frozen_account(self):
+        self.config['publish']['account_link_id'] = 'link_filed_account'
+        self.publish_fixture()
+        self.journal['identity']['account_link_id'] = 'link_another_account'
+        self.journal['identity_sha256'] = _hash(self.journal['identity'])
+        atomic_json(self.result / 'drive-publish.json', self.journal)
+        with self.assertRaisesRegex(SharingSourceError, 'notes changed after Drive filing'):
+            self.snapshot()
 
     def test_unfinished_stage_rejected_before_transcript_read(self):
         with self.queue.db:

@@ -109,6 +109,53 @@ class PipelineDriveTests(unittest.TestCase):
                       dict(large, credentials_file="relative.json"), dict(large, access_token="secret")]:
             self.assertFalse(configured(dict(self.settings, large_files=value), "archive"))
 
+    def test_drive_account_configuration_and_transport_binding(self):
+        for value in (False, "", "owner@example.com", "link_", "link_a/b", "link_" + "a" * 201):
+            self.assertFalse(configured(dict(self.settings, account_link_id=value), "archive"))
+        settings = dict(self.settings, account_link_id="link_account_a")
+        self.assertTrue(configured(settings, "archive"))
+        job, _ = self.prepare(dict(self.config, archive=settings))
+        self.runner("archive", job, settings)
+        self.assertEqual(self.transport_factory.call_args.kwargs["account_link_id"], "link_account_a")
+        self.assertEqual(self.uploader_factory.call_args.kwargs["account_link_id"], "link_account_a")
+
+    def test_drive_account_change_holds_before_connector_access(self):
+        settings = dict(self.settings, account_link_id="link_account_a")
+        job, _ = self.prepare(dict(self.config, archive=settings))
+        config_path = self.root / "workflow.json"
+        atomic_json(config_path, dict(self.config, archive=dict(settings, account_link_id="link_account_b")))
+        self.runner.config_path = config_path
+        with self.assertRaisesRegex(NeedsConfiguration, "Drive account changed"):
+            self.runner("archive", job, settings)
+        self.transport_factory.assert_not_called()
+        self.uploader.upload.assert_not_called()
+
+    def test_release_preserves_account_binding_and_legacy_absence(self):
+        config = dict(self.config, archive=dict(self.settings, account_link_id="link_account_a"))
+        job, _ = self.prepare(config)
+        changed = dict(config, archive=dict(self.settings, account_link_id="link_account_b"),
+                       publish=dict(self.settings, account_link_id="link_account_b"))
+        for stage in ("archive", "publish"):
+            with self.queue.db:
+                self.queue.db.execute("UPDATE tasks SET status='failed' WHERE job=? AND stage=?", (job, stage))
+            self.queue.release(job, stage, changed)
+        tasks = {item["stage"]: json.loads(item["settings"]) for item in self.queue.tasks(job)}
+        self.assertEqual(tasks["archive"]["account_link_id"], "link_account_a")
+        self.assertNotIn("account_link_id", tasks["publish"])
+
+    def test_retry_rejects_changed_or_removed_account_without_queue_mutation(self):
+        from quill_workflow.queue_status import retry_revision
+        settings = dict(self.settings, account_link_id="link_account_a")
+        config = dict(self.config, archive=settings)
+        job, _ = self.prepare(config)
+        with self.queue.db:
+            self.queue.db.execute("UPDATE tasks SET status='failed' WHERE job=? AND stage='archive'", (job,))
+        before = self.queue.tasks(job)
+        for selected in (dict(self.settings), dict(self.settings, account_link_id="link_account_b")):
+            with self.assertRaisesRegex(NeedsConfiguration, "Drive account changed"):
+                self.queue.retry_failed(job, retry_revision(before), dict(config, archive=selected))
+            self.assertEqual(self.queue.tasks(job), before)
+
     def test_large_media_provider_is_wired_only_when_explicitly_configured(self):
         job, _ = self.prepare()
         auth = Mock()
@@ -165,7 +212,7 @@ class PipelineDriveTests(unittest.TestCase):
                 self.assertIn("input_sha256", receipt)
                 self.assertIn("route_sha256", receipt)
         self.transport_factory.assert_called_with(
-            "/Applications/Codex.app/Contents/Resources/codex", model=None, timeout=180)
+            "/Applications/Codex.app/Contents/Resources/codex", model=None, account_link_id=None, timeout=180)
         args, kwargs = self.uploader_factory.call_args
         self.assertEqual(args, (self.queue.state, self.transport.invoke, "meetings_root_123"))
         self.assertTrue(callable(kwargs["guard"]))
@@ -175,7 +222,7 @@ class PipelineDriveTests(unittest.TestCase):
         job, _ = self.prepare()
         settings = dict(self.settings, codex="/fixture/codex", model="configured-model", timeout_seconds=90)
         self.runner("archive", job, settings)
-        self.transport_factory.assert_called_once_with("/fixture/codex", model="configured-model", timeout=90)
+        self.transport_factory.assert_called_once_with("/fixture/codex", model="configured-model", account_link_id=None, timeout=90)
 
     def recorded_date_fixture(self):
         self.started = "2026-09-28T05:12:41Z"

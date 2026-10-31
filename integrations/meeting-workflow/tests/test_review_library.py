@@ -103,6 +103,8 @@ class ReviewLibraryTests(unittest.TestCase):
                     "meeting_timezone": "Asia/Singapore", "text_format": NATIVE_TEMPLATE_FORMAT}
         if stage == "publish":
             identity.update(document_title=payload["title"], template_document_id="template_document_123", template_sha256="a" * 64)
+        if self.settings[stage].get("account_link_id") is not None:
+            identity["account_link_id"] = self.settings[stage]["account_link_id"]
         folder = stage + "_folder_123"
         external = {"job": self.job, "stage": stage, "idempotency_key": self.job + ":" + stage,
                     "folder_id": folder, "meeting_folder_id": "meeting_folder_123", "meeting_folder_name": "Dashboard review - 10/21/26",
@@ -174,6 +176,37 @@ class ReviewLibraryTests(unittest.TestCase):
         self.assertEqual(result["storage"]["document"]["file_ids"], ["remote_publish_0_123"])
         self.assertEqual(result["storage"]["media"]["status"], "confirmed")
         self.assertEqual(result["participants"], [])  # A mentioned Max is not proof he attended.
+
+    def test_account_bound_filing_confirms_both_notes_and_media(self):
+        for stage in ("archive", "publish"):
+            self.settings[stage]["account_link_id"] = "link_filed_account"
+            self.complete(stage)
+        result = self.view()
+        self.assertEqual(result["storage_status"], "saved_in_drive")
+        self.assertEqual(result["storage"]["document"]["status"], "confirmed")
+        self.assertEqual(result["storage"]["media"]["status"], "confirmed")
+
+    def test_different_or_missing_filing_account_cannot_confirm(self):
+        for stage, kind in (("archive", "media"), ("publish", "document")):
+            self.settings[stage]["account_link_id"] = "link_filed_account"
+            self.complete(stage)
+            for other in (None, "link_another_account"):
+                with self.subTest(stage=stage, account=other):
+                    identity = self.journals[stage]["identity"]
+                    if other is None:
+                        identity.pop("account_link_id", None)
+                    else:
+                        identity["account_link_id"] = other
+                    self.journals[stage]["identity_sha256"] = _hash(identity)
+                    atomic_json(self.result / ("drive-" + stage + ".json"), self.journals[stage])
+                    self.assertEqual(self.view()["storage"][kind]["status"], "uncertain")
+
+    def test_legacy_filing_cannot_adopt_unrecorded_account(self):
+        journal = self.journals["publish"]
+        journal["identity"]["account_link_id"] = "link_another_account"
+        journal["identity_sha256"] = _hash(journal["identity"])
+        atomic_json(self.result / "drive-publish.json", journal)
+        self.assertEqual(self.view()["storage"]["document"]["status"], "uncertain")
 
     def test_transcript_preview_adds_one_notice_without_changing_labels_or_speech(self):
         from quill_workflow.capture_quality import NOTICE

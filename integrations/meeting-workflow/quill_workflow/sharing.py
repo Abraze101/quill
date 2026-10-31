@@ -486,6 +486,7 @@ class SharingReviews:
                     from .sharing_drive import SharingDrive
                     settings = load_config(self.config_path).get("publish", {})
                     transport = CodexSharingTransport(settings.get("codex", "/Applications/Codex.app/Contents/Resources/codex"),
+                        account_link_id=snapshot.get("account_link_id"),
                         model=settings.get("model"), timeout=min(7200, max(1, int(settings.get("timeout_seconds", 180)))))
                     transport.cancelled = lambda: job in deleted_jobs(self.state)
                     adapter = SharingDrive(transport.invoke)
