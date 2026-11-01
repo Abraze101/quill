@@ -10,6 +10,7 @@ struct RecordingControlChecks {
         checkRecordingHeartbeat()
         checkTranscriptionRetryMenu()
         checkWarningHistoryMenu()
+        checkApplicationMenus()
         let suiteName = "com.digimata.quill.control-tests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -258,6 +259,173 @@ struct RecordingControlChecks {
             "Warning recovery and action revisions must update immediately")
         expect(pause.isEnabled && stop.isEnabled && !panel.isVisible,
             "Clock checks must preserve functional controls without displaying a window")
+    }
+
+    @MainActor
+    static func checkApplicationMenus() {
+        let visibleWindows = Set(NSApp.windows.filter(\.isVisible).map(\.windowNumber))
+        let menu = NSMenu()
+        let controller = MenuBarController(menu: menu, layout: .application)
+        expect(menu.items.map(\.title) == ["Quill", "Recording", "Meetings"],
+            "Application actions need discoverable Quill, Recording, and Meetings menus")
+        func submenu(_ title: String) -> NSMenu {
+            guard let value = menu.item(withTitle: title)?.submenu else { fatalError("Missing \(title) menu") }
+            expect(!value.autoenablesItems, "Application menus must preserve controller-supplied eligibility")
+            return value
+        }
+        func item(_ title: String, in menu: NSMenu) -> NSMenuItem {
+            guard let value = menu.item(withTitle: title), value.action != nil, value.target != nil else {
+                fatalError("Missing application action: \(title)")
+            }
+            return value
+        }
+        func invoke(_ item: NSMenuItem) {
+            guard let action = item.action else { fatalError("Menu action missing") }
+            expect(NSApp.sendAction(action, to: item.target, from: item), "Menu action must reach its controller")
+        }
+        let application = submenu("Quill")
+        let recording = submenu("Recording")
+        let meetings = submenu("Meetings")
+        let about = item("About Quill…", in: application)
+        let settings = item("Settings…", in: application)
+        guard let quit = application.items.first(where: { $0.title.lowercased() == "quit quill" }) else {
+            fatalError("Application Quit action missing")
+        }
+        expect(about.isEnabled && settings.keyEquivalent == "," && quit.keyEquivalent == "q",
+            "Application menu must retain About, Settings, and the standard Quit shortcut")
+        let toggle = item("Start audio recording", in: recording)
+        let pause = item("Pause recording", in: recording)
+        let automatic = item("Record automatically", in: recording)
+        let video = item("Include screen video", in: recording)
+        let controls = item("Show recording controls", in: recording)
+        let skip = item("Skip this meeting", in: recording)
+        let retryMeeting = item("Retry this meeting", in: recording)
+        let review = item("Review meetings…", in: meetings)
+        let folder = item("Open recordings folder", in: meetings)
+        let retryTranscription = item("Retry unfinished transcriptions…", in: meetings)
+        let history = item("Recent warnings…", in: meetings)
+        expect(toggle.keyEquivalent == "r" && folder.keyEquivalent == "o",
+            "Application menus must retain recording and folder shortcuts")
+        expect(pause.isHidden && !pause.isEnabled && retryMeeting.isHidden && !skip.isEnabled,
+            "Idle menus must not offer pause, a failed-meeting retry, or an unavailable skip")
+
+        var navigation: [String] = []
+        var starts = 0, skips = 0, transcriptionRetries = 0
+        var automaticChanges: [Bool] = [], videoChanges: [Bool] = [], meetingRetries: [String] = []
+        var stops: [(String, Int?)] = []
+        var pauses: [(String, Int, Bool)] = []
+        controller.onSettings = { navigation.append("settings") }
+        controller.onQuit = { navigation.append("quit") }
+        controller.onShowControls = { navigation.append("controls") }
+        controller.onReviewMeetings = { navigation.append("review") }
+        controller.onOpenFolder = { navigation.append("folder") }
+        controller.onWarningHistory = { navigation.append("history") }
+        controller.onToggle = { starts += 1 }
+        controller.onSkipMeeting = { skips += 1 }
+        controller.onRetryMeeting = { meetingRetries.append($0) }
+        controller.onRetryTranscriptions = { transcriptionRetries += 1 }
+        controller.onAutomaticRecordingChange = { automaticChanges.append($0) }
+        controller.onIncludeScreenVideoChange = { videoChanges.append($0) }
+        controller.onStopRecording = { stops.append(($0, $1)) }
+        controller.onPauseRecording = { pauses.append(($0, $1, $2)) }
+
+        var options = MenuBarOptions()
+        options.reviewAvailable = true
+        options.pendingReviews = 2
+        options.recordAutomatically = true
+        options.includeScreenVideo = true
+        options.canSkipMeeting = true
+        options.failedMeetingToRetry = "failed-call"
+        options.transcriptionRetryEnabled = true
+        controller.updateOptions(options)
+        expect(review.title == "Review meetings (2)…" && review.isEnabled,
+            "Meetings menu must show pending reviews without losing its action")
+        expect(toggle.title == "Start audio + screen" && automatic.state == .on && video.state == .on,
+            "Recording menu must show the saved preferences and matching Start label")
+        expect(skip.isEnabled && retryMeeting.isEnabled && !retryMeeting.isHidden && retryTranscription.isEnabled,
+            "Eligible skip and retry actions must be available from application menus")
+        for item in [settings, controls, review, folder, history, quit] { invoke(item) }
+        expect(navigation == ["settings", "controls", "review", "folder", "history", "quit"],
+            "Application navigation must call the same existing handlers without changing capture")
+        expect(starts == 0 && stops.isEmpty && pauses.isEmpty, "Navigation must not start, stop, or pause a recording")
+        invoke(toggle); invoke(automatic); invoke(video); invoke(skip); invoke(retryMeeting); invoke(retryTranscription)
+        expect(starts == 1 && automaticChanges == [false] && videoChanges == [false] && skips == 1
+            && meetingRetries == ["failed-call"] && transcriptionRetries == 1,
+            "Application recording actions must dispatch their exact existing requests")
+
+        options.configurationEnabled = false
+        options.transcriptionRetryInFlight = true
+        controller.updateOptions(options)
+        expect(!automatic.isEnabled && !video.isEnabled && !skip.isEnabled && !retryMeeting.isEnabled
+            && !retryTranscription.isEnabled, "Unavailable application actions must appear disabled")
+        for item in [automatic, video, skip, retryMeeting, retryTranscription] { invoke(item) }
+        expect(automaticChanges == [false] && videoChanges == [false] && skips == 1
+            && meetingRetries == ["failed-call"] && transcriptionRetries == 1,
+            "Direct dispatch must not bypass existing disabled-action guards")
+
+        options.configurationEnabled = true
+        options.transcriptionRetryInFlight = false
+        controller.updateOptions(options)
+        controller.updateStatus(.init(phase: .recording, sessionID: "application-first", elapsed: "00:00:10",
+            actionRevision: 11, stopEnabled: true, pauseEnabled: true))
+        controller.update(recording: true, elapsed: "00:00:10")
+        expect(toggle.title == "Stop recording" && pause.isEnabled && !pause.isHidden,
+            "Active recording must expose Stop and Pause in the application menu")
+        expect(!video.isEnabled && !retryMeeting.isEnabled, "Capture must disable changing video and retrying another meeting")
+        invoke(video); invoke(retryMeeting)
+        expect(videoChanges == [false] && meetingRetries == ["failed-call"],
+            "Application dispatch cannot change video or retry a meeting during capture")
+
+        guard let tracking = recording.delegate else { fatalError("Recording submenu needs action tracking") }
+        tracking.menuWillOpen?(recording)
+        controller.updateStatus(.init(phase: .paused, sessionID: "application-second", elapsed: "00:00:20",
+            actionRevision: 12, stopEnabled: true, pauseEnabled: true))
+        invoke(toggle); invoke(pause)
+        expect(stops.count == 1 && stops[0].0 == "application-first" && stops[0].1 == 11,
+            "A Stop selected from an open application menu must retain its displayed session and revision")
+        expect(pauses.count == 1 && pauses[0].0 == "application-first" && pauses[0].1 == 11 && !pauses[0].2,
+            "An open-menu Pause must not become Resume for a different recording")
+        expect(starts == 1, "A stale Stop must never become Start")
+        tracking.menuDidClose?(recording)
+        tracking.menuWillOpen?(recording)
+        invoke(toggle); invoke(pause)
+        expect(stops.count == 2 && stops[1].0 == "application-second" && stops[1].1 == 12,
+            "Reopening the application menu must bind Stop to the current recording")
+        expect(pauses.count == 2 && pauses[1].0 == "application-second" && pauses[1].1 == 12 && pauses[1].2,
+            "Reopening the application menu must bind Resume to the current paused revision")
+        tracking.menuDidClose?(recording)
+        controller.updateStatus(.init(phase: .resuming, sessionID: "application-second",
+            actionRevision: 13, stopEnabled: true, pauseEnabled: true))
+        expect(!pause.isEnabled && pause.title == "Resuming recording…",
+            "Application Pause must remain disabled while resuming")
+        invoke(pause)
+        expect(pauses.count == 2, "A disabled transition cannot request another pause or resume")
+
+        controller.updateStatus(.init())
+        controller.update(recording: false, elapsed: nil)
+        var shortcutActions: [String] = []
+        controller.onToggle = { shortcutActions.append("record") }
+        controller.onOpenFolder = { shortcutActions.append("folder") }
+        controller.onSettings = { shortcutActions.append("settings") }
+        controller.onQuit = { shortcutActions.append("quit") }
+        let shortcuts: [(key: String, code: UInt16, action: String)] = [
+            ("r", 15, "record"), ("o", 31, "folder"), (",", 43, "settings"), ("q", 12, "quit")
+        ]
+        for (index, shortcut) in shortcuts.enumerated() {
+            guard let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: .command,
+                timestamp: 0, windowNumber: 0, context: nil, characters: shortcut.key,
+                charactersIgnoringModifiers: shortcut.key, isARepeat: false, keyCode: shortcut.code) else {
+                fatalError("Could not construct application shortcut event")
+            }
+            expect(menu.performKeyEquivalent(with: event), "Application menu must handle Command-\(shortcut.key)")
+            expect(shortcutActions == shortcuts.prefix(index + 1).map(\.action),
+                "Each application shortcut must dispatch its intended callback exactly once")
+        }
+        expect(stops.count == 2 && pauses.count == 2,
+            "Idle shortcut checks must not stop or pause a recording")
+        expect(Set(NSApp.windows.filter(\.isVisible).map(\.windowNumber)) == visibleWindows,
+            "Application menus must not create another status surface or open a window")
+        print("Application menus: grouped actions, callbacks, keyboard shortcuts, state, guarded actions, and session-bound Stop/Pause passed")
     }
 
     @MainActor

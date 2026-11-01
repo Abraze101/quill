@@ -182,6 +182,13 @@ final class LoginItemController {
 
 @MainActor
 final class MenuBarController {
+    enum Layout { case statusItem, application }
+    let menu: NSMenu
+
+    init(menu: NSMenu = NSMenu(), layout: Layout = .statusItem) {
+        self.menu = menu
+    }
+
     var onToggle: (() -> Void)?
     var onOpenFolder: (() -> Void)?
     var onQuit: (() -> Void)?

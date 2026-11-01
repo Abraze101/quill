@@ -212,7 +212,11 @@ automatic recording. See [recording reminders](recording-visibility-safety.md#me
 
 ## Recording controls
 
-The menu, Settings and floating controls share the current recording state.
+The menus, Settings and floating controls share the current recording state.
+When Quill is active, the macOS menu bar includes **Recording** for capture
+controls and **Meetings** for review, recordings, transcription retry, and
+recent warnings. **Quill** contains Settings, About, and Quit. The feather menu
+remains available while other apps are active.
 **Include screen video** enables video; choosing a scope alone does not. Start
 changes to Cancel during startup and Stop after capture is confirmed. Capture
 choices lock during recording. Pause keeps one session and excludes paused time

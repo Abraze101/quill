@@ -56,13 +56,10 @@ struct Run: ParsableCommand {
         let controller = AppController(root: root)
         // The optional app bundle opens a useful window when launched or
         // reopened from Finder. The bare menu-bar executable keeps its startup.
-        let appDelegate = QuillAppDelegate(openControls: { controller.reopen() },
+        let appDelegate = QuillAppDelegate(mainMenu: controller.mainMenu,
+                                          openControls: { controller.reopen() },
                                           shouldTerminate: { controller.shouldTerminate() },
-                                          restoreVisibility: { controller.restoreRecordingVisibility() },
-                                          showControls: { controller.showRecordingControls() },
-                                          showSettings: { controller.showSettings() },
-                                          retryTranscriptions: { controller.retryTranscriptions() },
-                                          canRetryTranscriptions: { controller.canRetryTranscriptions })
+                                          restoreVisibility: { controller.restoreRecordingVisibility() })
         app.delegate = appDelegate
 
         let sigint = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
@@ -81,52 +78,22 @@ struct Run: ParsableCommand {
 }
 
 @MainActor
-private final class QuillAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
+private final class QuillAppDelegate: NSObject, NSApplicationDelegate {
+    private let mainMenu: NSMenu
     private let openControls: () -> Void
     private let shouldTerminate: () -> NSApplication.TerminateReply
     private let restoreVisibility: () -> Void
-    private let showControls: () -> Void
-    private let showSettings: () -> Void
-    private let retryTranscriptions: () -> Void
-    private let canRetryTranscriptions: () -> Bool
 
-    init(openControls: @escaping () -> Void, shouldTerminate: @escaping () -> NSApplication.TerminateReply,
-         restoreVisibility: @escaping () -> Void, showControls: @escaping () -> Void,
-         showSettings: @escaping () -> Void, retryTranscriptions: @escaping () -> Void,
-         canRetryTranscriptions: @escaping () -> Bool) {
+    init(mainMenu: NSMenu, openControls: @escaping () -> Void,
+         shouldTerminate: @escaping () -> NSApplication.TerminateReply,
+         restoreVisibility: @escaping () -> Void) {
+        self.mainMenu = mainMenu
         self.openControls = openControls
         self.shouldTerminate = shouldTerminate
         self.restoreVisibility = restoreVisibility
-        self.showControls = showControls
-        self.showSettings = showSettings
-        self.retryTranscriptions = retryTranscriptions
-        self.canRetryTranscriptions = canRetryTranscriptions
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let mainMenu = NSMenu()
-        let applicationItem = NSMenuItem(title: "Quill", action: nil, keyEquivalent: "")
-        let applicationMenu = NSMenu(title: "Quill")
-        let about = NSMenuItem(title: "About Quill…", action: #selector(openAbout), keyEquivalent: "")
-        about.target = self
-        applicationMenu.addItem(about)
-        applicationMenu.addItem(.separator())
-        let controls = NSMenuItem(title: "Show recording controls", action: #selector(openRecordingControls), keyEquivalent: "")
-        controls.target = self
-        applicationMenu.addItem(controls)
-        let retry = NSMenuItem(title: "Retry unfinished transcriptions…",
-                               action: #selector(retryUnfinishedTranscriptions), keyEquivalent: "")
-        retry.target = self
-        applicationMenu.addItem(retry)
-        let settings = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
-        settings.target = self
-        applicationMenu.addItem(settings)
-        applicationMenu.addItem(.separator())
-        let quit = NSMenuItem(title: "Quit Quill", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        quit.target = NSApp
-        applicationMenu.addItem(quit)
-        applicationItem.submenu = applicationMenu
-        mainMenu.addItem(applicationItem)
         NSApp.mainMenu = mainMenu
         if Bundle.main.bundleURL.pathExtension == "app",
            !LoginItemController.isLoginLaunch(NSAppleEventManager.shared().currentAppleEvent) {
@@ -145,21 +112,6 @@ private final class QuillAppDelegate: NSObject, NSApplicationDelegate, NSMenuIte
 
     func applicationDidHide(_ notification: Notification) { restoreVisibility() }
 
-    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
-        if menuItem.action == #selector(retryUnfinishedTranscriptions) { return canRetryTranscriptions() }
-        return true
-    }
-
-    @objc private func openRecordingControls() { showControls() }
-    @objc private func openSettings() { showSettings() }
-    @objc private func retryUnfinishedTranscriptions() {
-        guard canRetryTranscriptions() else { return }
-        retryTranscriptions()
-    }
-    @objc private func openAbout() {
-        NSApp.orderFrontStandardAboutPanel(nil)
-        NSApp.activate(ignoringOtherApps: true)
-    }
 }
 
 struct Doctor: ParsableCommand {

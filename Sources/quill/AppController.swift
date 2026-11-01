@@ -10,6 +10,9 @@ final class AppController {
     private enum Phase { case idle, starting, recording, pausing, paused, resuming, stopping, attention }
     private let root: URL
     private let menuBar = MenuBarController()
+    private let applicationMenus = MenuBarController(layout: .application)
+    private var menus: [MenuBarController] { [menuBar, applicationMenus] }
+    var mainMenu: NSMenu { applicationMenus.menu }
     private let settings = SettingsWindowController()
     private let loginItem = LoginItemController()
     private let transcription = TranscriptionCoordinator()
@@ -77,17 +80,7 @@ final class AppController {
     init(root: URL, warningHistory: RecordingWarningHistory = RecordingWarningHistory()) {
         self.root = root
         self.warningHistory = warningHistory
-        menuBar.onToggle = { [weak self] in self?.toggle() }
-        menuBar.onStopRecording = { [weak self] id, revision in self?.stopDisplayedRecording(id, revision: revision) }
-        menuBar.onPauseRecording = { [weak self] id, revision, paused in
-            self?.pauseDisplayedRecording(id, revision: revision, expectedPaused: paused)
-        }
-        menuBar.onOpenFolder = { [weak self] in self?.openFolder() }
-        menuBar.onRetryTranscriptions = { [weak self] in self?.retryTranscriptions() }
-        menuBar.onQuit = { [weak self] in self?.shutdown() }
-        menuBar.onSettings = { [weak self] in self?.showSettings() }
-        menuBar.onShowControls = { [weak self] in self?.showRecordingControls() }
-        menuBar.onWarningHistory = { [weak self] in self?.showWarningHistory() }
+        for menu in menus { configureActions(for: menu) }
         recordingControls.onWarningHistory = { [weak self] in self?.showWarningHistory() }
         recordingControls.onSettings = { [weak self] in self?.showSettings() }
         recordingControls.onOpenFolder = { [weak self] _ in self?.openReviewFolder() }
@@ -113,12 +106,7 @@ final class AppController {
         settings.onShowInDockChange = { [weak self] enabled in
             self?.savePreference { try Config.setShowInDock(enabled) }
         }
-        menuBar.onReviewMeetings = { [weak self] in self?.reviewMeetings() }
         settings.onReviewProcessing = { [weak self] in self?.reviewMeetings() }
-        menuBar.onAutomaticRecordingChange = { [weak self] enabled in
-            self?.savePreference { try Config.setMeetingAutomationEnabled(enabled) }
-        }
-        menuBar.onIncludeScreenVideoChange = { [weak self] enabled in self?.setScreenVideo(enabled, revealSettings: enabled) }
         settings.onToggleRecording = { [weak self] in self?.toggle() }
         settings.onStopRecording = { [weak self] id, revision in self?.stopDisplayedRecording(id, revision: revision) }
         settings.onPauseRecording = { [weak self] id, revision, paused in
@@ -131,17 +119,6 @@ final class AppController {
             refreshUI()
         }
         settings.onOpenLoginSettings = { [weak self] in self?.loginItem.openSystemSettings() }
-        menuBar.onSkipMeeting = { [weak self] in
-            guard let self else { return }
-            meetingAutomation.skipCurrent()
-            if phase == .starting, automaticMeeting != nil { cancelPendingStart() }
-            refreshUI()
-        }
-        menuBar.onRetryMeeting = { [weak self] meeting in
-            guard let self, phase == .idle, !shuttingDown else { return }
-            meetingAutomation.retryFailedStart(meeting: meeting)
-            refreshUI()
-        }
         meetingAutomation.onStart = { [weak self] meeting in self?.requestStart(meeting: meeting) }
         meetingAutomation.onStop = { [weak self] id in
             guard let self, session?.dir.path == id, automaticMeeting != nil else { return }
@@ -213,6 +190,36 @@ final class AppController {
                 Task { @MainActor [weak self] in self?.showTranscription(status) }
             }
             await transcription.resumePending(root: root)
+        }
+    }
+
+    private func configureActions(for menu: MenuBarController) {
+        menu.onToggle = { [weak self] in self?.toggle() }
+        menu.onStopRecording = { [weak self] id, revision in self?.stopDisplayedRecording(id, revision: revision) }
+        menu.onPauseRecording = { [weak self] id, revision, paused in
+            self?.pauseDisplayedRecording(id, revision: revision, expectedPaused: paused)
+        }
+        menu.onOpenFolder = { [weak self] in self?.openFolder() }
+        menu.onRetryTranscriptions = { [weak self] in self?.retryTranscriptions() }
+        menu.onQuit = { [weak self] in self?.shutdown() }
+        menu.onSettings = { [weak self] in self?.showSettings() }
+        menu.onShowControls = { [weak self] in self?.showRecordingControls() }
+        menu.onWarningHistory = { [weak self] in self?.showWarningHistory() }
+        menu.onReviewMeetings = { [weak self] in self?.reviewMeetings() }
+        menu.onAutomaticRecordingChange = { [weak self] enabled in
+            self?.savePreference { try Config.setMeetingAutomationEnabled(enabled) }
+        }
+        menu.onIncludeScreenVideoChange = { [weak self] enabled in self?.setScreenVideo(enabled, revealSettings: enabled) }
+        menu.onSkipMeeting = { [weak self] in
+            guard let self else { return }
+            meetingAutomation.skipCurrent()
+            if phase == .starting, automaticMeeting != nil { cancelPendingStart() }
+            refreshUI()
+        }
+        menu.onRetryMeeting = { [weak self] meeting in
+            guard let self, phase == .idle, !shuttingDown else { return }
+            meetingAutomation.retryFailedStart(meeting: meeting)
+            refreshUI()
         }
     }
 
@@ -864,10 +871,12 @@ final class AppController {
             options.recordingActionTitle = "Check recording status…"
             options.recordingActionEnabled = true
         }
-        menuBar.update(recording: hasActiveRecording || screenRecorder?.isRecording == true
-            || (phase == .attention && screenRecorder?.needsCleanup == true),
-            elapsed: session == nil ? nil : Self.format(elapsedInterval))
-        menuBar.updateOptions(options)
+        for menu in menus {
+            menu.update(recording: hasActiveRecording || screenRecorder?.isRecording == true
+                || (phase == .attention && screenRecorder?.needsCleanup == true),
+                elapsed: session == nil ? nil : Self.format(elapsedInterval))
+            menu.updateOptions(options)
+        }
         var state = QuillSettingsState()
         state.loginItem = loginItem.snapshot()
         state.includeScreenVideo = phase == .idle ? options.includeScreenVideo : requestedScreenVideo
@@ -1370,7 +1379,7 @@ final class AppController {
         let historyContext = observingCapture ? controlSessionID : screenError == nil ? nil : "idle-capture-error"
         rememberWarnings(source: .recording, contextID: historyContext, warnings: warnings)
         recordingControls.update(snapshot)
-        menuBar.updateStatus(snapshot)
+        for menu in menus { menu.updateStatus(snapshot) }
     }
 
     private func resumeCompletionWorker() {
@@ -1481,12 +1490,14 @@ final class AppController {
     }
 
     private func showTranscription(_ status: TranscriptionCoordinator.Status) {
-        switch status {
-        case .idle: menuBar.updateTranscription(nil)
-        case .preparing: menuBar.updateTranscription("Preparing local transcription…")
-        case .transcribing(let name, let queued):
-            menuBar.updateTranscription(queued > 0 ? "transcribing \(name) · \(queued) queued" : "transcribing \(name)")
-        case .failed(let name): menuBar.updateTranscription("transcription failed · \(name)")
+        for menu in menus {
+            switch status {
+            case .idle: menu.updateTranscription(nil)
+            case .preparing: menu.updateTranscription("Preparing local transcription…")
+            case .transcribing(let name, let queued):
+                menu.updateTranscription(queued > 0 ? "transcribing \(name) · \(queued) queued" : "transcribing \(name)")
+            case .failed(let name): menu.updateTranscription("transcription failed · \(name)")
+            }
         }
     }
 

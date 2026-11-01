@@ -12,6 +12,8 @@ release or a notarized app download. The original MIT license is preserved;
 
 - Detects actual Google Meet and Zoom web joins/leaves in Chrome, with automatic
   recording, manual Start/Stop, Pause/Resume, and Skip controls.
+- Provides Recording and Meetings menus while Quill is active, alongside the
+  feather menu. Settings, About, and Quit are under Quill.
 - Records microphone and system audio separately, with optional native window or
   display video. Floating recording controls remain accessible when the menu bar
   is crowded.

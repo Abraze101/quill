@@ -25,7 +25,9 @@ struct MenuBarOptions {
 /// and optional Dock icon when macOS has insufficient menu-bar space.
 @MainActor
 final class MenuBarController {
-    private let statusItem: NSStatusItem
+    enum Layout { case statusItem, application }
+    let menu: NSMenu
+    private let statusItem: NSStatusItem?
     private let stateLabel: NSMenuItem
     private let transcriptionLabel: NSMenuItem
     private let processingItem: NSMenuItem
@@ -64,10 +66,11 @@ final class MenuBarController {
     var onStopRecording: ((String, Int?) -> Void)?
     var onPauseRecording: ((String, Int, Bool) -> Void)?
 
-    init(menu: NSMenu = NSMenu()) {
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    init(menu: NSMenu = NSMenu(), layout: Layout = .statusItem) {
+        self.menu = menu
+        statusItem = layout == .statusItem ? NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength) : nil
 
-        statusItem.autosaveName = "QuillRecordingStatus"
+        statusItem?.autosaveName = "QuillRecordingStatus"
 
         menu.autoenablesItems = false
 
@@ -159,7 +162,7 @@ final class MenuBarController {
         menu.addItem(.separator())
 
         let quit = NSMenuItem(
-            title: "Quit quill",
+            title: "Quit Quill",
             action: #selector(quitClicked),
             keyEquivalent: "q"
         )
@@ -169,8 +172,29 @@ final class MenuBarController {
             item.target = self
         }
 
-        statusItem.menu = menu
-        menu.delegate = menuDelegate
+        if layout == .application {
+            // Each presentation owns its items and captured recording identity.
+            // Both receive the same callbacks and state from AppController.
+            menu.removeAllItems()
+            let sections: [(String, [NSMenuItem])] = [
+                ("Quill", [about, settings, .separator(), quit]),
+                ("Recording", [toggleItem, pauseItem, .separator(), automaticItem, screenVideoItem,
+                               skipItem, retryItem, .separator(), showControls]),
+                ("Meetings", [reviewItem, openFolder, transcriptionRetryItem, .separator(), warningHistory])
+            ]
+            for (title, items) in sections {
+                let section = NSMenu(title: title)
+                section.autoenablesItems = false
+                for item in items { section.addItem(item) }
+                let parent = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+                parent.submenu = section
+                menu.addItem(parent)
+                if title == "Recording" { section.delegate = menuDelegate }
+            }
+        } else {
+            statusItem?.menu = menu
+            menu.delegate = menuDelegate
+        }
         menuDelegate.onWillOpen = { [weak self] in
             guard let self else { return }
             self.bindRecordingAction()
@@ -178,7 +202,7 @@ final class MenuBarController {
         }
         menuDelegate.onDidClose = { [weak self] in self?.menuIsTracking = false }
 
-        if let button = statusItem.button {
+        if let button = statusItem?.button {
             let image = Self.featherImage()
             image?.isTemplate = true
             button.image = image
@@ -258,12 +282,12 @@ final class MenuBarController {
         processingItem.isEnabled = options.reviewAvailable
         let needsAttention = statusSnapshot?.needsAttention == true || options.processingNeedsAttention
         let busy = statusSnapshot?.phase == .starting || statusSnapshot?.phase == .stopping
-        statusItem.button?.title = changingPause ? " …" : paused ? (needsAttention ? " Paused !" : " Paused") : needsAttention ? (isRecording ? " REC !" : " !")
+        statusItem?.button?.title = changingPause ? " …" : paused ? (needsAttention ? " Paused !" : " Paused") : needsAttention ? (isRecording ? " REC !" : " !")
             : isRecording ? " REC" : busy ? " …" : ""
-        statusItem.button?.font = .systemFont(ofSize: 11, weight: .semibold)
-        statusItem.button?.contentTintColor = needsAttention || paused || changingPause ? .systemOrange : isRecording ? .systemRed : nil
-        statusItem.button?.toolTip = "Quill — \(stateLabel.title)"
-        statusItem.button?.setAccessibilityValue(stateLabel.title)
+        statusItem?.button?.font = .systemFont(ofSize: 11, weight: .semibold)
+        statusItem?.button?.contentTintColor = needsAttention || paused || changingPause ? .systemOrange : isRecording ? .systemRed : nil
+        statusItem?.button?.toolTip = "Quill — \(stateLabel.title)"
+        statusItem?.button?.setAccessibilityValue(stateLabel.title)
     }
 
     /// Show transcription progress/failure as a second status line in the
