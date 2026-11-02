@@ -102,6 +102,17 @@ class SharingReviews:
             raise WorkflowError("The saved meeting notes changed. This sharing approval is no longer valid")
         return snapshot
 
+    @staticmethod
+    def _refreshable(record):
+        # Only replace an untouched offer. Even an empty operation marker may
+        # represent a prior dispatch; preserve every prepared/approved journal.
+        return (isinstance(record, dict) and record.get("status") == "available"
+                and record.get("suggestion_status") != "searching"
+                and record.get("journal") == {} and record.get("recipients") == []
+                and not any(key in record for key in (
+                    "approval", "draft", "receipt", "operation", "attempts",
+                    "recipient_draft", "recipient_source")))
+
     def _automatic_policy(self, record):
         if record.get("suggestion_automatic") is not True:
             return
@@ -248,9 +259,17 @@ class SharingReviews:
                 pass
         if record["status"] not in ("private", "shared"):
             try:
-                self._current(record)
+                snapshot = self.snapshot(job)
             except (ValueError, WorkflowError, OSError) as error:
                 result.update(status="needs_attention", error=str(error), retryable=False)
+                return result
+            if digest(snapshot) != record["source_hash"]:
+                refreshable = self._refreshable(record)
+                result.update(status="needs_attention", retryable=False,
+                              refreshable=refreshable,
+                              error=("The sharing details changed. Refresh this review before sharing."
+                                     if refreshable else
+                                     "The saved meeting notes changed. This sharing approval is no longer valid"))
                 return result
         result["retryable"] = result["status"] == "needs_attention" and record.get("attempts", 0) < 3
         return result
@@ -278,7 +297,7 @@ class SharingReviews:
         return cards
 
     def decide(self, action, job, revision, emails=None, suggestion=None):
-        if action not in ("sharing_prepare", "sharing_confirm", "sharing_private", "sharing_retry", "sharing_suggest", "sharing_use_suggestions"):
+        if action not in ("sharing_prepare", "sharing_confirm", "sharing_private", "sharing_retry", "sharing_suggest", "sharing_use_suggestions", "sharing_refresh"):
             raise WorkflowError("Unknown sharing action")
         if action != "sharing_prepare" and emails is not None:
             raise WorkflowError("Recipients can only be set when preparing the private copy")
@@ -292,6 +311,17 @@ class SharingReviews:
             expected = record["revision"] if record else digest(snapshot)
             if revision != expected:
                 raise WorkflowError("This review changed; reload before choosing")
+            if action == "sharing_refresh":
+                if not self._refreshable(record):
+                    raise WorkflowError("Only an untouched sharing review can be refreshed")
+                if digest(snapshot) == record["source_hash"]:
+                    raise WorkflowError("This sharing review is already current")
+                # A fresh review discards stale calendar suggestions but grants
+                # no access and performs no copy, lookup, or sharing operation.
+                record = self._new(job, snapshot)
+                record.update(status="available", suggestion_status="idle")
+                self.put(record)
+                return copy.deepcopy(record)
             if record and action != "sharing_private":
                 self._current(record)
             status = record["status"] if record else "available"
@@ -419,6 +449,7 @@ class SharingReviews:
                     from .codex_calendar_transport import CodexCalendarTransport
                     settings = load_config(self.config_path).get("publish", {})
                     transport = CodexCalendarTransport(settings.get("codex", "/Applications/Codex.app/Contents/Resources/codex"),
+                        account_email=snapshot["owner"],
                         timeout=min(90, max(1, int(settings.get("timeout_seconds", 180)))))
                     transport.cancelled = lambda: job in deleted_jobs(self.state)
                     invoke = transport.invoke

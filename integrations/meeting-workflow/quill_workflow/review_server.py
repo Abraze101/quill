@@ -21,7 +21,7 @@ DELETION_ACTIONS = {"delete_prepare", "delete_confirm"}
 MAX_FORM_BYTES = 8192
 MAX_NOTES_BYTES = 64 * 1024
 SHARING_ACTIONS = {"sharing_prepare", "sharing_confirm", "sharing_private", "sharing_retry",
-                   "sharing_suggest", "sharing_use_suggestions"}
+                   "sharing_suggest", "sharing_use_suggestions", "sharing_refresh"}
 
 
 def _escape(value):
@@ -254,6 +254,8 @@ def _sharing_cards(server, items=None, start_index=0):
                 body += '</p>'
             if item.get("retryable") is True:
                 body += _sharing_form(server, item, '<button name="action" value="sharing_retry">Retry this sharing step</button>')
+            if item.get("refreshable") is True:
+                body += _sharing_form(server, item, '<button name="action" value="sharing_refresh">Refresh sharing review</button>')
             if item.get("cancellable") is True:
                 body += _sharing_form(server, item, '<button name="action" value="sharing_private">Keep private</button>')
         else:

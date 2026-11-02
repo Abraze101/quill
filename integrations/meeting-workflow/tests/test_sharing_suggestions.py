@@ -45,6 +45,15 @@ class SharingSuggestionsTests(unittest.TestCase):
         self.assertNotIn("approval", record)
         self.assertEqual(record["journal"], {})
         self.assertEqual(self.calls, [("list_calendars", {"max_results": 20})])
+    def test_default_calendar_transport_binds_the_meeting_document_owner(self):
+        request = self.request()
+        with patch("quill_workflow.codex_calendar_transport.CodexCalendarTransport") as transport:
+            transport.return_value.timeout = 90
+            transport.return_value.invoke.return_value = {}
+            record = self.reviews.run_suggestions("job", request["revision"], suggest=self.suggest)
+        self.assertEqual(record["suggestion_status"], "ready")
+        self.assertEqual(transport.call_args.kwargs["account_email"], "owner@example.com")
+        transport.return_value.invoke.assert_called_once_with("list_calendars", {"max_results": 20})
     def test_use_suggestions_only_prefills_editable_draft(self):
         found = self.found()
         record = self.reviews.decide("sharing_use_suggestions", "job", found["revision"], suggestion="a" * 64)

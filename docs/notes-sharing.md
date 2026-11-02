@@ -49,8 +49,10 @@ Trash. It leaves existing Drive documents and shared notes in place.
 
 ## Calendar suggestions
 
-The lookup uses the connected Google Calendar accounts through local Codex. It
-reads visible calendars and events within 90 minutes of the recording's start.
+The lookup uses the Google Calendar connection matching the filed document's
+owner through local Codex. It verifies that account before reading its visible
+calendars and events within 90 minutes of the recording's start. If that account
+is missing or ambiguous, the lookup stops instead of choosing another account.
 It checks up to 20 calendars, 25 search results per calendar and 10 full event
 records, with a 90-second overall deadline. Limits, incomplete attendee lists and
 unavailable calendars are shown in the review. The page identifies which calendars
@@ -102,6 +104,12 @@ recipient addresses. Changed sources or an edited copy stop the operation for
 review. The copy comes from the pinned blank template, so the original transcript
 is never placed in the copy or its revision history. Document content, date chip,
 paragraph styles, location, owner and permissions are checked before sharing.
+
+If the source or connected account changes before you choose recipients or
+prepare a copy, choose **Refresh sharing review**. It reloads the validated notes
+and clears old attendee suggestions. It does not create a document or share it.
+Prepared copies, approved shares and uncertain operations retain their saved
+history and cannot be reset this way.
 
 The folder check follows private ancestors to the authenticated My Drive root.
 Connectors may return a null parent list for that root. Quill accepts it only

@@ -105,6 +105,18 @@ class AutomaticSuggestionWorkflowTests(unittest.TestCase):
         launch.assert_not_called()
         review.close.assert_called_once()
 
+    def test_refreshing_unused_sharing_review_never_launches_external_worker(self):
+        review = Mock()
+        review.decide.return_value = {'job': 'new-job', 'status': 'available',
+                                      'revision': 'fresh-review', 'suggestion_status': 'idle'}
+        with patch('quill_workflow.sharing.SharingReviews', return_value=review), \
+                patch.object(workflow.subprocess, 'Popen') as launch:
+            workflow.sharing_decision('sharing_refresh', 'new-job', 'old-review', None,
+                                      self.config_path, self.queue.state)
+        review.decide.assert_called_once_with('sharing_refresh', 'new-job', 'old-review', None, None)
+        review.close.assert_called_once()
+        launch.assert_not_called()
+
     def test_repeat_scan_uses_store_claim_and_does_not_duplicate_lookup(self):
         review = Mock()
         review.request_automatic.side_effect = [self.pending_review(), None]

@@ -53,6 +53,15 @@ class SharingTests(unittest.TestCase):
     def confirm(self):
         record = self.ready()
         return self.reviews.decide("sharing_confirm", "test", record["revision"])
+    def stale_offer(self):
+        record = self.reviews._new("test", self.source)
+        record.update(status="available", suggestion_status="ready", suggestion_revision="old-lookup",
+                      suggested_events=[{"title": "Old calendar event"}], suggestion_scope=["old-calendar"],
+                      suggestion_error="Old lookup error", suggestion_warnings=["Old warning"],
+                      automatic_suggestion={"state": "completed", "since": 1})
+        self.reviews.put(record)
+        self.source["account_link_id"] = "link_selected_account"
+        return record
     def test_prepare_is_private_until_separate_confirmation(self):
         record = self.ready()
         self.assertEqual(record["status"], "ready")
@@ -196,6 +205,94 @@ class SharingTests(unittest.TestCase):
         for value in ("", "Alice <alice@example.com>", "all", "@example.com", "https://example.com"):
             with self.assertRaises(WorkflowError):
                 recipients(value)
+
+    def test_refresh_stale_untouched_offer_binds_current_source_without_external_work(self):
+        record = self.stale_offer()
+        before = self.reviews.get("test")
+        card = self.reviews.card("test")
+        self.assertEqual(card["status"], "needs_attention")
+        self.assertTrue(card["refreshable"])
+        self.assertFalse(card["retryable"])
+        self.assertEqual(self.reviews.get("test"), before)
+        with patch("subprocess.Popen") as process, \
+                patch("quill_workflow.codex_sharing_transport.CodexSharingTransport.invoke") as drive, \
+                patch("quill_workflow.codex_calendar_transport.CodexCalendarTransport.invoke") as calendar:
+            result = self.reviews.decide("sharing_refresh", "test", record["revision"])
+            process.assert_not_called()
+            drive.assert_not_called()
+            calendar.assert_not_called()
+        self.assertEqual(result["status"], "available")
+        self.assertEqual(result["suggestion_status"], "idle")
+        self.assertEqual(result["source_hash"], digest(self.source))
+        self.assertNotEqual(result["revision"], record["revision"])
+        self.assertEqual(result["journal"], {})
+        self.assertEqual(result["recipients"], [])
+        for key in ("suggested_events", "suggestion_revision", "suggestion_scope", "suggestion_error",
+                    "suggestion_warnings", "automatic_suggestion", "approval", "draft", "receipt"):
+            self.assertNotIn(key, result)
+        self.assertEqual(self.reviews.card("test")["status"], "available")
+        with self.assertRaises(WorkflowError):
+            self.reviews.run("test", result["revision"], self.adapter)
+        self.assertEqual(self.adapter.calls, [])
+
+    def test_refresh_requires_saved_stale_offer_and_current_revision(self):
+        with self.assertRaises(WorkflowError):
+            self.reviews.decide("sharing_refresh", "test", digest(self.source))
+        record = self.stale_offer()
+        with self.assertRaisesRegex(WorkflowError, "reload"):
+            self.reviews.decide("sharing_refresh", "test", "outdated-revision")
+        self.assertEqual(self.reviews.get("test"), record)
+        refreshed = self.reviews.decide("sharing_refresh", "test", record["revision"])
+        with self.assertRaisesRegex(WorkflowError, "reload"):
+            self.reviews.decide("sharing_refresh", "test", record["revision"])
+        with self.assertRaisesRegex(WorkflowError, "already current"):
+            self.reviews.decide("sharing_refresh", "test", refreshed["revision"])
+        self.assertEqual(self.reviews.get("test"), refreshed)
+
+    def test_refresh_requires_valid_current_source(self):
+        record = self.stale_offer()
+        with patch.object(self.reviews, "snapshot", side_effect=ValueError("Source unavailable")):
+            card = self.reviews.card("test")
+            self.assertEqual(card["status"], "needs_attention")
+            self.assertFalse(card.get("refreshable", False))
+            with self.assertRaisesRegex(ValueError, "Source unavailable"):
+                self.reviews.decide("sharing_refresh", "test", record["revision"])
+        self.assertEqual(self.reviews.get("test"), record)
+
+    def test_refresh_preserves_all_prepared_approved_or_selected_recipient_state(self):
+        original = self.stale_offer()
+        cases = [{"status": value} for value in ("preparing", "ready", "sharing", "shared", "private", "needs_attention")]
+        cases += [{key: value} for key, value in (
+            ("approval", {}), ("draft", {}), ("receipt", {}), ("operation", "prepare"),
+            ("attempts", 0), ("journal", {"copy": {"state": "dispatched"}}),
+            ("recipients", ["reader@example.com"]), ("recipient_draft", "reader@example.com"),
+            ("recipient_source", {"event_id": "selected-event"}), ("suggestion_status", "searching"))]
+        for changed in cases:
+            with self.subTest(changed=changed):
+                record = dict(copy.deepcopy(original), **changed)
+                self.reviews.put(record)
+                self.assertFalse(self.reviews.card("test").get("refreshable", False))
+                with self.assertRaisesRegex(WorkflowError, "untouched"):
+                    self.reviews.decide("sharing_refresh", "test", record["revision"])
+                self.assertEqual(self.reviews.get("test"), record)
+
+    def test_refresh_obeys_job_and_software_recovery_locks(self):
+        record = self.stale_offer()
+        with self.reviews.locked("test"):
+            with self.assertRaisesRegex(WorkflowError, "already being updated"):
+                self.reviews.decide("sharing_refresh", "test", record["revision"])
+        with (self.state / "sharing-work.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(WorkflowError, "recovery"):
+                self.reviews.decide("sharing_refresh", "test", record["revision"])
+        self.assertEqual(self.reviews.get("test"), record)
+
+    def test_refresh_cannot_supply_recipients_or_calendar_selection(self):
+        record = self.stale_offer()
+        for kwargs in ({"emails": "reader@example.com"}, {"suggestion": "a" * 64}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(WorkflowError):
+                self.reviews.decide("sharing_refresh", "test", record["revision"], **kwargs)
+        self.assertEqual(self.reviews.get("test"), record)
 
 
 if __name__ == "__main__":

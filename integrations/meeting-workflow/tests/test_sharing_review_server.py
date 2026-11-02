@@ -94,6 +94,22 @@ class SharingReviewServerTests(unittest.TestCase):
         self.assertEqual(headers["Location"].split("?", 1)[0], self.server.review_path)
         self.assertEqual(self.calls, [("sharing_prepare", "exact-job", "exact-revision", emails)])
 
+    def test_stale_unused_review_can_refresh_without_recipients_or_sharing(self):
+        self.items[0].update(status="needs_attention", error="The saved sharing details changed.",
+                             retryable=False, refreshable=True, cancellable=True)
+        status, _, body = self.request()
+        self.assertEqual(status, 200)
+        self.assertIn('value="sharing_refresh">Refresh sharing review', body)
+        self.assertNotIn('value="sharing_confirm"', body)
+        self.assertNotIn('value="sharing_retry"', body)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.decide("sharing_refresh")[0], 303)
+        self.assertEqual(self.calls, [("sharing_refresh", "exact-job", "exact-revision", None)])
+        self.assertEqual(self.decide("sharing_refresh", emails="alice@example.com")[0], 400)
+        self.assertEqual(len(self.calls), 1)
+        self.items[0]["refreshable"] = False
+        self.assertNotIn('value="sharing_refresh"', self.request()[2])
+
     def test_ready_preview_requires_explicit_confirmation_without_recipient_changes(self):
         self.ready()
         status, _, body = self.request()

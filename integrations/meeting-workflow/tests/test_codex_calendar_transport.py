@@ -2,6 +2,7 @@
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from quill_workflow.codex_calendar_transport import (
@@ -17,6 +18,7 @@ class CalendarTransportTests(unittest.TestCase):
         self.fixture.setUp()
         self.bounds = {"calendar_id": "primary", "time_min": "2026-10-09T09:30:37Z",
                        "time_max": "2026-10-09T14:00:37Z", "timezone_str": "UTC", "max_results": 30}
+        self.link = "link_calendar_owner"
 
     def tearDown(self):
         self.fixture.tearDown()
@@ -25,12 +27,13 @@ class CalendarTransportTests(unittest.TestCase):
         native = {"events": [{"id": "event_20261009", "summary": "Synthetic meeting",
                               "start": "2026-10-09T11:00:00Z", "end": "2026-10-09T12:00:00Z"}],
                   "next_page_token": None}
-        result = CodexCalendarTransport(executable=self.fixture.fake(native=native)).invoke("search_events", self.bounds)
+        result = CodexCalendarTransport(executable=self.fixture.fake(native=native),
+                                       account_link_id=self.link).invoke("search_events", self.bounds)
         self.assertEqual(result, native)
         messages = self.fixture.requests()
         self.assertEqual([m["method"] for m in messages], ["initialize", "initialized", "thread/start", "mcpServer/tool/call"])
         self.assertEqual(messages[-1]["params"]["tool"], "google_calendar.search_events")
-        self.assertEqual(messages[-1]["params"]["arguments"], self.bounds)
+        self.assertEqual(messages[-1]["params"]["arguments"], dict(self.bounds, link_id=self.link))
         self.assertTrue(messages[2]["params"]["ephemeral"])
 
     def test_list_calendars_and_exact_event_shapes(self):
@@ -105,14 +108,111 @@ class CalendarTransportTests(unittest.TestCase):
     def test_interrupted_read_is_not_an_unknown_write_and_does_not_retry(self):
         executable = self.fixture.fake(call="sys.exit(0)")
         with self.assertRaises(private.DriveTransportError) as caught:
-            CodexCalendarTransport(executable=executable).invoke("search_events", self.bounds)
+            CodexCalendarTransport(executable=executable, account_link_id=self.link).invoke("search_events", self.bounds)
         self.assertFalse(caught.exception.outcome_unknown)
         self.assertEqual(len([m for m in self.fixture.requests() if m["method"] == "mcpServer/tool/call"]), 1)
 
     def test_approval_or_server_tool_requests_are_never_answered(self):
         executable = self.fixture.fake(call="send({'id':'approval','method':'mcpServer/elicitation/request','params':{}})")
         with self.assertRaises(private.DriveOperationError):
-            CodexCalendarTransport(executable=executable).invoke("search_events", self.bounds)
+            CodexCalendarTransport(executable=executable, account_link_id=self.link).invoke("search_events", self.bounds)
+
+    def catalog(self, accounts=None):
+        if accounts is None:
+            accounts = [{"link_id": self.link, "profile_id": "owner123", "profile_email": "owner@example.test",
+                         "profile_name": "Owner"},
+                        {"link_id": "link_other_account", "profile_id": "other123", "profile_email": "other@example.test",
+                         "profile_name": "Other"}]
+        return {"data": [{"name": "codex_apps", "tools": {"google_calendar.get_profile": {
+            "name": "google_calendar.get_profile", "_meta": {"connector_id": CONNECTOR,
+                "link_accounts": accounts}}}}], "nextCursor": None}
+
+    def matching_transport(self, *, catalog=None, profile=None):
+        profile = profile or {"id": "owner123", "email": "owner@example.test"}
+        call = "value = " + repr(profile) + " if request['params']['tool']=='google_calendar.get_profile' else {'calendars': [], 'next_page_token': None}\n"
+        call += "send({'id':3,'result':{'structuredContent':value,'isError':False}})"
+        executable = self.fixture.fake(catalog=catalog if catalog is not None else self.catalog(), call=call)
+        return CodexCalendarTransport(executable, account_email="Owner@example.test")
+
+    def test_owner_account_is_discovered_verified_and_pinned_on_all_reads(self):
+        transport = self.matching_transport()
+        self.assertEqual(transport.invoke("list_calendars", {"max_results": 20})["calendars"], [])
+        transport.invoke("list_calendars", {"max_results": 10})
+        requests = self.fixture.requests()
+        calls = [item["params"] for item in requests if item["method"] == "mcpServer/tool/call"]
+        self.assertEqual([item["tool"] for item in calls],
+                         ["google_calendar.get_profile", "google_calendar.list_calendars", "google_calendar.list_calendars"])
+        self.assertTrue(all(item["arguments"]["link_id"] == self.link for item in calls))
+        self.assertEqual(sum(item["method"] == "mcpServerStatus/list" for item in requests), 1)
+        self.assertNotIn("turn/start", [item["method"] for item in requests])
+        self.assertEqual(transport.account_link_id, self.link)
+
+    def test_no_account_does_not_fall_back_to_a_default(self):
+        with self.assertRaisesRegex(private.DriveOperationError, "Choose the Google account"):
+            CodexCalendarTransport(self.fixture.fake()).invoke("list_calendars", {})
+        self.assertFalse(self.fixture.capture.exists())
+
+    def test_unmatched_owner_and_duplicate_matches_never_read_calendar_events(self):
+        for accounts in ([], [{"link_id": "link_other", "profile_id": "other123",
+                              "profile_email": "other@example.test", "profile_name": "Other"}],
+                         self.catalog()["data"][0]["tools"]["google_calendar.get_profile"]["_meta"]["link_accounts"] * 2):
+            with self.subTest(accounts=accounts):
+                if self.fixture.capture.exists():
+                    self.fixture.capture.unlink()
+                transport = self.matching_transport(catalog=self.catalog(accounts))
+                with self.assertRaises(private.DriveTransportError):
+                    transport.invoke("list_calendars", {})
+                self.assertFalse(any(item["method"] == "mcpServer/tool/call" for item in self.fixture.requests()))
+
+    def test_mismatched_verified_profile_never_reads_calendar_events(self):
+        for profile in ({"id": "wrong", "email": "owner@example.test"},
+                        {"id": "owner123", "email": "other@example.test"}):
+            with self.subTest(profile=profile):
+                if self.fixture.capture.exists():
+                    self.fixture.capture.unlink()
+                transport = self.matching_transport(profile=profile)
+                with self.assertRaisesRegex(private.DriveOperationError, "different account"):
+                    transport.invoke("list_calendars", {})
+                calls = [item["params"]["tool"] for item in self.fixture.requests() if item["method"] == "mcpServer/tool/call"]
+                self.assertEqual(calls, ["google_calendar.get_profile"])
+
+    def test_caller_cannot_override_selected_calendar_account(self):
+        transport = CodexCalendarTransport(self.fixture.fake(), account_link_id=self.link)
+        with self.assertRaises(private.DriveProtocolError):
+            transport.invoke("list_calendars", {"link_id": "link_other"})
+        self.assertFalse(self.fixture.capture.exists())
+
+    def test_wrong_connector_metadata_does_not_select_an_account(self):
+        catalog = self.catalog()
+        catalog["data"][0]["tools"]["google_calendar.get_profile"]["_meta"]["connector_id"] = private.CONNECTOR
+        with self.assertRaisesRegex(private.DriveProtocolError, "different connector"):
+            self.matching_transport(catalog=catalog).invoke("list_calendars", {})
+        self.assertFalse(any(item["method"] == "mcpServer/tool/call" for item in self.fixture.requests()))
+
+    def test_discovery_profile_and_read_share_one_deadline(self):
+        transport = self.matching_transport()
+        seen = []
+        original = transport._read_rpc
+        def read(*args, **kwargs):
+            seen.append(args[3])
+            return original(*args, **kwargs)
+        with patch.object(transport, "_read_rpc", side_effect=read):
+            transport.invoke("list_calendars", {})
+        self.assertEqual(len(seen), 3)
+        self.assertEqual(len(set(seen)), 1)
+
+    def test_expired_deadline_does_not_launch_a_process(self):
+        transport = self.matching_transport()
+        with patch("quill_workflow.codex_calendar_transport.time.monotonic", return_value=20):
+            with self.assertRaisesRegex(private.DriveTransportError, "time limit"):
+                transport._read_rpc(transport.executable, "list_calendars", {}, 10)
+        self.assertFalse(self.fixture.capture.exists())
+
+    def test_discovery_pagination_is_bounded(self):
+        catalog = {"data": [], "nextCursor": "repeat"}
+        with self.assertRaisesRegex(private.DriveProtocolError, "page limit"):
+            self.matching_transport(catalog=catalog).invoke("list_calendars", {})
+        self.assertEqual(sum(item["method"] == "mcpServerStatus/list" for item in self.fixture.requests()), 2)
 
 
 if __name__ == "__main__":
