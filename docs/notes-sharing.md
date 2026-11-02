@@ -74,10 +74,19 @@ A stranded request becomes retryable in the review page. Disabling automatic
 lookup or changing its activation timestamp blocks subsequent automatic reads.
 These failures do not retry the completed Drive upload or interrupt recording.
 
-Matching uses the saved recording time, validated note title and identified
-participant names. A recording with a saved meeting identifier can also be matched
-to its Meet or Zoom link. Current recording metadata does not save that identifier,
-so current suggestions rely on time, title and names and remain tentative.
+Matching uses the saved recording time, validated note title and participant
+names. New recordings can also save the normalized Meet code or Zoom meeting ID
+and names visible in supported in-call participant elements. The browser supplies
+the meeting identifier from its verified current frame. Full URLs, passcodes,
+chat, captions and participant email addresses are excluded.
+
+The saved list is partial: hidden tiles, unsupported layouts and people outside
+the captured interval may be missing. A matching meeting link takes priority;
+an exact display-name match can improve a calendar suggestion. The review labels
+an address whose display name was seen in the call, but its email still comes
+from the calendar invitation and needs review. Duplicate calendar display names remain
+invite-only suggestions. No address is selected automatically. Historical
+recordings without this evidence keep using time, title and note names.
 Cancelled events, declined invitees, resources, your document-owner address and
 verified own calendar-account addresses are excluded. Each event offers at most
 20 addresses; a longer list is marked partial.

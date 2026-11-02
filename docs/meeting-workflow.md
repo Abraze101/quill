@@ -188,9 +188,11 @@ effect on the next connection.
 
 Detection supports Meet `/<meeting-code>` and `/meet/<meeting-code>` URLs and
 Zoom's `/wc/` web client. The bridge passes opaque call identities, state,
-timestamps and optional window bounds. It does not send meeting titles,
-participants, captions, chat or media. The extension's `webNavigation` permission
-supports checking meeting senders; stored detector state contains no URLs.
+timestamps and optional window bounds. Joined signals can also carry the
+normalized meeting code and names visible in supported meeting tiles. These
+partial names help match calendar invitations and review speakers; they do not
+verify identity or authorize sharing. No full URLs, passcodes, captions, chat or
+media are sent. The extension's `webNavigation` permission checks meeting senders.
 
 Before relying on a new installation, use an empty test meeting and verify:
 

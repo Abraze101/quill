@@ -347,6 +347,88 @@ class PipelineTests(unittest.TestCase):
         self.queue.run_ready(runner)
         self.assertEqual(next(t for t in self.queue.tasks(job) if t["stage"] == "notes")["status"], "succeeded")
 
+    def context_notes_fixture(self):
+        from quill_workflow.transcript_sources import bind_speaker_review
+        transcript = {"speaker_labels": "diarized_v1", "speakers": {
+            "mic_speaker_1": {"source": "mic", "label": "Microphone speaker 1"}},
+            "segments": [{"speaker": "mic_speaker_1", "source": "mic", "start_ms": 0,
+                          "text": "My name is Jamie. I will send the agenda."}]}
+        context = {"provider": "google-meet", "key": "abc-defg-hij", "coverage": "visible_only",
+                   "participants": [{"name": "Jamie", "self": False}]}
+        atomic_json(self.session / "transcript.json", transcript)
+        meta = json.loads((self.session / "meta.json").read_text())
+        meta["meeting_context"] = context
+        atomic_json(self.session / "meta.json", meta)
+        settings = {"enabled": True, "command": ["test-notes", "{input}", "{output}", "{context}"]}
+        self.config["notes"] = settings
+        job = self.queue.enqueue(self.session, self.config)
+        runner = ConnectorRunner(self.queue.state, ROOT / "skills/call-summary/SKILL.md")
+        notes = {"schema_version": 1, "summary": [{"text": "Jamie will send the agenda.", "evidence": [0]}],
+            "actions": [], "speaker_review": {"schema_version": 1,
+            "assignments": [{"speaker_id": "mic_speaker_1", "name": "Jamie", "status": "confirmed",
+                             "evidence": [0], "context_participants": []}]}}
+        def execute(argv, *_):
+            self.assertEqual(json.loads(Path(argv[3]).read_text()), context)
+            atomic_json(Path(argv[2]), bind_speaker_review(notes, transcript, context))
+        runner.execute = execute
+        return job, runner, settings, transcript, context, execute
+
+    def test_speaker_context_snapshot_and_derived_transcript_survive_retry(self):
+        job, runner, settings, transcript, context, _ = self.context_notes_fixture()
+        original = (self.session / "transcript.json").read_bytes()
+        receipt = runner("notes", job, settings)
+        folder = self.queue.state / "results" / job / "notes"
+        self.assertIn("Jamie", (folder / "transcript-reviewed.md").read_text())
+        self.assertEqual((folder / "source-transcript.json").read_bytes(), original)
+        self.assertEqual((self.session / "transcript.json").read_bytes(), original)
+        self.assertTrue(receipt["context_sha256"])
+        runner.execute = lambda *args: self.fail("Finished review ran twice")
+        self.assertEqual(runner("notes", job, settings), receipt)
+        (self.queue.state / "results" / job / "notes-receipt.json").unlink()
+        self.assertEqual(runner("notes", job, settings), receipt)
+        meta_path = self.queue.state / "recordings" / job / "meta.json"
+        metadata = json.loads(meta_path.read_text())
+        metadata["meeting_context"]["participants"].append({"name": "Morgan", "self": False})
+        atomic_json(meta_path, metadata)
+        with self.assertRaisesRegex(NeedsConfiguration, "explicit revision"):
+            runner("notes", job, settings)
+
+    def test_changed_transcript_is_rejected_during_speaker_review(self):
+        job, runner, settings, transcript, _, execute = self.context_notes_fixture()
+        def mutate(argv, *args):
+            execute(argv, *args)
+            changed = json.loads(Path(argv[1]).read_text())
+            changed["segments"][0]["text"] = "Changed input"
+            atomic_json(Path(argv[1]), changed)
+        runner.execute = mutate
+        with self.assertRaisesRegex(WorkflowError, "Transcript changed"):
+            runner("notes", job, settings)
+        self.assertFalse((self.queue.state / "results" / job / "notes").exists())
+
+    def test_changed_context_is_rejected_during_speaker_review(self):
+        job, runner, settings, _, _, execute = self.context_notes_fixture()
+        def mutate(argv, *args):
+            execute(argv, *args)
+            path = self.queue.state / "recordings" / job / "meta.json"
+            meta = json.loads(path.read_text())
+            meta["meeting_context"]["key"] = "xyz-abcd-efg"
+            atomic_json(path, meta)
+        runner.execute = mutate
+        with self.assertRaisesRegex(WorkflowError, "Meeting context changed"):
+            runner("notes", job, settings)
+
+    def test_wrong_context_review_cannot_publish(self):
+        job, runner, settings, _, _, execute = self.context_notes_fixture()
+        def mutate(argv, *args):
+            execute(argv, *args)
+            path = Path(argv[2])
+            notes = json.loads(path.read_text())
+            notes["speaker_review"]["context"]["key"] = "xyz-abcd-efg"
+            atomic_json(path, notes)
+        runner.execute = mutate
+        with self.assertRaisesRegex(WorkflowError, "different meeting context"):
+            runner("notes", job, settings)
+
     def test_notes_need_valid_evidence_and_explicit_unresolved_fields(self):
         transcript = {"segments": [{"speaker": "them", "start_ms": 0, "text": "Someone should send it."}]}
         notes = {"schema_version": 1, "actions": [{"text": "Send it", "owner": None, "due": None, "evidence": [0]}]}

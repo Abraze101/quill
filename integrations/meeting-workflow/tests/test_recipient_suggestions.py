@@ -56,12 +56,55 @@ class RecipientSuggestionTests(unittest.TestCase):
         self.assertIn('participant name', option['match_reason'])
         self.assertFalse(option['selected'])
         self.assertEqual(option['recipients'], [{'name': 'Casey', 'email': 'guest@example.test',
-                         'source': 'Calendar invite', 'response_status': 'accepted', 'optional': False, 'selected': False}])
+                         'source': 'Calendar invite', 'attendance': 'invite_only', 'response_status': 'accepted', 'optional': False, 'selected': False}])
         self.assertIn('not confirmed attendees', result['attendance_note'])
         self.assertEqual(result['calendars'][0]['name'], 'Main calendar')
         self.assertTrue(result['calendars'][0]['searched'])
         self.assertFalse(result['incomplete'])
         self.assertEqual([name for name, _ in self.calendar.calls], ['list_calendars', 'search_events', 'read_event'])
+
+    def test_observed_names_rank_display_matches_without_inventing_or_selecting_emails(self):
+        self.context.update(observed_participants=[{'name': 'Casey Rivera', 'self': False},
+                                                  {'name': 'Owner Name', 'self': True}],
+                            participant_coverage='visible_only')
+        self.calendar.event['attendees'].extend([
+            {'email': 'casey@example.test', 'display_name': 'Casey Rivera', 'response_status': 'accepted'},
+            {'email': 'invite@example.test', 'display_name': 'Invited Person', 'response_status': 'accepted'}])
+        result = self.run_suggestions()
+        event = result['events'][0]
+        self.assertIn('display name seen in the call', event['match_reason'])
+        recipients = {person['email']: person for person in event['recipients']}
+        self.assertEqual(recipients['casey@example.test']['attendance'], 'name_observed')
+        self.assertEqual(recipients['guest@example.test']['attendance'], 'invite_only')
+        self.assertEqual(recipients['invite@example.test']['attendance'], 'invite_only')
+        self.assertTrue(all(person['selected'] is False for person in recipients.values()))
+        self.assertFalse(event['selected'])
+        self.assertNotIn('observed_participants', self.calendar.calls[1][1])
+
+    def test_duplicate_calendar_display_names_are_not_labeled_observed_identity(self):
+        self.context.update(observed_participants=[{'name': 'Casey', 'self': False}], participant_coverage='visible_only')
+        self.calendar.event['attendees'].append({'email': 'another@example.test', 'display_name': 'Casey'})
+        result = self.run_suggestions()
+        self.assertTrue(all(person['attendance'] == 'invite_only' for person in result['events'][0]['recipients']))
+
+    def test_partial_name_and_self_name_never_claim_to_identify_an_invitee(self):
+        for person in ({'name': 'Casey Rivera', 'self': False}, {'name': 'Casey', 'self': True}):
+            self.context.update(observed_participants=[person], participant_coverage='visible_only')
+            self.assertEqual(self.run_suggestions()['events'][0]['recipients'][0]['attendance'], 'invite_only')
+
+    def test_exact_link_match_takes_priority_over_observed_name_match(self):
+        self.context.update(meeting={'provider': 'google-meet', 'key': 'abc-defg-hij'},
+                            observed_participants=[{'name': 'Casey', 'self': False}], participant_coverage='visible_only')
+        event = self.run_suggestions()['events'][0]
+        self.assertEqual(event['match_strength'], 'strong')
+        self.assertIn('Same meeting link', event['match_reason'])
+
+    def test_invalid_observed_evidence_cannot_trigger_a_calendar_read(self):
+        for people in ('Casey', [{'name': 'Casey', 'self': 'false'}], [{'name': 'private@example.test', 'self': False}]):
+            self.context.update(observed_participants=people, participant_coverage='visible_only')
+            with self.assertRaises(RecipientSuggestionError):
+                self.run_suggestions()
+        self.assertEqual(self.calendar.calls, [])
 
     def test_window_is_explicit_three_hours_even_for_long_recording(self):
         self.context['ended'] = '2026-10-10T06:00:37Z'
@@ -181,7 +224,8 @@ class RecipientSuggestionTests(unittest.TestCase):
         self.assertEqual(option['match_strength'], 'tentative')
         self.assertIn('similar title wording', option['match_reason'])
 
-    def test_excludes_self_owner_resources_declined_and_malformed(self):
+    def test_excludes_verified_self_owner_resources_declined_and_malformed(self):
+        self.context['verified_self_emails'] = ['alias@example.test']
         self.calendar.event['attendees'].extend([
             {'email': 'alias@example.test', 'is_self': True},
             {'email': 'room@example.test', 'resource': True},
@@ -201,7 +245,8 @@ class RecipientSuggestionTests(unittest.TestCase):
         self.calendar.event['attendees'][0]['response_status'] = 'declined'
         self.assertEqual(len(self.run_suggestions()['events'][0]['recipients']), 1)
 
-    def test_owned_secondary_account_email_is_excluded_without_self_marker(self):
+    def test_explicitly_verified_secondary_account_email_is_excluded_without_self_marker(self):
+        self.context['verified_self_emails'] = ['ownsecondary@example.com']
         self.calendar.calendars['calendars'].append({'id': 'ownsecondary@example.com', 'summary': 'Acme',
                                                     'access_role': 'owner', 'primary': False})
         self.calendar.event['attendees'].append({'email': 'ownsecondary@example.com', 'is_self': None,
@@ -210,6 +255,38 @@ class RecipientSuggestionTests(unittest.TestCase):
         self.assertTrue(options)
         self.assertTrue(all([recipient['email'] for recipient in option['recipients']] == ['guest@example.test']
                             for option in options))
+
+    def test_delegated_owner_calendar_does_not_hide_its_real_attendee(self):
+        self.calendar.calendars['calendars'].append({'id': 'coworker@example.test', 'summary': 'Delegated calendar',
+                                                    'access_role': 'owner', 'primary': False})
+        self.calendar.event['attendees'].append({'email': 'coworker@example.test', 'display_name': 'Coworker',
+                                                'is_self': True, 'self': True, 'response_status': 'accepted'})
+        for option in self.run_suggestions()['events']:
+            self.assertEqual({person['email'] for person in option['recipients']},
+                             {'guest@example.test', 'coworker@example.test'})
+
+    def test_calendar_copy_self_marker_does_not_establish_an_account_alias(self):
+        self.calendar.event['attendees'].append({'email': 'calendarowner@example.test', 'self': True})
+        self.calendar.event['attendees'].append({'email': 'organizer@example.test', 'is_self': True, 'organizer': True})
+        recipients = self.run_suggestions()['events'][0]['recipients']
+        self.assertEqual({person['email'] for person in recipients},
+                         {'guest@example.test', 'calendarowner@example.test', 'organizer@example.test'})
+
+    def test_missing_display_name_keeps_authoritative_address_without_inventing_name(self):
+        self.context.update(observed_participants=[{'name': 'Casey Rivera', 'self': False}], participant_coverage='visible_only')
+        self.calendar.event['attendees'][1].update(display_name=None, email='caseyrivera@example.test')
+        recipient = self.run_suggestions()['events'][0]['recipients'][0]
+        self.assertEqual(recipient['email'], 'caseyrivera@example.test')
+        self.assertIsNone(recipient['name'])
+        self.assertEqual(recipient['attendance'], 'invite_only')
+        self.assertFalse(recipient['selected'])
+
+    def test_invalid_explicit_account_aliases_cannot_suppress_attendees(self):
+        for value in ('alias@example.test', ['not-an-email'], [None], ['own@example.test'] * 21):
+            self.context['verified_self_emails'] = value
+            with self.assertRaises(RecipientSuggestionError):
+                self.run_suggestions()
+        self.assertEqual(self.calendar.calls, [])
 
     def test_reader_and_group_calendar_ids_are_not_assumed_to_be_self_addresses(self):
         self.calendar.calendars['calendars'].extend([

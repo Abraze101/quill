@@ -1,7 +1,8 @@
 import Foundation
 
 /// Reads the native browser bridge's bounded, atomic signal files. No browser
-/// history, meeting chat, title, attendee list, or media passes through here.
+/// history, meeting chat, full URLs, or media passes through here. Optional
+/// normalized meeting keys and partial visible participant names stay local.
 public struct MeetingSignalStore: Sendable {
     public let directory: URL
 
@@ -18,7 +19,7 @@ public struct MeetingSignalStore: Sendable {
             guard file.pathExtension == "json",
                   let values = try? file.resourceValues(forKeys: [.isSymbolicLinkKey, .isRegularFileKey, .fileSizeKey, .contentModificationDateKey]),
                   values.isSymbolicLink != true, values.isRegularFile == true,
-                  (values.fileSize ?? Int.max) < 4096,
+                  (values.fileSize ?? Int.max) < 16384,
                   let modified = values.contentModificationDate,
                   now - modified.timeIntervalSince1970 < 120,
                   let bytes = try? Data(contentsOf: file),

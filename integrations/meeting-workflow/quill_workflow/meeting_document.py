@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .meeting_title import meeting_title
 from .capture_quality import notice
-from .transcript_sources import SOURCE_NOTICE, DIARIZED_NOTICE, speaker_attributions, segment_label
+from .transcript_sources import attribution_notice, effective_attributions, segment_label
 
 FORMAT = "combined_google_doc_v1"
 VERSION = 1
@@ -240,7 +240,7 @@ def render_document(notes, transcript, metadata, route, timezone_name="UTC", not
         raise ValueError("Document notes layout must be sources or clean")
     from .pipeline import render_notes  # Validate every note and evidence reference.
     render_notes(notes, transcript)
-    attributions = speaker_attributions(transcript)
+    attributions = effective_attributions(transcript, notes)
     if not isinstance(metadata, dict) or not isinstance(route, dict):
         raise ValueError("Document metadata and approved company route are required")
     if not isinstance(timezone_name, str) or not timezone_name:
@@ -298,7 +298,7 @@ def render_document(notes, transcript, metadata, route, timezone_name="UTC", not
         if notes_layout == "sources":
             doc.evidence(draft["evidence"], segments)
     doc.paragraph("Full transcript", "Heading1", page_break=True)
-    doc.paragraph("Timestamps are relative to the recording. " + (SOURCE_NOTICE if attributions is None else DIARIZED_NOTICE))
+    doc.paragraph("Timestamps are relative to the recording. " + attribution_notice(transcript, notes))
     for index, segment in enumerate(segments):
         if not isinstance(segment, dict):
             raise ValueError("Every transcript segment must be an object")

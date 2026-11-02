@@ -76,7 +76,7 @@ function permitted(url) {
 
 async function currentFrame(tabID, frameID = 0) {
   // webNavigation can expose navigation metadata. We query only meeting
-  // senders/tracked tabs; neither URLs nor titles enter storage or the host.
+  // senders/tracked tabs; only a normalized meeting key enters context.
   try { return await chrome.webNavigation.getFrame({ tabId: Number(tabID), frameId: frameID }); }
   catch (error) {
     const message = typeof error?.message === "string" && error.message.length <= 512 ? error.message : "";
@@ -87,6 +87,34 @@ async function currentFrame(tabID, frameID = 0) {
     }
     return null;
   }
+}
+
+function meetingKey(url, provider) {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:" || parsed.username || parsed.password || (parsed.port && parsed.port !== "443")) return;
+    if (provider === "google-meet" && parsed.hostname === "meet.google.com") {
+      return /^\/(?:meet\/)?([a-z]{3}-[a-z]{4}-[a-z]{3})\/?$/.exec(parsed.pathname)?.[1];
+    }
+    if (provider === "zoom-web" && /(^|\.)zoom\.us$/.test(parsed.hostname)) {
+      return /^\/wc\/(?:join\/)?([0-9]{9,12})(?:\/(?:join|start))?\/?$/.exec(parsed.pathname)?.[1];
+    }
+  } catch {}
+}
+
+function participantEvidence(value) {
+  if (!Array.isArray(value) || value.length > 20) return [];
+  const people = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object" || Array.isArray(item)
+        || Object.keys(item).sort().join(",") !== "name,self" || typeof item.self !== "boolean"
+        || typeof item.name !== "string" || [...item.name].length > 100
+        || /\p{C}|@|:\/\//u.test(item.name)) return [];
+    const name = item.name.normalize("NFC").replace(/\s+/g, " ").trim();
+    if (!name || name !== item.name || /^(you|me|host|participant|participants|unknown|guest)$/i.test(name)) return [];
+    people.push({ name, self: item.self });
+  }
+  return people;
 }
 
 function zoomMeeting(url) {
@@ -104,7 +132,7 @@ async function currentIdentity(tabID, frameID, documentID, provider, rootDocumen
   if (frame?.documentId !== documentID || frame.documentLifecycle !== "active" || !permitted(frame.url)) return;
   if (frameID === 0) {
     if (rootDocumentID != null && rootDocumentID !== documentID) return;
-    return { rootDocumentID: documentID };
+    return { rootDocumentID: documentID, meetingKey: meetingKey(frame.url, provider) };
   }
   // Only the observed Zoom web-client shape is trusted: a direct child of
   // the current root, with the same origin and numeric meeting in both URLs.
@@ -115,7 +143,7 @@ async function currentIdentity(tabID, frameID, documentID, provider, rootDocumen
   const childMeeting = zoomMeeting(frame.url);
   const rootMeeting = zoomMeeting(root.url);
   if (!childMeeting || !rootMeeting || childMeeting.origin !== rootMeeting.origin || childMeeting.meeting !== rootMeeting.meeting) return;
-  return { rootDocumentID: root.documentId };
+  return { rootDocumentID: root.documentId, meetingKey: meetingKey(root.url, provider) };
 }
 
 function currentEvent(event) {
@@ -238,12 +266,18 @@ async function pump() {
       // Refresh geometry immediately before delivery: a queued heartbeat may
       // outlive a move/resize or a tab transfer to a different Chrome window.
       const browserWindow = candidate.windowUnavailable ? undefined : await browserWindowFor(candidate.tabID);
-      if (!await currentEvent(candidate)) {
+      const current = await currentEvent(candidate);
+      if (!current) {
         delete outbox[keyFor(candidate)];
         continue;
       }
       delete candidate.browserWindow;
       if (browserWindow) candidate.browserWindow = browserWindow;
+      if (candidate.meetingContext && current.meetingKey !== candidate.meetingContext.key) {
+        // A same-document navigation may change the actual meeting link.
+        // Omit old participant context rather than attach it to the new call.
+        delete candidate.meetingContext;
+      }
     }
     event = candidate;
     break;
@@ -260,6 +294,7 @@ async function pump() {
     }), ACK_TIMEOUT);
     port.postMessage({ source: event.source, meeting: event.meeting,
       provider: event.provider, state: event.state, requestID: event.requestID,
+      ...(event.state === "joined" && event.meetingContext ? { meetingContext: event.meetingContext } : {}),
       ...(event.state !== "left" && event.browserWindow ? { browserWindow: event.browserWindow } : {}) });
   } catch (error) {
     reportError("Native connection failed", error);
@@ -322,11 +357,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // geometry lookup. Retired documents cannot refresh the replacement call.
     if (!identity) return;
     const browserWindow = message.state === "left" ? undefined : await browserWindowFor(tab, sender.tab.windowId);
-    if (!await currentIdentity(tab, sender.frameId, sender.documentId, message.provider, identity.rootDocumentID)) return;
+    const current = await currentIdentity(tab, sender.frameId, sender.documentId, message.provider, identity.rootDocumentID);
+    if (!current) return;
     const source = client + "-" + tab;
     const event = { source, meeting: message.meeting, provider: message.provider,
       state: message.state, documentID: sender.documentId, frameID: sender.frameId,
       rootDocumentID: identity.rootDocumentID, tabID: tab,
+      ...(message.state === "joined" && current.meetingKey ? { meetingContext: {
+        provider: message.provider, key: current.meetingKey,
+        participants: participantEvidence(message.participants), coverage: "visible_only" } } : {}),
       ...(browserWindow ? { browserWindow } : {}) };
     const previous = documents[tab];
     if (previous && !sameDocument(previous, event) && previous.state !== "left") {

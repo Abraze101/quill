@@ -31,6 +31,9 @@ def meeting_title(notes, transcript):
     checks evidence, exact cited name spelling, and anonymous labels; it cannot
     independently prove that a mentioned person attended the meeting.
     """
+    # Validate the derived view before every notes renderer accepts it.
+    from .transcript_sources import effective_attributions
+    attributions = effective_attributions(transcript, notes) if "speaker_review" in notes else None
     if "meeting_title" not in notes:
         return None
     title = notes["meeting_title"]
@@ -75,8 +78,11 @@ def meeting_title(notes, transcript):
             raise ValueError("Meeting title cannot use anonymous participant names")
         cited = evidence(person["evidence"])
         pattern = r"(?<!\w)" + re.escape(normalized) + r"(?!\w)"
-        if not any(re.search(pattern, " ".join(unicodedata.normalize("NFC", text).casefold().split()))
-                   for text in cited):
+        confirmed = attributions is not None and any(
+            attributions.get(segments[index].get("speaker"), {}).get("name") == name
+            for index in person["evidence"])
+        if not confirmed and not any(re.search(pattern, " ".join(unicodedata.normalize("NFC", text).casefold().split()))
+                                    for text in cited):
             raise ValueError("Meeting title participant name is absent from its cited evidence")
         if normalized in seen:
             raise ValueError("Meeting title participant names must be unique")

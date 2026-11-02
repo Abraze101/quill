@@ -267,9 +267,11 @@ actor TranscriptionCoordinator {
             try RecordingReviewGate.requireProcessingAllowed(session: dir)
             if meta.speakerIdentificationRequested {
                 let status = await engine.speakerIdentificationStatus()
+                let diagnostic = await engine.speakerIdentificationDiagnostic()
                 try Task.checkCancellation()
                 try RecordingReviewGate.requireProcessingAllowed(session: dir)
                 speakerStatuses[track.source] = status == .disabled ? "unavailable" : status.rawValue
+                if let diagnostic { log(dir, "speakers \(track.source): \(diagnostic)") }
             }
             let offset = TimeInterval(track.offsetMs) / 1000
             var trackSpeakers: [String: String] = [:]
@@ -295,7 +297,9 @@ actor TranscriptionCoordinator {
         }
         merged.sort { $0.start_ms < $1.start_ms }
 
-        let names = SpeakerIdentityNames.names(in: merged.map { .init(speaker: $0.speaker, text: $0.text) })
+        let names = SpeakerIdentityNames.names(in: merged.map {
+            .init(speaker: $0.speaker, text: $0.text, startMs: $0.start_ms, endMs: $0.end_ms)
+        }, policy: .explicitIntroV2)
         for (identity, name) in names where speakers[identity] != nil {
             speakers[identity]?.name = name.name
             speakers[identity]?.name_source = "self_introduction"
@@ -316,6 +320,7 @@ actor TranscriptionCoordinator {
             created_at: ISO8601DateFormatter().string(from: Date()),
             segments: merged,
             speakers: meta.speakerIdentificationRequested ? speakers : nil,
+            speaker_name_policy: meta.speakerIdentificationRequested ? SpeakerIdentityNames.Policy.explicitIntroV2.rawValue : nil,
             speaker_identification: identification,
             capture_quality: meta.captureQuality
         )
@@ -510,6 +515,7 @@ private struct Transcript: Codable {
     let created_at: String
     let segments: [Segment]
     var speakers: [String: Speaker]? = nil
+    var speaker_name_policy: String? = nil
     var speaker_identification: Identification? = nil
     var capture_quality: CaptureQuality? = nil
 

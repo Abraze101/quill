@@ -1,5 +1,56 @@
 import Foundation
 
+/// Partial, visible in-call evidence. Display names are not verified identities
+/// and this context never grants recording ownership or sharing permission.
+public struct MeetingContext: Codable, Equatable, Sendable {
+    public struct Participant: Codable, Equatable, Sendable {
+        public let name: String
+        public let isSelf: Bool
+        enum CodingKeys: String, CodingKey { case name; case isSelf = "self" }
+        public init(name: String, isSelf: Bool) { self.name = name; self.isSelf = isSelf }
+    }
+    public let provider: String
+    public let key: String
+    public let participants: [Participant]
+    public let coverage: String
+
+    public init(provider: String, key: String, participants: [Participant], coverage: String = "visible_only") {
+        self.provider = provider; self.key = key; self.participants = participants; self.coverage = coverage
+    }
+
+    public func validated() -> MeetingContext? {
+        let pattern = provider == "google-meet" ? "^[a-z]{3}-[a-z]{4}-[a-z]{3}$" : "^[0-9]{9,12}$"
+        guard ["google-meet", "zoom-web"].contains(provider), coverage == "visible_only",
+              key.range(of: pattern, options: .regularExpression) != nil,
+              participants.count <= 50 else { return nil }
+        for person in participants {
+            let name = person.name
+            guard !name.isEmpty, name.unicodeScalars.count <= 100, name.utf8.count <= 400,
+                  name == name.precomposedStringWithCanonicalMapping,
+                  name == name.split(whereSeparator: \.isWhitespace).joined(separator: " "),
+                  !name.unicodeScalars.contains(where: {
+                      switch $0.properties.generalCategory {
+                      case .control, .format, .surrogate, .privateUse, .unassigned: return true
+                      default: return false
+                      }
+                  }),
+                  !name.contains("@"), !name.contains("://"),
+                  !["you", "me", "host", "unknown", "participant", "participants", "guest"].contains(name.lowercased()) else { return nil }
+        }
+        return self
+    }
+
+    public func merging(_ next: MeetingContext) -> MeetingContext {
+        guard let next = next.validated(), provider == next.provider, key == next.key else { return self }
+        var people = participants
+        for person in next.participants where !people.contains(person) {
+            if people.count == 50 { break }
+            people.append(person)
+        }
+        return MeetingContext(provider: provider, key: key, participants: people)
+    }
+}
+
 public struct MeetingSignal: Codable, Equatable, Sendable {
     public enum State: String, Codable, Sendable { case joined, left, unknown }
     /// Browser-reported outer window bounds. A browser ID is not a native
@@ -26,14 +77,16 @@ public struct MeetingSignal: Codable, Equatable, Sendable {
     public let state: State
     public let timestamp: TimeInterval
     public let browserWindow: BrowserWindow?
+    public let meetingContext: MeetingContext?
 
-    public init(source: String, meeting: String, provider: String, state: State, timestamp: TimeInterval, browserWindow: BrowserWindow? = nil) {
+    public init(source: String, meeting: String, provider: String, state: State, timestamp: TimeInterval, browserWindow: BrowserWindow? = nil, meetingContext: MeetingContext? = nil) {
         self.source = source
         self.meeting = meeting
         self.provider = provider
         self.state = state
         self.timestamp = timestamp
         self.browserWindow = browserWindow
+        self.meetingContext = meetingContext?.provider == provider ? meetingContext?.validated() : nil
     }
 }
 

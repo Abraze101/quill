@@ -662,6 +662,8 @@ extension AppController {
 private struct AppSleepChecks {
     @MainActor
     static func main() async throws {
+        try await AppController.meetingContextIsBoundToRecording()
+        try await AppController.ambiguousMeetingContextIsOmitted()
         try await AppController.warningHistoryDoesNotControlCapture()
         try await AppController.warningHistoryIncludesFailedStartup()
         try await AppController.crashCheckpointAndRestartReview()
@@ -694,11 +696,78 @@ private struct AppSleepChecks {
         try await AppController.failedAutomaticStartCanBeManuallyStartedAfterAutomationDisabled()
         try await AppController.transcriptionRetryRequestGuards()
         try await AppController.transcriptionRetrySuppressesLateAlerts()
-        print("App sleep/recovery/pause/reminder/retry/warning integration checks passed (33 production-coordinator scenarios; no devices, UI, user configuration, or external processing).")
+        print("App sleep/recovery/pause/reminder/retry/warning integration checks passed (35 production-coordinator scenarios; no devices, UI, user configuration, or external processing).")
     }
 }
 
 extension AppController {
+    static func meetingContextIsBoundToRecording() async throws {
+        try await withFixture { app in
+            func signal(_ names: [String], meeting: String = "call", key: String = "abc-defg-hij", source: String = "tab") -> MeetingSignal {
+                .init(source: source, meeting: meeting, provider: "google-meet", state: .joined, timestamp: 1000,
+                      meetingContext: .init(provider: "google-meet", key: key,
+                          participants: names.map { .init(name: $0, isSelf: false) }))
+            }
+            app.meetingAutomation.observe([signal(["Jamie"])], now: 1000)
+            app.requestStart()
+            try await waitFor { app.phase == .recording }
+            let directory = app.session!.dir
+            precondition(app.automaticMeeting == nil, "Context took ownership of a manual recording")
+            app.meetingAutomation.observe([signal(["Morgan"])], now: 1000)
+            app.tick()
+            let id = app.safety!.sessionID.uuidString
+            app.pauseDisplayedRecording(id, revision: app.recordingActionRevision, expectedPaused: false)
+            try await waitFor { app.phase == .paused }
+            app.meetingAutomation.observe([signal(["During pause"])], now: 1000)
+            app.tick()
+            app.meetingAutomation.observe([signal(["Morgan"])], now: 1000)
+            app.pauseDisplayedRecording(id, revision: app.recordingActionRevision, expectedPaused: true)
+            try await waitFor { app.phase == .recording }
+            app.meetingAutomation.observe([signal(["Unrelated"], key: "xyz-abcd-efg")], now: 1000)
+            app.tick()
+            app.meetingAutomation.observe([signal(["Other"], source: "other-tab")], now: 1000)
+            app.tick()
+            app.requestStop(manually: true)
+            try await waitFor { app.phase == .idle }
+            let metadata = try JSONSerialization.jsonObject(with: Data(contentsOf: directory.appendingPathComponent("meta.json"))) as! [String: Any]
+            let context = metadata["meeting_context"] as! [String: Any]
+            let names = (context["participants"] as! [[String: Any]]).map { $0["name"] as! String }
+            precondition(names == ["Jamie", "Morgan"], "Context mixed meetings or dropped later visible people")
+            precondition(context["key"] as? String == "abc-defg-hij")
+            app.meetingAutomation.observe([], now: 1001)
+            app.requestStart()
+            try await waitFor { app.phase == .recording }
+            let next = try app.session!.recoveryMetadata(transcriptionRequested: false, screenRequested: false, screenStarted: false)
+            precondition(next["meeting_context"] == nil, "Previous meeting leaked into a new recording")
+            app.meetingAutomation.observe([signal(["Later participant"], meeting: "later-call", key: "xyz-abcd-efg")], now: 1000)
+            app.tick()
+            let joinedLater = try app.session!.recoveryMetadata(transcriptionRequested: false, screenRequested: false, screenStarted: false)
+            precondition((joinedLater["meeting_context"] as? [String: Any])?["key"] as? String == "xyz-abcd-efg",
+                         "A meeting joined after manual recording began lost its context")
+            precondition(app.automaticMeeting == nil)
+            app.requestStop(manually: true)
+            try await waitFor { app.phase == .idle }
+        }
+    }
+
+    static func ambiguousMeetingContextIsOmitted() async throws {
+        try await withFixture { app in
+            let signals = ["one", "two"].map { id in
+                MeetingSignal(source: id, meeting: id, provider: "google-meet", state: .joined, timestamp: 1000,
+                    meetingContext: .init(provider: "google-meet", key: "abc-defg-hij",
+                        participants: [.init(name: "Jamie", isSelf: false)]))
+            }
+            app.meetingAutomation.observe(signals, now: 1000)
+            app.requestStart()
+            try await waitFor { app.phase == .recording }
+            app.tick()
+            let metadata = try app.session!.recoveryMetadata(transcriptionRequested: false, screenRequested: false, screenStarted: false)
+            precondition(metadata["meeting_context"] == nil, "Manual recording guessed between joined calls")
+            app.requestStop(manually: true)
+            try await waitFor { app.phase == .idle }
+        }
+    }
+
     static func warningHistoryIncludesFailedStartup() async throws {
         try await withFixture { app in
             Fixture.screenEnabled = true

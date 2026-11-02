@@ -26,6 +26,7 @@ actor ParakeetEngine: TranscriptionEngine {
 
     private var manager: AsrManager?
     private var speakerStatus: SpeakerIdentificationState = .disabled
+    private var speakerDiagnostic: String?
 
     func prepare() async throws {
         guard manager == nil else { return }
@@ -40,10 +41,12 @@ actor ParakeetEngine: TranscriptionEngine {
     }
 
     func speakerIdentificationStatus() async -> SpeakerIdentificationState { speakerStatus }
+    func speakerIdentificationDiagnostic() async -> String? { speakerDiagnostic }
 
     func transcribe(_ audio: URL, identifySpeakers: Bool) async throws -> [TranscriptSegment] {
         guard let manager else { throw EngineError.notPrepared }
         speakerStatus = identifySpeakers ? .unavailable : .disabled
+        speakerDiagnostic = nil
 
         // A track with no frames (recorder died before its first buffer)
         // makes AVFoundation raise an ObjC exception deep inside the
@@ -66,6 +69,7 @@ actor ParakeetEngine: TranscriptionEngine {
             TranscriptWord(start: $0.startTime, end: $0.endTime, text: $0.word)
         }
         guard !words.isEmpty, words.allSatisfy({ $0.start.isFinite && $0.end.isFinite && $0.start >= 0 && $0.end >= $0.start }) else {
+            if identifySpeakers { speakerDiagnostic = "unavailable: missing_or_invalid_word_timings; words=\(words.count)" }
             let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
             return text.isEmpty
                 ? []
@@ -78,11 +82,22 @@ actor ParakeetEngine: TranscriptionEngine {
             let segments = SpeakerAlignment.segments(words: words, intervals: intervals)
             let identified = segments.filter { $0.speakerID != nil }.count
             speakerStatus = identified == 0 ? .unavailable : (identified == segments.count ? .completed : .partial)
+            let supportedWords = segments.filter { $0.speakerID != nil }.reduce(0) { $0 + ($1.words?.count ?? 0) }
+            let clusters = Set(segments.compactMap(\.speakerID)).count
+            speakerDiagnostic = "\(speakerStatus.rawValue): \(identified == 0 ? "no_supported_alignment" : "aligned"); "
+                + "words=\(words.count); supported_words=\(supportedWords); intervals=\(intervals.count); clusters=\(clusters)"
             return segments
         } catch {
             // Cancellation is never downgraded to a successful transcript.
             try Task.checkCancellation()
             speakerStatus = .unavailable
+            let reason: String
+            switch error {
+            case LocalDiarizationProcess.Failure.timedOut: reason = "child_timeout"
+            case LocalDiarizationProcess.Failure.invalidOutput, is DecodingError: reason = "invalid_child_output"
+            default: reason = "child_unavailable"
+            }
+            speakerDiagnostic = "unavailable: \(reason); words=\(words.count)"
             return SpeakerAlignment.segments(words: words)
         }
     }
@@ -91,5 +106,6 @@ actor ParakeetEngine: TranscriptionEngine {
         if let manager { await manager.cleanup() }
         manager = nil
         speakerStatus = .disabled
+        speakerDiagnostic = nil
     }
 }

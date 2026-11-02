@@ -1,4 +1,6 @@
 import copy
+import hashlib
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -145,6 +147,43 @@ class SharingSuggestionsTests(unittest.TestCase):
         self.reviews.put(found)
         with self.assertRaises(WorkflowError):
             self.reviews.decide("sharing_suggest", "job", found["revision"])
+
+    def context_sources(self, meeting=None):
+        metadata = {"started": "2026-10-09T11:00:00Z", "ended": "2026-10-09T12:00:00Z"}
+        if meeting is not None:
+            metadata["meeting_context"] = meeting
+        notes = {"meeting_title": {"text": "Synthetic meeting", "participants": [{"name": "Mentioned Person"}]}}
+        self.source["binding"] = {}
+        for relative, value, key in (("recordings/job/meta.json", metadata, "metadata_sha256"),
+                                     ("results/job/notes/notes.json", notes, "notes_sha256")):
+            target = self.state / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            data = json.dumps(value).encode()
+            target.write_bytes(data)
+            self.source["binding"][key] = hashlib.sha256(data).hexdigest()
+        return SharingReviews._suggestion_context(self.reviews, "job", self.source)
+
+    def test_context_passes_frozen_meeting_key_and_observed_names_separately(self):
+        meeting = {"provider": "google-meet", "key": "abc-defg-hij", "coverage": "visible_only",
+                   "participants": [{"name": "Casey Rivera", "self": False}, {"name": "Owner Name", "self": True}]}
+        context = self.context_sources(meeting)
+        self.assertEqual(context["meeting"], {"provider": "google-meet", "key": "abc-defg-hij"})
+        self.assertEqual(context["observed_participants"], meeting["participants"])
+        self.assertEqual(context["participants"], ["Mentioned Person", "Casey Rivera"])
+        self.assertEqual(context["participant_coverage"], "visible_only")
+
+    def test_historical_context_does_not_invent_participant_evidence(self):
+        context = self.context_sources()
+        self.assertNotIn("meeting", context)
+        self.assertNotIn("observed_participants", context)
+
+    def test_invalid_present_context_and_changed_metadata_are_not_used(self):
+        with self.assertRaises(ValueError):
+            self.context_sources({"provider": "google-meet", "key": "full-url", "coverage": "visible_only", "participants": []})
+        self.context_sources()
+        (self.state / "recordings/job/meta.json").write_text("{}")
+        with self.assertRaisesRegex(WorkflowError, "changed"):
+            SharingReviews._suggestion_context(self.reviews, "job", self.source)
 
 
 if __name__ == "__main__":

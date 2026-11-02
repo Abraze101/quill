@@ -9,6 +9,7 @@ import hashlib
 import html
 import json
 import re
+import unicodedata
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
@@ -96,6 +97,14 @@ def _name_mentioned(name, text):
     return re.search(r"(?<!\w)" + re.escape(name.casefold()) + r"(?!\w)", text.casefold()) is not None
 
 
+def _name_key(value):
+    return " ".join(unicodedata.normalize("NFC", value).casefold().split())
+
+
+def _observed_names(context):
+    return {_name_key(person["name"]) for person in context.get("observed_participants", []) if not person["self"]}
+
+
 def _meeting_key(value):
     if not isinstance(value, dict):
         return None
@@ -173,12 +182,16 @@ def _match(context, event, start, end):
     title = _text(event.get("summary", event.get("title"))) or "Untitled calendar event"
     names = [name for name in context["participants"] if _name_mentioned(name, title)]
     attendees = event.get("attendees", [])
+    observed_names = _observed_names(context)
+    observed_matches = set()
     if isinstance(attendees, list):
         for attendee in attendees[:200]:
             if not isinstance(attendee, dict):
                 continue
             name = attendee.get("display_name", attendee.get("displayName"))
             if isinstance(name, str):
+                if _name_key(name) in observed_names:
+                    observed_matches.add(_name_key(name))
                 names.extend(candidate for candidate in context["participants"]
                              if candidate not in names and _name_mentioned(candidate, name))
     common = _words(context["title"]) & _words(title)
@@ -186,6 +199,9 @@ def _match(context, event, start, end):
         strength, reason, rank = "strong", "Same meeting link and overlapping times; invitees still need review.", 4
     elif exact:
         strength, reason, rank = "tentative", "Same meeting link near the recording time; scheduled times do not overlap.", 3
+    elif observed_matches:
+        strength, rank = "tentative", 3
+        reason = ("Overlapping times" if overlap else "Nearby scheduled time") + " and a display name seen in the call; confirm the email address."
     elif names or len(common) >= 2:
         signals = []
         if names:
@@ -200,11 +216,19 @@ def _match(context, event, start, end):
             "distance": distance, "start": event_start, "end": event_end, "title": title}
 
 
-def _recipients(event, self_addresses):
+def _recipients(event, self_addresses, observed_names=None):
     attendees = event.get("attendees", [])
     if not isinstance(attendees, list):
         return [], True, False
     recipients, seen = [], set()
+    observed_names = observed_names or set()
+    name_counts = {}
+    for attendee in attendees[:200]:
+        if isinstance(attendee, dict):
+            name = _text(attendee.get("display_name", attendee.get("displayName")), 200)
+            if name:
+                key = _name_key(name)
+                name_counts[key] = name_counts.get(key, 0) + 1
     incomplete = len(attendees) > 200 or event.get("attendees_omitted") is True or event.get("attendeesOmitted") is True
     for attendee in attendees[:200]:
         if not isinstance(attendee, dict):
@@ -213,12 +237,15 @@ def _recipients(event, self_addresses):
         response = attendee.get("response_status", attendee.get("responseStatus"))
         if (email is None or email.casefold() in self_addresses or email.casefold() in seen
                 or email.casefold().endswith("@resource.calendar.google.com")
-                or attendee.get("resource") is True or attendee.get("is_self") is True or attendee.get("self") is True
+                or attendee.get("resource") is True
                 or response == "declined"):
             continue
         seen.add(email.casefold())
         name = _text(attendee.get("display_name", attendee.get("displayName")), 200)
-        recipients.append({"name": name, "email": email, "source": "Calendar invite",
+        observed = bool(name and _name_key(name) in observed_names and name_counts[_name_key(name)] == 1)
+        recipients.append({"name": name, "email": email,
+                           "source": "Name seen in call; email from Calendar invite" if observed else "Calendar invite",
+                           "attendance": "name_observed" if observed else "invite_only",
                            "response_status": response if response in {"accepted", "tentative", "needsAction", "declined"} else "unknown",
                            "optional": attendee.get("optional") is True, "selected": False})
     recipients.sort(key=lambda item: ((item["name"] or item["email"]).casefold(), item["email"].casefold()))
@@ -233,12 +260,16 @@ def _recipients(event, self_addresses):
     return bounded, incomplete or limited, limited
 
 
-def _self_addresses(owner, calendars):
-    addresses = {owner.casefold()}
+def _self_addresses(owner, calendars, verified_self_emails=()):
+    addresses = {owner.casefold(), *(value.casefold() for value in verified_self_emails)}
     for calendar in calendars:
         email = _email(calendar["calendar_id"])
-        if email is None or not (calendar["primary"] or calendar["access_role"] == "owner"):
+        if email is None or not calendar["primary"]:
             continue
+        # Google Calendar's owner accessRole is an ACL capability, not account
+        # identity. attendee.self identifies this calendar copy, not the user.
+        # https://developers.google.com/workspace/calendar/api/v3/reference/calendarList
+        # https://developers.google.com/workspace/calendar/api/v3/reference/events
         domain = email.rsplit("@", 1)[1].casefold()
         # Google assigns address-shaped IDs to shared/group/resource calendars.
         # Those identify calendars, not another address of the account holder.
@@ -275,6 +306,23 @@ def suggest_recipients(context, invoke):
             or not isinstance(context.get("participants"), list) or len(context["participants"]) > 50
             or any(_text(name, 200) is None for name in context["participants"]) or not callable(invoke)):
         raise RecipientSuggestionError("The saved meeting context is incomplete")
+    verified_self_emails = context.get("verified_self_emails", [])
+    if (not isinstance(verified_self_emails, list) or len(verified_self_emails) > 20
+            or any(_email(value) is None for value in verified_self_emails)):
+        raise RecipientSuggestionError("The verified account identities need review")
+    if "observed_participants" in context:
+        from .meeting_context import participant_name
+        people = context["observed_participants"]
+        try:
+            if (not isinstance(people, list) or len(people) > 50
+                    or context.get("participant_coverage") != "visible_only"):
+                raise ValueError("Invalid observed roster")
+            for person in people:
+                if not isinstance(person, dict) or set(person) != {"name", "self"} or type(person.get("self")) is not bool:
+                    raise ValueError("Invalid observed participant")
+                participant_name(person["name"])
+        except ValueError as error:
+            raise RecipientSuggestionError("The saved participant evidence needs review") from error
     try:
         start, end = _time(context.get("started")), _time(context.get("ended"))
         if end < start:
@@ -315,7 +363,7 @@ def suggest_recipients(context, invoke):
     usable.sort(key=lambda item: (not item["primary"], {"owner": 0, "writer": 1, "reader": 2}[item["access_role"]],
                                   item["calendar_id"]))
     result["calendars"] = usable
-    self_addresses = _self_addresses(context["owner"], usable)
+    self_addresses = _self_addresses(context["owner"], usable, verified_self_emails)
     candidates = []
     for calendar in usable:
         try:
@@ -357,7 +405,7 @@ def suggest_recipients(context, invoke):
             match = _match(context, event, start, end)
             if match is None:
                 continue
-            recipients, incomplete, limited = _recipients(event, self_addresses)
+            recipients, incomplete, limited = _recipients(event, self_addresses, _observed_names(context))
             if incomplete:
                 warn("Some event invitations have incomplete attendee lists; review addresses manually.")
             if limited:

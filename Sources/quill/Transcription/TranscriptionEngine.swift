@@ -30,6 +30,8 @@ protocol TranscriptionEngine: Sendable {
     func transcribe(_ audio: URL) async throws -> [TranscriptSegment]
     func transcribe(_ audio: URL, identifySpeakers: Bool) async throws -> [TranscriptSegment]
     func speakerIdentificationStatus() async -> SpeakerIdentificationState
+    /// Bounded reason/count diagnostics only; never transcript text or paths.
+    func speakerIdentificationDiagnostic() async -> String?
     func release() async
 }
 
@@ -38,4 +40,5 @@ extension TranscriptionEngine {
         try await transcribe(audio)
     }
     func speakerIdentificationStatus() async -> SpeakerIdentificationState { .disabled }
+    func speakerIdentificationDiagnostic() async -> String? { nil }
 }

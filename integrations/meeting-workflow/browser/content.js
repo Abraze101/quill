@@ -1,4 +1,4 @@
-/* No media capture. Only visible meeting controls and end/lobby notices. */
+/* No media capture. Visible meeting controls, notices and participant names. */
 (() => {
   "use strict";
   const documentID = crypto.randomUUID();
@@ -42,9 +42,10 @@
     const style = getComputedStyle(element);
     return style.display !== "none" && style.visibility !== "hidden" && element.getClientRects().length > 0;
   }
-  function send(state) {
+  function send(state, participants) {
     if (stopped || !meeting || !provider) return;
-    const message = { type: "quill-meeting", documentID, meeting, provider, state };
+    const message = { type: "quill-meeting", documentID, meeting, provider, state,
+      ...(state === "joined" ? { participants: participants || [] } : {}) };
     try {
       Promise.resolve(chrome.runtime.sendMessage(message)).catch(sendFailed);
     } catch (error) {
@@ -82,7 +83,8 @@
       // Hidden controls, reconnecting, or an unreadable state cannot prove leave.
       last = "unknown";
     }
-    if (last) send(last);
+    if (last) send(last, result.state === "joined"
+      ? QuillMeetingDetector.visibleParticipants(document, provider, visible) : undefined);
     warning?.observe(QuillMeetingDetector.warningEvidence(snapshot), result.state === "joined" ? meeting : null);
   }
   function onPageHide() {

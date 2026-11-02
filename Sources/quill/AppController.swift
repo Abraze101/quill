@@ -45,6 +45,8 @@ final class AppController {
     private var session: RecordingSession?
     private var captureLease: RecordingCrashRecovery.CaptureLease?
     private var automaticMeeting: String?
+    private var contextMeeting: String?
+    private var contextSource: String?
     private var captureMeeting: String?
     private var captureSource: String?
     private var browserWindowID: Int?
@@ -448,6 +450,16 @@ final class AppController {
             let newSession = try RecordingSession(root: root,
                                                  speakerIdentificationRequested: Config.speakerIdentificationEnabled())
             session = newSession
+            // A manual recording may use context from one unambiguous joined
+            // call, but remains manually owned. Multiple calls supply none.
+            let signals = meetingAutomation.joinedSignals()
+            let contextSignal = automaticMeeting.flatMap { meetingAutomation.signal(for: $0) }
+                ?? (automaticMeeting == nil && signals.count == 1 ? signals.first : nil)
+            contextMeeting = contextSignal?.meeting
+            contextSource = contextSignal?.source
+            if let context = contextSignal?.meetingContext, context.provider == contextSignal?.provider {
+                newSession.observeMeetingContext(context)
+            }
             let now = RecordingSafetyClock.now
             safetyStartedAt = now
             safety = RecordingSafety(sessionID: pendingStartID ?? UUID(), owner: automaticMeeting == nil ? .manual : .automatic,
@@ -676,6 +688,8 @@ final class AppController {
         screenFinishTask = nil
         screenURL = nil
         automaticMeeting = nil
+        contextMeeting = nil
+        contextSource = nil
         captureMeeting = nil
         captureSource = nil
         browserWindowID = nil
@@ -753,6 +767,19 @@ final class AppController {
             else if completionRecovery.shouldRestart(now: now) { resumeCompletionWorker() }
         }
         if hasActiveRecording || phase == .starting {
+            if phase == .recording, contextMeeting == nil, contextSource == nil {
+                let signals = meetingAutomation.joinedSignals()
+                let signal = automaticMeeting.flatMap { meetingAutomation.signal(for: $0) }
+                    ?? (automaticMeeting == nil && signals.count == 1 ? signals.first : nil)
+                contextMeeting = signal?.meeting
+                contextSource = signal?.source
+            }
+            if phase == .recording, let contextMeeting, let contextSource,
+               let signal = meetingAutomation.joinedSignals().first(where: {
+                   $0.meeting == contextMeeting && $0.source == contextSource
+               }), let context = signal.meetingContext, context.provider == signal.provider {
+                session?.observeMeetingContext(context)
+            }
             do { try checkpointCapture() }
             catch { stopForSafety("Recording recovery checkpoints could not be saved. Review this recording locally.") }
             if let issue = session?.systemCaptureFailure { addSafetyReason(issue) }

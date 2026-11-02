@@ -158,6 +158,44 @@ function harness({ local = { client: 'client' }, session = {}, autoAck = true, i
   };
 }
 
+test('meeting context uses the verified frame key and only bounded visible name evidence', async () => {
+  const h = harness();
+  h.frame('doc-A', 42, meetingURL + '?authuser=3&secret=discard');
+  await h.message('doc-A', 'opaque-session', 'joined', 42, {
+    participants: [{ name: 'Casey Rivera', self: false }, { name: 'Owner Name', self: true }],
+    meetingContext: { key: 'spoofed', url: 'https://private.example', participants: [{ name: 'Spoof' }] },
+  });
+  assert.deepEqual(h.sent[0].meetingContext, { provider: 'google-meet', key: 'abc-defg-hij',
+    participants: [{ name: 'Casey Rivera', self: false }, { name: 'Owner Name', self: true }], coverage: 'visible_only' });
+  assert.equal(h.sent[0].meeting, 'opaque-session');
+  assert.ok(!JSON.stringify([h.local, h.session, h.sent]).includes('secret'));
+  await h.message('doc-A', 'opaque-session', 'unknown', 42, { participants: [{ name: 'Stale Name', self: false }] });
+  await h.message('doc-A', 'opaque-session', 'left');
+  assert.ok(h.sent.slice(1).every(item => !('meetingContext' in item)));
+});
+
+test('invalid roster evidence is omitted without disrupting joined delivery', async () => {
+  for (const people of [null, 'Casey', [{ name: 'person@example.test', self: false }],
+      [{ name: 'Casey', self: 'false' }], [{ name: 'Casey', self: false, email: 'private@example.test' }],
+      [{ name: 'A\u202eB', self: false }], [{ name: 'a'.repeat(101), self: false }],
+      Array.from({ length: 21 }, (_, i) => ({ name: 'Person ' + i, self: false }))]) {
+    const h = harness(); h.frame('doc-A');
+    await h.message('doc-A', 'call-A', 'joined', 42, { participants: people });
+    assert.equal(h.sent[0].state, 'joined');
+    assert.deepEqual(h.sent[0].meetingContext.participants, []);
+  }
+});
+
+test('queued context never follows a same-document move to a different meeting key', async () => {
+  const h = harness({ autoAck: false }); h.frame('doc-A');
+  await h.message('doc-A', 'call-A');
+  await h.message('doc-A', 'call-A', 'joined', 42, { participants: [{ name: 'Old Call', self: false }] });
+  h.frame('doc-A', 42, 'https://meet.google.com/xyz-abcd-efg');
+  h.ports[0].ack({ accepted: true, requestID: h.sent[0].requestID }); await h.flush();
+  assert.equal(h.sent.at(-1).state, 'joined');
+  assert.ok(!('meetingContext' in h.sent.at(-1)));
+});
+
 test('rejects a departed document first seen after the current document, using browser identity', async () => {
   const h = harness();
   h.frame('document-B');
@@ -516,7 +554,8 @@ test('direct Zoom client frame is bound to its current same-origin numeric meeti
   assert.equal(h.session.documents['42'].rootDocumentID, 'zoom-root');
   assert.equal(h.session.documents['42'].frameID, 5);
   assert.ok(!JSON.stringify([h.local, h.session, h.sent]).includes('https://'));
-  assert.ok(!JSON.stringify([h.local, h.session, h.sent]).includes('12345678901'));
+  assert.equal(h.sent[0].meetingContext.key, '12345678901');
+  assert.ok(!JSON.stringify([h.local, h.session, h.sent]).includes('private=not-stored'));
   assert.ok(!('rootDocumentID' in h.sent[0]));
   assert.ok(!('frameID' in h.sent[0]));
 });

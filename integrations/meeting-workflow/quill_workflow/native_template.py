@@ -10,7 +10,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .meeting_document import timestamp
 from .meeting_title import meeting_title
 from .capture_quality import with_summary_notice
-from .transcript_sources import SOURCE_NOTICE, DIARIZED_NOTICE, speaker_attributions, segment_label
+from .transcript_sources import (SOURCE_NOTICE, DIARIZED_NOTICE, attribution_notice,
+                                 effective_attributions, segment_label)
 
 
 FORMAT = "native_template_google_doc_v1"
@@ -73,7 +74,7 @@ def build_payload(notes, transcript, metadata, route, timezone="UTC"):
     """Map every validated note section and the exact transcript into native slots."""
     from .pipeline import render_notes
     render_notes(notes, transcript)
-    attributions = speaker_attributions(transcript)
+    attributions = effective_attributions(transcript, notes)
     if not isinstance(metadata, dict) or not isinstance(route, dict):
         raise ValueError("Meeting metadata and approved company route are required")
     if not isinstance(timezone, str) or not timezone:
@@ -116,7 +117,9 @@ def build_payload(notes, transcript, metadata, route, timezone="UTC"):
     # Older payloads must stay byte-for-byte compatible with pending Drive
     # write reconciliation. New captures explicitly declare source-only labels.
     transcript_text = "\n".join(transcript_lines)
-    if transcript.get("speaker_labels") == "audio_source":
+    if "speaker_review" in notes:
+        transcript_text = attribution_notice(transcript, notes) + "\n\n" + transcript_text
+    elif transcript.get("speaker_labels") == "audio_source":
         transcript_text = SOURCE_NOTICE + "\n\n" + transcript_text
     elif attributions is not None:
         transcript_text = DIARIZED_NOTICE + "\n\n" + transcript_text

@@ -10,12 +10,38 @@ import struct
 import sys
 import tempfile
 import time
+import unicodedata
 
 
 STATUS_MAX_BYTES = 16384
 STATUS_FRESHNESS = 8
 STATUS_FUTURE_TOLERANCE = 2
 SIGNAL_IDENTITY = re.compile(r"[A-Za-z0-9-]{1,128}")
+
+
+def meeting_context(value, *, max_participants=20):
+    # Keep the installed host self-contained. This bounded wire schema mirrors
+    # the workflow validator; neither accepts full URLs or guessed emails.
+    if (not isinstance(value, dict) or set(value) != {"provider", "key", "participants", "coverage"}
+            or value.get("coverage") != "visible_only" or not isinstance(value.get("provider"), str)):
+        raise ValueError("Invalid meeting context")
+    pattern = {"google-meet": r"[a-z]{3}-[a-z]{4}-[a-z]{3}", "zoom-web": r"[0-9]{9,12}"}.get(value["provider"])
+    if pattern is None or not isinstance(value.get("key"), str) or re.fullmatch(pattern, value["key"]) is None:
+        raise ValueError("Invalid meeting context identity")
+    people = value.get("participants")
+    if not isinstance(people, list) or len(people) > max_participants:
+        raise ValueError("Invalid meeting participant list")
+    for person in people:
+        if not isinstance(person, dict) or set(person) != {"name", "self"} or type(person.get("self")) is not bool:
+            raise ValueError("Invalid meeting participant")
+        name = person.get("name")
+        if (not isinstance(name, str) or not 0 < len(name) <= 100 or len(name.encode("utf-8")) > 400
+                or any(unicodedata.category(char).startswith("C") for char in name)
+                or " ".join(unicodedata.normalize("NFC", name).split()) != name
+                or "@" in name or "://" in name
+                or name.casefold() in {"you", "me", "host", "participant", "participants", "unknown", "guest"}):
+            raise ValueError("Invalid visible participant name")
+    return value
 
 
 def unique_object(pairs):
@@ -141,6 +167,12 @@ def accept(message, directory, now=None):
     if request_id is not None and (not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9-]{1,64}", request_id)):
         raise ValueError("Invalid delivery identity")
     event = {key: message[key] for key in ("source", "meeting", "provider", "state")}
+    if "meetingContext" in message:
+        context = meeting_context(message["meetingContext"], max_participants=20)
+        if context["provider"] != event["provider"]:
+            raise ValueError("Meeting context belongs to a different provider")
+        if event["state"] == "joined":
+            event["meetingContext"] = context
     if "browserWindow" in message:
         geometry = browser_window(message["browserWindow"])
         if event["state"] != "left":

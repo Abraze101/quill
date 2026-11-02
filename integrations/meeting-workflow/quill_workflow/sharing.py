@@ -424,10 +424,19 @@ class SharingReviews:
             return json.loads(data)
         metadata = read_bound(metadata_path, "metadata_sha256", 100_000)
         notes = read_bound(notes_path, "notes_sha256", 20_000_000)
-        return {"job": job, "source_hash": digest(snapshot), "title": notes["meeting_title"]["text"],
+        context = {"job": job, "source_hash": digest(snapshot), "title": notes["meeting_title"]["text"],
                 "started": metadata["started"], "ended": metadata["ended"], "owner": snapshot["owner"],
                 "timezone": metadata.get("recording_timezone", "UTC"),
                 "participants": [person["name"] for person in notes["meeting_title"]["participants"]]}
+        if "meeting_context" in metadata:
+            from .meeting_context import meeting_context
+            observed = meeting_context(metadata["meeting_context"])
+            context["meeting"] = {key: observed[key] for key in ("provider", "key")}
+            context["observed_participants"] = observed["participants"]
+            context["participant_coverage"] = observed["coverage"]
+            names = [person["name"] for person in observed["participants"] if not person["self"]]
+            context["participants"] = list(dict.fromkeys(context["participants"] + names))[:50]
+        return context
 
     def run_suggestions(self, job, revision, invoke=None, suggest=None):
         from .local_deletion import deleted_jobs

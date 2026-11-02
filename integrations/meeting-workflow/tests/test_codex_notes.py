@@ -373,6 +373,52 @@ class CodexNotesTests(unittest.TestCase):
         self.assertFalse(capture.exists())
         self.assertFalse(self.output.exists())
 
+    def test_new_review_uses_bounded_context_and_caller_owned_binding(self):
+        from test_speaker_review import source, context, draft
+        transcript, meeting_context = source(), context()
+        atomic_json(self.transcript, transcript)
+        context_path = self.root / "context.json"
+        atomic_json(context_path, meeting_context)
+        executable, calls = self.sequence([json.dumps(draft())])
+        self.invoke(executable, context_path=context_path)
+        saved = json.loads(self.output.read_text())
+        self.assertEqual(saved["speaker_review"]["context"], meeting_context)
+        self.assertEqual(len(saved["speaker_review"]["transcript_sha256"]), 64)
+        payload = json.loads(calls.read_text())[0]["payload"]
+        self.assertEqual(payload["meeting_context"], meeting_context)
+        self.assertEqual(payload["transcript"], transcript)
+        self.assertEqual(json.loads(self.transcript.read_text()), transcript)
+        self.assertEqual(saved["speaker_review"]["assignments"][1]["status"], "suggested")
+
+    def test_rejected_review_is_corrected_using_same_context(self):
+        from test_speaker_review import source, context, draft
+        atomic_json(self.transcript, source())
+        context_path = self.root / "context.json"
+        atomic_json(context_path, context())
+        invalid = draft()
+        invalid["speaker_review"]["assignments"][1]["status"] = "confirmed"
+        executable, calls = self.sequence([json.dumps(invalid), json.dumps(draft())])
+        self.invoke(executable, context_path=context_path)
+        attempts = json.loads(calls.read_text())
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(attempts[1]["payload"]["meeting_context"], context())
+        self.assertIn("self-introduction", attempts[1]["payload"]["validation_error"])
+
+    def test_invalid_context_and_malformed_review_fail_with_workflow_error(self):
+        from test_speaker_review import context
+        context_path = self.root / "context.json"
+        value = context()
+        value["participants"][0]["name"] = "anna@example.test"
+        atomic_json(context_path, value)
+        executable, calls = self.sequence([json.dumps(self.notes)])
+        with self.assertRaises(WorkflowError):
+            self.invoke(executable, context_path=context_path)
+        self.assertFalse(calls.exists())
+        for review in (None, [], "bad", {"schema_version": 1, "assignments": None}):
+            with self.subTest(review=review), self.assertRaises(WorkflowError):
+                validate_result(dict(self.notes, speaker_review=review), json.loads(self.transcript.read_text()))
+        self.assertFalse(self.output.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

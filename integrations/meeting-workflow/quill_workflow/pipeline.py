@@ -1182,6 +1182,8 @@ class ConnectorRunner:
         receipt = {"job": job, "stage": stage, "idempotency_key": job + ":" + stage,
                    "settings_sha256": signature}
         transcript_path = result_dir / "input/transcript.json"
+        speaker_context = None
+        uses_speaker_context = stage == "notes" and any("{context}" in part for part in settings.get("command", []))
         if not transcript_path.exists():
             transcript_path = recording / "transcript.json"
         if stage == "route":
@@ -1209,6 +1211,13 @@ class ConnectorRunner:
             if not isinstance(transcript, dict) or not transcript.get("segments"):
                 raise WorkflowError("Empty transcript; notes were not generated")
             receipt["input_sha256"] = hashlib.sha256(transcript_path.read_bytes()).hexdigest()
+            if uses_speaker_context:
+                from .meeting_context import meeting_context
+                metadata = read_json(safe_member(recording, "meta.json"), 100_000)
+                if metadata.get("meeting_context") is not None:
+                    speaker_context = meeting_context(metadata["meeting_context"])
+                receipt["context_sha256"] = hashlib.sha256(json.dumps(
+                    speaker_context, sort_keys=True, ensure_ascii=False, allow_nan=False).encode()).hexdigest()
         receipt_path = result_dir / (stage + "-receipt.json")
         if receipt_path.exists():
             previous = read_json(receipt_path)
@@ -1218,7 +1227,7 @@ class ConnectorRunner:
                 return previous
         if stage == "notes" and (result_dir / "notes/notes.json").exists():
             provenance = read_json(result_dir / "notes/provenance.json")
-            if any(provenance.get(key) != receipt.get(key) for key in ("input_sha256", "settings_sha256")):
+            if any(provenance.get(key) != receipt.get(key) for key in ("input_sha256", "settings_sha256", "context_sha256")):
                 raise NeedsConfiguration("Existing notes use different input or settings; an explicit revision is required")
             render_notes(read_json(result_dir / "notes/notes.json"), transcript)
             atomic_json(receipt_path, receipt)
@@ -1262,6 +1271,10 @@ class ConnectorRunner:
             values = {"input": str(source), "output": str(output), "skill": self.skill,
                       "idempotency_key": receipt["idempotency_key"], "job": job,
                       "stage": stage}
+            if uses_speaker_context:
+                context_path = staging / "meeting-context.json"
+                atomic_json(context_path, speaker_context)
+                values["context"] = str(context_path)
             if route:
                 values.update(route=str(result_dir / "route.json"), drive_folder_id=route["drive_folder_id"])
             argv = [part.format_map(values) for part in settings["command"]]
@@ -1269,6 +1282,18 @@ class ConnectorRunner:
             self.execute(argv, staging, min(7200, max(1, int(settings.get("timeout_seconds", 1200)))))
             returned = read_json(output)
             if stage == "notes":
+                if hashlib.sha256(transcript_path.read_bytes()).hexdigest() != receipt["input_sha256"]:
+                    raise WorkflowError("Transcript changed during notes review")
+                if uses_speaker_context:
+                    current_metadata = read_json(safe_member(recording, "meta.json"), 100_000)
+                    current_context = current_metadata.get("meeting_context")
+                    if current_context is not None:
+                        current_context = meeting_context(current_context)
+                    if current_context != speaker_context:
+                        raise WorkflowError("Meeting context changed during notes review")
+                review = returned.get("speaker_review") if isinstance(returned, dict) else None
+                if review is not None and (not isinstance(review, dict) or review.get("context") != speaker_context):
+                    raise WorkflowError("Speaker review belongs to different meeting context")
                 markdown = render_notes(returned, transcript)
                 notes = staging / "notes"
                 notes.mkdir()
@@ -1276,6 +1301,10 @@ class ConnectorRunner:
                 atomic_json(notes / "provenance.json", receipt)
                 shutil.copyfile(transcript_path, notes / "source-transcript.json")
                 (notes / "notes.md").write_text(markdown, encoding="utf-8")
+                if review is not None:
+                    from .transcript_sources import render_reviewed_transcript
+                    (notes / "transcript-reviewed.md").write_text(
+                        render_reviewed_transcript(transcript, returned), encoding="utf-8")
                 destination = result_dir / "notes"
                 if destination.exists():
                     # A crash after publishing notes but before committing the

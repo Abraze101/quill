@@ -149,7 +149,9 @@ def _calendar_suggestions(server, item):
             for recipient in event["recipients"]:
                 email, name = recipient["email"], recipient.get("name")
                 label = (str(name) + ' (' + email + ')') if name else email
-                body += '<li>' + _escape(label) + ' · Calendar invite'
+                source = ('Name seen in call; email from Calendar invite'
+                          if recipient.get("attendance") == "name_observed" else 'Calendar invite')
+                body += '<li>' + _escape(label) + ' · ' + _escape(source)
                 if recipient.get("response_status"):
                     body += ' · ' + _escape(recipient["response_status"])
                 body += '</li>'

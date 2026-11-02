@@ -18,7 +18,7 @@ function harness(initialFailure = null, initialURL = 'https://meet.google.com/ab
   const listeners = new Map();
   const attempts = [];
   const delivered = [];
-  const state = { failure: initialFailure, toolbar: true, now: 0, healthState: 'not-recording' };
+  const state = { failure: initialFailure, toolbar: true, now: 0, healthState: 'not-recording', people: [], rosterReads: 0 };
   const warningNodes = [];
   const mountedWarnings = [];
   const observer = { active: false, disconnects: 0, callback: null };
@@ -36,7 +36,11 @@ function harness(initialFailure = null, initialURL = 'https://meet.google.com/ab
       warningNodes.push(node); return node;
     },
     getElementById: id => ids.get(id) ?? null,
-    querySelectorAll: selector => selector.startsWith('button') && state.toolbar ? controls : [],
+    querySelectorAll: selector => {
+      if (selector.startsWith('button')) return state.toolbar ? controls : [];
+      if (selector.startsWith('[data-participant-id]')) { state.rosterReads++; return state.people; }
+      return [];
+    },
   };
   function element(tag, attributes = {}, text) {
     const node = {
@@ -95,6 +99,7 @@ function harness(initialFailure = null, initialURL = 'https://meet.google.com/ab
   vm.runInContext(contentSource, context, { filename: 'content.js' });
   return {
     state, observer, attempts, delivered, timers, listeners, location, warningNodes, mountedWarnings,
+    person: name => element('span', { 'data-self-name': name }, name),
     mutate: () => observer.callback(),
     pagehide: () => listeners.get('pagehide')?.(),
     tick() {
@@ -118,9 +123,26 @@ test('actual content scan recognizes the observed toolbar, heartbeats, and sends
   await h.flush();
   assert.deepEqual(h.delivered.map(message => message.state), ['joined', 'joined', 'left']);
   assert.equal(new Set(h.delivered.map(message => message.meeting)).size, 1);
-  assert.deepEqual(Object.keys(h.delivered[0]).sort(), ['documentID', 'meeting', 'provider', 'state', 'type']);
+  assert.deepEqual(Object.keys(h.delivered[0]).sort(), ['documentID', 'meeting', 'participants', 'provider', 'state', 'type']);
   assert.equal(h.delivered[0].provider, 'google-meet');
   assert.equal(JSON.stringify(h.delivered).includes('meet.google.com'), false);
+});
+
+test('content passes visible names only while current controls prove joined', async () => {
+  const h = harness();
+  h.state.people = [h.person('Casey Rivera'), h.person('Owner Name (You)')];
+  h.tick();
+  assert.deepEqual(h.delivered.at(-1).participants,
+    [{ name: 'Casey Rivera', self: false }, { name: 'Owner Name', self: true }]);
+  const reads = h.state.rosterReads;
+  h.state.toolbar = false;
+  h.tick();
+  assert.equal(h.delivered.at(-1).state, 'unknown');
+  assert.ok(!('participants' in h.delivered.at(-1)));
+  assert.equal(h.state.rosterReads, reads);
+  h.pagehide();
+  await h.flush();
+  assert.ok(!('participants' in h.delivered.at(-1)));
 });
 
 test('a prefixed Meet page sends joined heartbeats and a real leave without transmitting its URL', async () => {
@@ -130,7 +152,7 @@ test('a prefixed Meet page sends joined heartbeats and a real leave without tran
   await h.flush();
   assert.deepEqual(h.delivered.map(message => message.state), ['joined', 'joined', 'left']);
   assert.equal(new Set(h.delivered.map(message => message.meeting)).size, 1);
-  assert.deepEqual(Object.keys(h.delivered[0]).sort(), ['documentID', 'meeting', 'provider', 'state', 'type']);
+  assert.deepEqual(Object.keys(h.delivered[0]).sort(), ['documentID', 'meeting', 'participants', 'provider', 'state', 'type']);
   assert.equal(h.delivered[0].provider, 'google-meet');
   assert.equal(JSON.stringify(h.delivered).includes('meet.google.com'), false);
   assert.equal(JSON.stringify(h.delivered).includes('authuser'), false);

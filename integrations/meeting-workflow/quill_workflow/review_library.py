@@ -24,7 +24,8 @@ from .meeting_dates import recording_timezone
 from .meeting_title import meeting_title
 from .native_template import build_payload
 from .pipeline import WorkflowError, render_notes
-from .transcript_sources import segment_label, speaker_attributions
+from .transcript_sources import (effective_attributions, render_reviewed_transcript,
+                                 segment_label, speaker_attributions)
 
 
 _JOB = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
@@ -237,10 +238,15 @@ def _notes(sources, job, tasks, transcript, transcript_hash):
     if (not isinstance(notes, dict) or not isinstance(provenance, dict) or not isinstance(source, bytes)
             or hashlib.sha256(source).hexdigest() != transcript_hash
             or any(provenance.get(key) != receipt.get(key) for key in (
-                "job", "stage", "idempotency_key", "input_sha256", "settings_sha256"))):
+                "job", "stage", "idempotency_key", "input_sha256", "settings_sha256", "context_sha256"))):
         return None, None
     try:
         render_notes(notes, transcript)
+        if "context_sha256" in receipt and "speaker_review" in notes:
+            context_hash = hashlib.sha256(json.dumps(notes["speaker_review"]["context"],
+                sort_keys=True, ensure_ascii=False, allow_nan=False).encode()).hexdigest()
+            if context_hash != receipt["context_sha256"]:
+                return None, None
         return notes, meeting_title(notes, transcript)
     except (ValueError, TypeError, KeyError, RecursionError, WorkflowError):
         return None, None
@@ -464,6 +470,12 @@ def _entry(sources, row, tasks):
     metadata = sources.json(f"recordings/{job}/meta.json", 100_000)
     display_date, recorded_at = _date(metadata)
     notes, title = _notes(sources, job, tasks, transcript, transcript_hash)
+    if notes is not None and "speaker_review" in notes:
+        people = effective_attributions(transcript, notes)
+        transcript_text = render_reviewed_transcript(transcript, notes)
+        if len(transcript_text) > MAX_TRANSCRIPT_CHARACTERS:
+            transcript_text = transcript_text[:MAX_TRANSCRIPT_CHARACTERS] + "\n\n[Transcript preview shortened.]"
+        participants = [person["name"] for person in (people or {}).values() if person.get("name")]
     route = _route(sources, job, tasks, transcript_hash)
     storage = {name: _storage(sources, job, stage, tasks, transcript_hash, route, metadata, notes, transcript)
                for name, stage in (("document", "publish"), ("media", "archive"))}

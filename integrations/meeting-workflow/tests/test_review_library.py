@@ -124,6 +124,28 @@ class ReviewLibraryTests(unittest.TestCase):
     def view(self):
         return meeting_library(self.state)[self.job]
 
+    def test_saved_review_applies_suggestions_only_to_derived_transcript(self):
+        from test_speaker_review import source, context, draft
+        from quill_workflow.transcript_sources import bind_speaker_review
+        self.transcript = source()
+        atomic_json(self.recording / "transcript.json", self.transcript)
+        self.transcript_bytes = (self.recording / "transcript.json").read_bytes()
+        self.transcript_hash = hashlib.sha256(self.transcript_bytes).hexdigest()
+        self.notes = bind_speaker_review(draft(), self.transcript, context())
+        self.receipt("notes")
+        atomic_json(self.result / "notes/notes.json", self.notes)
+        atomic_json(self.result / "notes/provenance.json", self.receipts["notes"])
+        (self.result / "notes/source-transcript.json").write_bytes(self.transcript_bytes)
+        view = self.view()
+        self.assertIn("Jamie (suggested): Thanks.", view["transcript_text"])
+        self.assertEqual(view["participants"], ["Anna"])
+        self.assertEqual((self.recording / "transcript.json").read_bytes(), self.transcript_bytes)
+        self.notes["speaker_review"]["transcript_sha256"] = "0" * 64
+        atomic_json(self.result / "notes/notes.json", self.notes)
+        view = self.view()
+        self.assertNotIn("Jamie", view["transcript_text"])
+        self.assertIn("Other speaker 1: Thanks.", view["transcript_text"])
+
     def unset_stage(self, stage, status="pending"):
         self.task(stage, status)
         (self.result / (stage + "-receipt.json")).unlink(missing_ok=True)

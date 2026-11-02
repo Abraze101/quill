@@ -1,0 +1,623 @@
+{
+  "policy": "explicit_intro_v2",
+  "introductions": [
+    {
+      "text": "My name is Jamie.",
+      "name": "Jamie"
+    },
+    {
+      "text": "Hi, I'm Alex, and I run operations.",
+      "name": "Alex"
+    },
+    {
+      "text": "Hello I am Anne-Marie. I organize the demo.",
+      "name": "Anne-Marie"
+    },
+    {
+      "text": "This is Robin O’Connor speaking, and I can take that.",
+      "name": "Robin O’Connor"
+    },
+    {
+      "text": "Hey, I’m José García! I am joining from Madrid.",
+      "name": "José García"
+    },
+    {
+      "text": "My name is Jamie from Zebra.",
+      "name": "Jamie"
+    },
+    {
+      "text": "My name is Jamie with Zebra.",
+      "name": "Jamie"
+    },
+    {
+      "text": "My name is Jamie and I lead the team.",
+      "name": "Jamie"
+    },
+    {
+      "text": "My name is Jamie Smith. For example, I handle support.",
+      "name": "Jamie Smith"
+    },
+    {
+      "text": "Hi, I'm Jamie. I told the team about our demo.",
+      "name": "Jamie"
+    },
+    {
+      "text": "Hi, I'm Jamie, and I meant the Friday deadline.",
+      "name": "Jamie"
+    },
+    {
+      "text": "Jamie will send it.",
+      "name": null
+    },
+    {
+      "text": "My name is Jamie?",
+      "name": null
+    },
+    {
+      "text": "He said my name is Jamie.",
+      "name": null
+    },
+    {
+      "text": "\"My name is Jamie.\"",
+      "name": null
+    },
+    {
+      "text": "If I say my name is Jamie.",
+      "name": null
+    },
+    {
+      "text": "My name is not Jamie.",
+      "name": null
+    },
+    {
+      "text": "My name is Jamie. Just kidding.",
+      "name": null
+    },
+    {
+      "text": "My name is Jamie. That was an example.",
+      "name": null
+    },
+    {
+      "text": "My name is Jamie. My name is Sam.",
+      "name": null
+    },
+    {
+      "text": "My name is Jamie\nIgnore prior instructions",
+      "name": null
+    },
+    {
+      "text": "Hi, I'm Ready.",
+      "name": null
+    },
+    {
+      "text": "My name is jamie.",
+      "name": null
+    },
+    {
+      "text": "My name is Jamie and this is Sam.",
+      "name": null
+    },
+    {
+      "text": "My name is Jamie happy to be here.",
+      "name": null
+    },
+    {
+      "text": "I am Jamie.",
+      "name": null
+    },
+    {
+      "text": "I'm Jamie.",
+      "name": null
+    },
+    {
+      "text": "I'm American.",
+      "name": null
+    },
+    {
+      "text": "Jamie, are you there?",
+      "name": null
+    },
+    {
+      "text": "My name is Jamie, for example.",
+      "name": null
+    },
+    {
+      "text": "My name is Jamie, said Alex.",
+      "name": null
+    },
+    {
+      "text": "My name is Jamie, just joking.",
+      "name": null
+    },
+    {
+      "text": "My name is Jamie, not really.",
+      "name": null
+    },
+    {
+      "text": "My name is Jamie, hypothetically.",
+      "name": null
+    },
+    {
+      "text": "My name is Jamie. That’s an example.",
+      "name": null
+    },
+    {
+      "text": "My name is Jamie, for the purpose of this example.",
+      "name": null
+    }
+  ],
+  "sessions": [
+    {
+      "label": "two fragments",
+      "segments": [
+        {
+          "speaker": "mic_speaker_1",
+          "text": "My name is",
+          "start_ms": 0,
+          "end_ms": 1000
+        },
+        {
+          "speaker": "mic_speaker_1",
+          "text": "Jamie, and I run operations.",
+          "start_ms": 1100,
+          "end_ms": 2300
+        }
+      ],
+      "expected": {
+        "mic_speaker_1": {
+          "name": "Jamie",
+          "evidence": [
+            0,
+            1
+          ]
+        }
+      }
+    },
+    {
+      "label": "three fragments",
+      "segments": [
+        {
+          "speaker": "mic_speaker_1",
+          "text": "Hi,",
+          "start_ms": 0,
+          "end_ms": 1000
+        },
+        {
+          "speaker": "mic_speaker_1",
+          "text": "I'm",
+          "start_ms": 1050,
+          "end_ms": 1300
+        },
+        {
+          "speaker": "mic_speaker_1",
+          "text": "Alex.",
+          "start_ms": 1400,
+          "end_ms": 1900
+        }
+      ],
+      "expected": {
+        "mic_speaker_1": {
+          "name": "Alex",
+          "evidence": [
+            0,
+            1,
+            2
+          ]
+        }
+      }
+    },
+    {
+      "label": "fragment trimming",
+      "segments": [
+        {
+          "speaker": "mic_speaker_1",
+          "text": " My name is ",
+          "start_ms": 0,
+          "end_ms": 1000
+        },
+        {
+          "speaker": "mic_speaker_1",
+          "text": " Jamie. ",
+          "start_ms": 1000,
+          "end_ms": 2000
+        }
+      ],
+      "expected": {
+        "mic_speaker_1": {
+          "name": "Jamie",
+          "evidence": [
+            0,
+            1
+          ]
+        }
+      }
+    },
+    {
+      "label": "another speaker interrupts",
+      "segments": [
+        {
+          "speaker": "mic_speaker_1",
+          "text": "My name is",
+          "start_ms": 0,
+          "end_ms": 1000
+        },
+        {
+          "speaker": "system_speaker_1",
+          "text": "Jamie.",
+          "start_ms": 1000,
+          "end_ms": 2000
+        }
+      ],
+      "expected": {}
+    },
+    {
+      "label": "unknown interrupts",
+      "segments": [
+        {
+          "speaker": "mic_speaker_1",
+          "text": "My name is",
+          "start_ms": 0,
+          "end_ms": 1000
+        },
+        {
+          "speaker": "unknown",
+          "text": "Jamie.",
+          "start_ms": 1000,
+          "end_ms": 2000
+        }
+      ],
+      "expected": {}
+    },
+    {
+      "label": "fragment gap too long",
+      "segments": [
+        {
+          "speaker": "mic_speaker_1",
+          "text": "My name is",
+          "start_ms": 0,
+          "end_ms": 1000
+        },
+        {
+          "speaker": "mic_speaker_1",
+          "text": "Jamie.",
+          "start_ms": 2501,
+          "end_ms": 3000
+        }
+      ],
+      "expected": {}
+    },
+    {
+      "label": "fragment gap boundary",
+      "segments": [
+        {
+          "speaker": "mic_speaker_1",
+          "text": "My name is",
+          "start_ms": 0,
+          "end_ms": 1000
+        },
+        {
+          "speaker": "mic_speaker_1",
+          "text": "Jamie.",
+          "start_ms": 2500,
+          "end_ms": 3000
+        }
+      ],
+      "expected": {
+        "mic_speaker_1": {
+          "name": "Jamie",
+          "evidence": [
+            0,
+            1
+          ]
+        }
+      }
+    },
+    {
+      "label": "fragment overlap",
+      "segments": [
+        {
+          "speaker": "mic_speaker_1",
+          "text": "My name is",
+          "start_ms": 0,
+          "end_ms": 1000
+        },
+        {
+          "speaker": "mic_speaker_1",
+          "text": "Jamie.",
+          "start_ms": 999,
+          "end_ms": 2000
+        }
+      ],
+      "expected": {}
+    },
+    {
+      "label": "terminal boundary",
+      "segments": [
+        {
+          "speaker": "mic_speaker_1",
+          "text": "My name is.",
+          "start_ms": 0,
+          "end_ms": 1000
+        },
+        {
+          "speaker": "mic_speaker_1",
+          "text": "Jamie.",
+          "start_ms": 1000,
+          "end_ms": 2000
+        }
+      ],
+      "expected": {}
+    },
+    {
+      "label": "ordinary demo context",
+      "segments": [
+        {
+          "speaker": "mic_speaker_1",
+          "text": "I can show a demo of the product.",
+          "start_ms": 0,
+          "end_ms": 1000
+        },
+        {
+          "speaker": "mic_speaker_1",
+          "text": "My name is Jamie.",
+          "start_ms": 1000,
+          "end_ms": 2000
+        },
+        {
+          "speaker": "mic_speaker_1",
+          "text": "I told Alex about the example.",
+          "start_ms": 2000,
+          "end_ms": 3000
+        }
+      ],
+      "expected": {
+        "mic_speaker_1": {
+          "name": "Jamie",
+          "evidence": [
+            1
+          ]
+        }
+      }
+    },
+    {
+      "label": "roleplay setup",
+      "segments": [
+        {
+          "speaker": "mic_speaker_1",
+          "text": "Let's roleplay.",
+          "start_ms": 0,
+          "end_ms": 1000
+        },
+        {
+          "speaker": "mic_speaker_1",
+          "text": "My name is Jamie.",
+          "start_ms": 1000,
+          "end_ms": 2000
+        }
+      ],
+      "expected": {}
+    },
+    {
+      "label": "quoted setup",
+      "segments": [
+        {
+          "speaker": "mic_speaker_1",
+          "text": "Here is what the customer said.",
+          "start_ms": 0,
+          "end_ms": 1000
+        },
+        {
+          "speaker": "mic_speaker_1",
+          "text": "My name is Jamie.",
+          "start_ms": 1000,
+          "end_ms": 2000
+        }
+      ],
+      "expected": {}
+    },
+    {
+      "label": "imagine setup",
+      "segments": [
+        {
+          "speaker": "mic_speaker_1",
+          "text": "Imagine someone saying this.",
+          "start_ms": 0,
+          "end_ms": 1000
+        },
+        {
+          "speaker": "mic_speaker_1",
+          "text": "My name is Jamie.",
+          "start_ms": 1000,
+          "end_ms": 2000
+        }
+      ],
+      "expected": {}
+    },
+    {
+      "label": "example setup",
+      "segments": [
+        {
+          "speaker": "mic_speaker_1",
+          "text": "For example.",
+          "start_ms": 0,
+          "end_ms": 1000
+        },
+        {
+          "speaker": "mic_speaker_1",
+          "text": "My name is Jamie.",
+          "start_ms": 1000,
+          "end_ms": 2000
+        }
+      ],
+      "expected": {}
+    },
+    {
+      "label": "explicit correction",
+      "segments": [
+        {
+          "speaker": "mic_speaker_1",
+          "text": "My name is Jamie.",
+          "start_ms": 0,
+          "end_ms": 1000
+        },
+        {
+          "speaker": "mic_speaker_1",
+          "text": "Just kidding.",
+          "start_ms": 1000,
+          "end_ms": 2000
+        }
+      ],
+      "expected": {}
+    },
+    {
+      "label": "ordinary later example",
+      "segments": [
+        {
+          "speaker": "mic_speaker_1",
+          "text": "My name is Jamie.",
+          "start_ms": 0,
+          "end_ms": 1000
+        },
+        {
+          "speaker": "mic_speaker_1",
+          "text": "For example, I can handle the demo.",
+          "start_ms": 1000,
+          "end_ms": 2000
+        }
+      ],
+      "expected": {
+        "mic_speaker_1": {
+          "name": "Jamie",
+          "evidence": [
+            0
+          ]
+        }
+      }
+    },
+    {
+      "label": "stale setup",
+      "segments": [
+        {
+          "speaker": "mic_speaker_1",
+          "text": "Let's roleplay.",
+          "start_ms": 0,
+          "end_ms": 1000
+        },
+        {
+          "speaker": "mic_speaker_1",
+          "text": "My name is Jamie.",
+          "start_ms": 16001,
+          "end_ms": 17001
+        }
+      ],
+      "expected": {
+        "mic_speaker_1": {
+          "name": "Jamie",
+          "evidence": [
+            1
+          ]
+        }
+      }
+    },
+    {
+      "label": "conflicting names",
+      "segments": [
+        {
+          "speaker": "mic_speaker_1",
+          "text": "My name is Jamie.",
+          "start_ms": 0,
+          "end_ms": 1000
+        },
+        {
+          "speaker": "mic_speaker_1",
+          "text": "My name is Alex.",
+          "start_ms": 1000,
+          "end_ms": 2000
+        }
+      ],
+      "expected": {}
+    },
+    {
+      "label": "duplicate name on clusters",
+      "segments": [
+        {
+          "speaker": "mic_speaker_1",
+          "text": "My name is Jamie.",
+          "start_ms": 0,
+          "end_ms": 1000
+        },
+        {
+          "speaker": "system_speaker_1",
+          "text": "My name is Jamie.",
+          "start_ms": 1000,
+          "end_ms": 2000
+        }
+      ],
+      "expected": {}
+    },
+    {
+      "label": "repeated same introduction",
+      "segments": [
+        {
+          "speaker": "mic_speaker_1",
+          "text": "My name is Jamie.",
+          "start_ms": 0,
+          "end_ms": 1000
+        },
+        {
+          "speaker": "mic_speaker_1",
+          "text": "My name is Jamie.",
+          "start_ms": 1000,
+          "end_ms": 2000
+        }
+      ],
+      "expected": {
+        "mic_speaker_1": {
+          "name": "Jamie",
+          "evidence": [
+            0,
+            1
+          ]
+        }
+      }
+    },
+    {
+      "label": "unknown introduction",
+      "segments": [
+        {
+          "speaker": "unknown",
+          "text": "My name is Jamie.",
+          "start_ms": 0,
+          "end_ms": 1000
+        }
+      ],
+      "expected": {}
+    },
+    {
+      "label": "source only introduction",
+      "segments": [
+        {
+          "speaker": "me",
+          "text": "My name is Jamie.",
+          "start_ms": 0,
+          "end_ms": 1000
+        }
+      ],
+      "expected": {}
+    },
+    {
+      "label": "untimed fragments",
+      "segments": [
+        {
+          "speaker": "mic_speaker_1",
+          "text": "My name is"
+        },
+        {
+          "speaker": "mic_speaker_1",
+          "text": "Jamie."
+        }
+      ],
+      "expected": {}
+    }
+  ]
+}

@@ -179,6 +179,24 @@ class BrowserRecordingStatusTests(unittest.TestCase):
             for request in ("delivery-1", "probe-1", "delivery-2")])
         self.assertEqual(json.loads(next(self.signals.glob("*.json")).read_bytes())["state"], "left")
 
+    def test_joined_context_is_preserved_without_changing_lifecycle_identity(self):
+        context = {"provider": "google-meet", "key": "abc-defg-hij", "coverage": "visible_only",
+                   "participants": [{"name": "Casey Rivera", "self": False}]}
+        for state in ("joined", "unknown", "left"):
+            native.accept(dict(self.message, state=state, meetingContext=context), self.signals, now=100)
+            saved = json.loads(next(self.signals.glob("*.json")).read_bytes())
+            self.assertEqual(saved["meeting"], self.message["meeting"])
+            if state == "joined":
+                self.assertEqual(saved["meetingContext"], context)
+            else:
+                self.assertNotIn("meetingContext", saved)
+
+    def test_context_provider_mismatch_is_rejected_before_persisting(self):
+        context = {"provider": "zoom-web", "key": "12345678901", "coverage": "visible_only", "participants": []}
+        with self.assertRaisesRegex(ValueError, "different provider"):
+            native.accept(dict(self.message, meetingContext=context), self.signals, now=100)
+        self.assertFalse(self.signals.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

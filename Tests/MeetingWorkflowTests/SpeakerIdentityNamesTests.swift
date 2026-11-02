@@ -1,4 +1,5 @@
 import MeetingWorkflow
+import Foundation
 
 func runSpeakerIdentityNamesTests() {
     for (text, name) in [
@@ -41,5 +42,56 @@ func runSpeakerIdentityNamesTests() {
             .init(speaker: "system_speaker_1", text: "My name is Jamie.")
         ]).count, 0)
     }
+    runSpeakerNamePolicyV2Fixtures()
     print("Speaker naming checks passed: direct introductions, exact spelling, conflicts, unknown and quoted text")
+}
+
+private func runSpeakerNamePolicyV2Fixtures() {
+    struct Corpus: Decodable {
+        struct Introduction: Decodable { let text: String; let name: String? }
+        struct Session: Decodable {
+            struct Segment: Decodable {
+                let speaker: String
+                let text: String
+                let start_ms: Int?
+                let end_ms: Int?
+            }
+            struct Name: Decodable { let name: String; let evidence: [Int] }
+            let label: String
+            let segments: [Segment]
+            let expected: [String: Name]
+        }
+        let policy: String
+        let introductions: [Introduction]
+        let sessions: [Session]
+    }
+    let path = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        .appendingPathComponent("Fixtures/speaker-name-policy-v2.json")
+    guard let data = try? Data(contentsOf: path), let corpus = try? JSONDecoder().decode(Corpus.self, from: data) else {
+        preconditionFailure("Could not read shared speaker-name policy fixtures")
+    }
+    expectEqual(corpus.policy, SpeakerIdentityNames.Policy.explicitIntroV2.rawValue)
+    for item in corpus.introductions {
+        expectEqual(SpeakerIdentityNames.introduction(in: item.text, policy: .explicitIntroV2), item.name)
+    }
+    for item in corpus.sessions {
+        let segments = item.segments.map {
+            SpeakerIdentityNames.Segment(speaker: $0.speaker, text: $0.text,
+                                         startMs: $0.start_ms, endMs: $0.end_ms)
+        }
+        let names = SpeakerIdentityNames.names(in: segments, policy: .explicitIntroV2)
+        precondition(Set(names.keys) == Set(item.expected.keys), "Unexpected identities: \(item.label)")
+        for (identity, expected) in item.expected {
+            precondition(names[identity]?.name == expected.name && names[identity]?.evidence == expected.evidence,
+                         "Unexpected name/evidence: \(item.label)")
+        }
+    }
+    // A V2 transcript marker opts into new evidence rules; saved V1 payloads
+    // cannot silently acquire the broader grammar or lose their old names.
+    expectNil(SpeakerIdentityNames.introduction(in: "My name is Jamie, and I run operations."))
+    expectEqual(SpeakerIdentityNames.names(in: [
+        .init(speaker: "mic_speaker_1", text: "My name is Jamie."),
+        .init(speaker: "mic_speaker_1", text: "I can show a demo.")
+    ]).count, 0)
+    print("Versioned speaker naming checks passed: \(corpus.introductions.count) introductions and \(corpus.sessions.count) shared session fixtures")
 }

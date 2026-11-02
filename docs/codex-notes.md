@@ -2,7 +2,7 @@
 
 The completion worker can apply the existing Anthropic Call Summary instructions through a locally installed Codex CLI and its saved ChatGPT login. No separate model-provider API key or client is required. Codex still sends the supplied transcript to its hosted model; Quill's audio transcription runs on the Mac.
 
-The adapter is `integrations/meeting-workflow/quill_workflow/codex_notes.py`. It receives one transcript, the skill file, and an output path. It passes their contents to Codex, validates the returned JSON and transcript references, and writes the result atomically. The surrounding completion worker renders Markdown with Summary, Decisions, Next steps and Details, following the user-selected meeting-notes template. Actions include owners and stated deadlines; discussion topics, concerns, assessments and unresolved questions remain in Details. Repeated inline citations and timestamps are omitted, with evidence kept in the local JSON. A repeat with matching input and settings reuses the accepted result; exact legacy, earlier clean and template Markdown renderings remain valid for review and filing.
+The adapter is `integrations/meeting-workflow/quill_workflow/codex_notes.py`. It receives one transcript, the skill file, an output path, and optional saved meeting-name context. It passes their contents to Codex, validates the returned JSON and transcript references, and writes the result atomically. The surrounding completion worker renders Markdown with Summary, Decisions, Next steps and Details, following the user-selected meeting-notes template. Actions include owners and stated deadlines; discussion topics, concerns, assessments and unresolved questions remain in Details. Repeated inline citations and timestamps are omitted, with evidence kept in the local JSON. A repeat with matching input, context and settings reuses the accepted result; exact legacy, earlier clean and template Markdown renderings remain valid for review and filing.
 
 Writing guidance starts with the meeting's outcome or focus, followed by decisions,
 concrete tasks with verified owners, and compact topic details that preserve useful
@@ -36,19 +36,40 @@ such as `mic_speaker_1` or `system_speaker_1`. Unnamed voices appear as
 keeps **Microphone (unidentified)** or **System audio (unidentified)**; it is
 never assigned to a named voice by proximity.
 
-A clear self-introduction can supply a name for that voice. The Python runner
-rechecks the exact introduction text, its speaker and source, and its segment
-indices before using the name. Conflicting introductions, the same name on
-different voices, and nearby quotation, roleplay or correction cues prevent
-attribution. A stated name is not an independently verified identity. The notes
-model receives only the names that pass these checks, and both document formats
-reuse them for later segments from the same speaker ID.
+A clear self-introduction can supply a name for that voice. New captures mark
+`speaker_name_policy: "explicit_intro_v2"`. This policy accepts an introduction
+followed by a separate clause, and introductions split across up to three adjacent,
+timed segments from the same voice. It checks nearby quoted-speech setups and
+explicit corrections without rejecting ordinary discussion of demos or examples.
+Python and Swift share synthetic cases for these rules. Older captures retain
+their original parsing policy. A stated name is not an independently verified identity.
+
+The same notes call also reviews speaker names in context. It considers supplied
+introductions, direct address, replies, microphone/system sources and any saved
+visible participant names. A clear two-person exchange can support a suggestion;
+two names alone cannot identify either voice. A shared microphone may contain
+several people, and a browser's self badge does not identify every microphone
+speaker. Visible participants are a partial list, not proof of total attendance.
+
+New output includes `speaker_review` with `schema_version: 1` and `assignments`.
+Each assignment records `speaker_id`, `name`, `status` (`confirmed` or `suggested`),
+transcript `evidence` indices and `context_participants` indices. Only explicit
+introductions that pass the parser can be confirmed. Contextual matches, including
+bare “I'm Jamie,” remain visibly **Jamie (suggested)**. Names must occur exactly in
+the cited speech or referenced visible-name context; emails and surnames are never
+inferred. Unknown names can be omitted without blocking notes.
+
+The caller adds the canonical `transcript_sha256` and validated `context` to the
+saved review. The model cannot author those binding fields. Transcript previews,
+the separate readable transcript in the notes folder, native Google Docs and DOCX
+use the same validated review. Source JSON, speaker IDs, speech and times remain
+unchanged. Old notes without a review retain their existing output.
 
 A named action may cite a later commitment from that separated speaker. Without
 that validated mapping, the owner must have their name in the cited transcript
-text. Unknown owners stay unassigned, and numbered speaker labels never become
-owners. Calendar attendees and browser meeting controls do not establish who
-spoke.
+text. A suggested mapping alone cannot establish an action owner or a definite
+participant. Unknown owners stay unassigned, and numbered speaker labels never
+become owners. Speaker naming does not choose recipients or authorize sharing.
 
 Older transcripts and recordings with only audio-source labels retain their
 existing **Microphone** and **System audio** labels. A shared source may contain
@@ -72,6 +93,7 @@ The following setup example leaves notes disabled until the runner is configured
       "--input", "{input}",
       "--output", "{output}",
       "--skill", "{skill}",
+      "--context", "{context}",
       "--codex", "/Applications/Codex.app/Contents/Resources/codex",
       "--timeout", "900"
     ],

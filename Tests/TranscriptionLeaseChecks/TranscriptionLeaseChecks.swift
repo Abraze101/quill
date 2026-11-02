@@ -90,6 +90,13 @@ actor ParakeetEngine: TranscriptionEngine {
             speakerStatus = .unavailable
             return try await EngineProbe.shared.transcribe()
         }
+        if fixture == "speakers-v2" {
+            speakerStatus = .completed
+            return audio.lastPathComponent == "mic.caf"
+                ? [.init(start: 0, end: 0.3, text: "My name is", speakerID: "S1"),
+                   .init(start: 0.4, end: 0.9, text: "Alex, and I run operations.", speakerID: "S1")]
+                : [.init(start: 2, end: 3, text: "Hi, I'm Max. I can show the demo.", speakerID: "S1")]
+        }
         speakerStatus = .partial
         let name = audio.lastPathComponent == "mic.caf" ? "Alex" : "Max"
         return [.init(start: 0, end: 1, text: "My name is \(name).", speakerID: "S1"),
@@ -97,6 +104,9 @@ actor ParakeetEngine: TranscriptionEngine {
                 .init(start: 2, end: 3, text: "Overlapping speech.")]
     }
     func speakerIdentificationStatus() async -> SpeakerIdentificationState { speakerStatus }
+    func speakerIdentificationDiagnostic() async -> String? {
+        speakerStatus == .disabled ? nil : "\(speakerStatus.rawValue): synthetic_counts; words=3"
+    }
     func release() async {}
 }
 
@@ -136,10 +146,12 @@ struct TranscriptionLeaseChecks {
         precondition(!contents.contains("] me:**") && !contents.contains("] them:**"))
         let transcript = try JSONSerialization.jsonObject(with: Data(contentsOf: session.appendingPathComponent("transcript.json"))) as! [String: Any]
         precondition(transcript["speaker_labels"] as? String == "audio_source")
+        precondition(transcript["speaker_name_policy"] == nil, "Legacy source transcripts must keep their payload shape")
         let sourceTracks = (transcript["segments"] as! [[String: Any]]).compactMap { $0["speaker"] as? String }
         precondition(Set(sourceTracks) == Set(["me", "them"]), "Canonical source keys must remain compatible")
         let log = try String(contentsOf: session.appendingPathComponent("transcribe.log"), encoding: .utf8)
         precondition(log.contains("done — 2 segments"))
+        precondition(!log.contains("synthetic_counts"), "Disabled speaker identification must not emit speaker diagnostics")
         var exclusive = flock(fd, LOCK_EX | LOCK_NB) == 0
         while !exclusive, Date() < completedBy {
             try await Task.sleep(for: .milliseconds(10))
@@ -583,7 +595,7 @@ struct TranscriptionLeaseChecks {
     }
 
     private static func checkCanonicalSpeakers(root: URL, coordinator: TranscriptionCoordinator) async throws {
-        for suffix in ["speakers", "speakers-unavailable", "speakers-missing-track", "speakers-skipped-track"] {
+        for suffix in ["speakers", "speakers-unavailable", "speakers-missing-track", "speakers-skipped-track", "speakers-v2"] {
             let session = try fixture(suffix, root: root)
             if suffix == "speakers-missing-track" {
                 try FileManager.default.removeItem(at: session.appendingPathComponent("system.caf"))
@@ -601,6 +613,11 @@ struct TranscriptionLeaseChecks {
             let json = try JSONSerialization.jsonObject(with: Data(contentsOf: session.appendingPathComponent("transcript.json"))) as! [String: Any]
             let markdown = try String(contentsOf: session.appendingPathComponent("transcript.md"), encoding: .utf8)
             precondition(json["speaker_labels"] as? String == "diarized_v1")
+            precondition(json["speaker_name_policy"] as? String == "explicit_intro_v2")
+            let log = try String(contentsOf: session.appendingPathComponent("transcribe.log"), encoding: .utf8)
+            precondition(log.contains("speakers mic: ") && log.contains("synthetic_counts; words=3"),
+                         "Speaker diagnostics were not saved with the track")
+            precondition(!log.contains("My name is"), "Speaker diagnostics must not log transcript contents")
             if suffix == "speakers" {
                 let quality = json["capture_quality"] as? [String: Any]
                 precondition(quality?["affected_sources"] as? [String] == ["mic"])
@@ -612,6 +629,17 @@ struct TranscriptionLeaseChecks {
             let segments = json["segments"] as! [[String: Any]]
             let status = json["speaker_identification"] as! [String: Any]
             precondition(map["unknown"] == nil)
+            if suffix == "speakers-v2" {
+                precondition(status["status"] as? String == "completed")
+                precondition(map["mic_speaker_1"]?["name"] as? String == "Alex")
+                precondition(map["mic_speaker_1"]?["evidence"] as? [Int] == [0, 1])
+                precondition(map["system_speaker_1"]?["name"] as? String == "Max")
+                precondition(map["system_speaker_1"]?["evidence"] as? [Int] == [2])
+                precondition(segments.count == 3 && segments[0]["text"] as? String == "My name is",
+                             "Joining name evidence must not rewrite the canonical segments")
+                precondition(markdown.contains("] Alex:**") && markdown.contains("] Max:**"))
+                continue
+            }
             if ["speakers-missing-track", "speakers-skipped-track"].contains(suffix) {
                 precondition(status["status"] as? String == "partial",
                              "Missing or failed tracks must not count as complete speaker detection")

@@ -64,6 +64,80 @@
     return "";
   }
 
+  function participantName(value) {
+    if (typeof value !== "string" || value.length > 400) return null;
+    const name = value.normalize("NFC").replace(/\s+/g, " ").trim();
+    if (!name || [...name].length > 100 || /\p{C}|@|:\/\//u.test(name)
+        || /^(you|me|host|participant|participants|unknown|guest)$/i.test(name)) return null;
+    return name;
+  }
+
+  function visibleParticipants(document, provider, isVisible) {
+    // Only dedicated participant-name elements. Never aggregate a roster,
+    // chat, caption, or accessible announcement into an alleged identity.
+    const meetTileSelector = "[data-participant-id][data-tile-media-id]";
+    const selector = provider === "google-meet"
+      ? "[data-participant-id] [data-self-name],[data-participant-id][data-self-name],"
+        + meetTileSelector + " .notranslate"
+      : provider === "zoom-web"
+        ? ".video-avatar__avatar-name" : null;
+    if (!selector) return [];
+    const people = [], seen = new Set();
+    const excluded = "[role='log'],[data-message-id],[data-caption-id],[aria-hidden='true'],[hidden],.chat-container,.chat-message,.chat-box";
+    const tileNames = new Map();
+
+    function meetTileName(element) {
+      if (element.tagName !== "SPAN" || element.childElementCount !== 0 || !element.matches(".notranslate")) return null;
+      const tile = element.closest(meetTileSelector);
+      if (!tile) return null;
+      if (!tileNames.has(tile)) {
+        // Current Meet puts icon labels and empty placeholders beside the
+        // display name. Read visible SPAN leaves only, never tile text.
+        const nodes = tile.querySelectorAll(".notranslate");
+        const names = [];
+        if (nodes.length <= 100) {
+          for (const node of nodes) {
+            if (node.tagName !== "SPAN" || node.childElementCount !== 0
+                || node.closest(meetTileSelector) !== tile || !isVisible(node)
+                || node.closest(excluded)) continue;
+            const value = node.textContent;
+            if (participantName(value)) names.push({ element: node, value });
+            if (names.length > 1) break;
+          }
+        }
+        tileNames.set(tile, names.length === 1 ? names[0] : null);
+      }
+      const name = tileNames.get(tile);
+      return name?.element === element ? name.value : null;
+    }
+
+    for (const element of [...document.querySelectorAll(selector)].slice(0, 100)) {
+      if (!isVisible(element) || element.closest(excluded)) continue;
+      let value = provider === "google-meet" ? element.getAttribute("data-self-name") : null;
+      if (provider === "google-meet" && !value) {
+        value = meetTileName(element);
+        if (!value) continue;
+      }
+      // Zoom's dedicated display-name element may include a small self badge.
+      // Inspect leaf-sized text only; a changed container shape is omitted.
+      if (!value) {
+        if (element.childElementCount > 2 || (element.textContent || "").length > 400) continue;
+        value = element.textContent;
+      }
+      const self = element.getAttribute("data-is-self") === "true"
+        || (typeof value === "string" && /\s*\(you\)\s*$/i.test(value));
+      if (self) value = value.replace(/\s*\(you\)\s*$/i, "");
+      const name = participantName(value);
+      if (!name) continue;
+      const key = name.toLowerCase() + "|" + self;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      people.push({ name, self });
+      if (people.length === 20) break;
+    }
+    return people;
+  }
+
   function classify(snapshot) {
     let url;
     try { url = new URL(snapshot.url); } catch { return { state: "unknown", reason: "url" }; }
@@ -112,6 +186,6 @@
     if (leave && people && audio) return { provider, state: "joined", reason: "in-call-controls" };
     return { provider, state: "unknown", reason: "no-confirmed-call-state" };
   }
-  root.QuillMeetingDetector = { classify, controlLabel, warningEvidence };
-  if (typeof module !== "undefined") module.exports = { classify, controlLabel, warningEvidence };
+  root.QuillMeetingDetector = { classify, controlLabel, warningEvidence, visibleParticipants, participantName };
+  if (typeof module !== "undefined") module.exports = { classify, controlLabel, warningEvidence, visibleParticipants, participantName };
 })(globalThis);

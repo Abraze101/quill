@@ -1,4 +1,5 @@
 import Foundation
+import MeetingWorkflow
 
 /// One meeting recording: a timestamped folder holding two independent tracks
 /// (mic = you, system = them) plus a meta.json written on clean stop. Tracks
@@ -17,6 +18,12 @@ final class RecordingSession {
     var microphoneCoverageComplete: Bool { mic.captureReport["coverage_complete"] as? Bool == true }
     private let recordingTimeZone: TimeZone
     private let speakerIdentificationRequested: Bool
+    private var meetingContext: MeetingContext?
+
+    func observeMeetingContext(_ context: MeetingContext) {
+        guard endedAt == nil, let context = context.validated() else { return }
+        meetingContext = meetingContext?.merging(context) ?? context
+    }
 
     private let mic = MicRecorder()
     private let system = SystemAudioRecorder()
@@ -199,6 +206,9 @@ final class RecordingSession {
         }
         if let origin = captureOrigins.min() { meta["capture_start_offset_seconds"] = origin }
         if let screenError { meta["screen_error"] = screenError }
+        if let meetingContext {
+            meta["meeting_context"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(meetingContext))
+        }
         return meta
     }
 }

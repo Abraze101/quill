@@ -64,6 +64,7 @@ final class MeetingWindowMatcherTests {
         let legacy = Data(#"{"source":"tab","meeting":"call","provider":"google-meet","state":"joined","timestamp":100}"#.utf8)
         let decoded = try decoder.decode(MeetingSignal.self, from: legacy)
         expectNil(decoded.browserWindow)
+        expectNil(decoded.meetingContext)
         let legacyInitializer = MeetingSignal(source: "tab", meeting: "call", provider: "google-meet", state: .joined, timestamp: 100)
         expectEqual(decoded, legacyInitializer)
         let withWindow = MeetingSignal(source: "tab", meeting: "call", provider: "google-meet", state: .joined,
@@ -71,5 +72,25 @@ final class MeetingWindowMatcherTests {
         expectEqual(try decoder.decode(MeetingSignal.self, from: JSONEncoder().encode(withWindow)), withWindow)
         let explicitNull = Data(#"{"source":"tab","meeting":"call","provider":"google-meet","state":"joined","timestamp":100,"browserWindow":null}"#.utf8)
         expectNil(try decoder.decode(MeetingSignal.self, from: explicitNull).browserWindow)
+        let context = MeetingContext(provider: "google-meet", key: "abc-defg-hij", participants: [
+            .init(name: "Jamie Smith", isSelf: false)])
+        let withContext = MeetingSignal(source: "tab", meeting: "call", provider: "google-meet", state: .joined,
+                                        timestamp: 100, meetingContext: context)
+        expectEqual(try decoder.decode(MeetingSignal.self, from: JSONEncoder().encode(withContext)), withContext)
+        expectEqual(context.validated(), context)
+        let next = MeetingContext(provider: "google-meet", key: context.key, participants: [
+            .init(name: "Jamie Smith", isSelf: false), .init(name: "Morgan", isSelf: true)])
+        expectEqual(context.merging(next).participants.count, 2)
+        let unrelated = MeetingContext(provider: "google-meet", key: "xyz-abcd-efg", participants: next.participants)
+        expectEqual(context.merging(unrelated), context)
+        for name in ["Guest", "someone@example.com", "https://example.com", " Jamie", "A\nB", "A\u{200B}B", "A\u{E000}B", String(repeating: "x", count: 101)] {
+            expectNil(MeetingContext(provider: "google-meet", key: context.key,
+                                     participants: [.init(name: name, isSelf: false)]).validated())
+        }
+        expectNil(MeetingContext(provider: "google-meet", key: "abc-defg-hij?authuser=1", participants: []).validated())
+        expectNil(MeetingSignal(source: "tab", meeting: "call", provider: "zoom-web", state: .joined,
+                                timestamp: 100, meetingContext: context).meetingContext)
+        expectNil(MeetingContext(provider: "google-meet", key: context.key,
+                                 participants: Array(repeating: context.participants[0], count: 51)).validated())
     }
 }
