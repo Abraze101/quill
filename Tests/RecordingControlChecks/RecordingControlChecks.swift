@@ -33,6 +33,7 @@ struct RecordingControlChecks {
         let initial = RecordingStatusSnapshot(phase: .recording, sessionID: "first", elapsed: "00:42:15",
             microphoneStatus: "Recording", systemAudioStatus: "Recording", videoStatus: "Entire display", actionRevision: 4, stopEnabled: true)
         control.update(initial)
+        checkPanelGeometry(panel, content: content, compact: false)
         render(content, name: "recording")
         expect(!panel.isVisible, "Offscreen checks must not reveal a panel")
         expect(stop.isEnabled && !stop.isHiddenOrHasHiddenAncestor, "Recording needs a visible Stop")
@@ -59,6 +60,7 @@ struct RecordingControlChecks {
                "Collapsing must leave an enabled Stop")
         expect(labels(content).contains("REC"), "Compact indicator must contain REC text")
         expect(panel.frame.width < 366, "Compact recording control must be narrower")
+        checkPanelGeometry(panel, content: content, compact: true)
         render(content, name: "recording-compact")
 
         control.update(.init(phase: .recording, sessionID: "pause-first", elapsed: "00:42:15",
@@ -830,6 +832,43 @@ struct RecordingControlChecks {
         heartbeat.invalidate()
         expect(!FileManager.default.fileExists(atPath: path.path), "Quit must invalidate previous recording confirmation")
         print("Recording heartbeat publication checks passed")
+    }
+
+    @MainActor static func checkPanelGeometry(_ panel: NSWindow, content: NSView, compact: Bool) {
+        content.layoutSubtreeIfNeeded()
+        func hit(_ p: NSPoint) -> NSView? {
+            content.hitTest(content.convert(p, to: content.superview))
+        }
+        let disclosure = button("quill-status-disclosure", in: content)
+        let target = content.convert(disclosure.bounds, from: disclosure)
+        expect(target.width >= 40 && target.height >= 28 && disclosure.isBordered,
+            "Collapse and expand need a visible rectangular target")
+        for x in [target.minX + 3, target.maxX - 3] {
+            for y in [target.minY + 3, target.maxY - 3] {
+                expect(hit(NSPoint(x: x, y: y)) === disclosure, "Button padding must accept the click")
+            }
+        }
+        let stop = button(compact ? "quill-status-compact-stop" : "quill-status-stop", in: content)
+        let stopFrame = content.convert(stop.bounds, from: stop)
+        expect(!target.intersects(stopFrame) && hit(NSPoint(x: stopFrame.midX, y: stopFrame.midY)) === stop,
+               "Disclosure must not intercept Stop")
+        let b = content.bounds
+        for x in [b.minX + 1, b.maxX - 1] {
+            for y in [b.minY + 1, b.maxY - 1] {
+                expect(hit(NSPoint(x: x, y: y)) == nil, "Transparent corners must not take clicks")
+            }
+        }
+        let gutter = hit(NSPoint(x: b.midX, y: b.maxY - 4))
+        expect(panel.isMovableByWindowBackground && gutter != nil && !(gutter is NSControl),
+               "The top gutter must remain available for dragging")
+        guard let mask = (content as? NSVisualEffectView)?.maskImage,
+              let bitmap = mask.tiffRepresentation.flatMap(NSBitmapImageRep.init(data:)) else {
+            fatalError("A layer corner radius alone does not clip the behind-window material")
+        }
+        expect(bitmap.colorAt(x: 0, y: 0)!.alphaComponent < 0.02 &&
+               bitmap.colorAt(x: bitmap.pixelsWide / 2, y: bitmap.pixelsHigh / 2)!.alphaComponent > 0.98 &&
+               mask.capInsets.top == content.layer?.cornerRadius && mask.resizingMode == .stretch &&
+               content.layer?.masksToBounds == true, "Material and child views need the same rounded corners")
     }
 
     @MainActor static func render(_ content: NSView, name: String) {

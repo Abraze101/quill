@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Quill meeting detector",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "minimum_chrome_version": "106",
   "description": "Reports meeting state, meeting identifiers and visible participant names to local Quill. Does not record audio or video.",
   "permissions": ["nativeMessaging", "storage", "alarms", "webNavigation"],

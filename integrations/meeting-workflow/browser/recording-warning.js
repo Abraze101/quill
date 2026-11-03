@@ -3,6 +3,9 @@
   "use strict";
   const STATES = new Set(["not-recording", "starting", "recording", "paused", "skipped", "unavailable"]);
   const FRESHNESS = 8000;
+  // Allow one missed five-second poll after confirmed capture. This limits
+  // banner presentation only; a failed reply never counts as confirmation.
+  const COVERED_WARNING_DEADLINE = 12000;
   const JOIN_FRESHNESS = 15000;
   const GRACE = 15000;
   const START_GRACE = 30000;
@@ -27,7 +30,25 @@
           (status === "starting" && call.startingAt !== null && time - call.startingAt < START_GRACE)) {
         display(null); return;
       }
+      if (status === "unavailable" && !invalidated && call.coveredAt !== null && call.failedProbes < 2 &&
+          time >= call.coveredAt && time - call.coveredAt < COVERED_WARNING_DEADLINE) {
+        display(null); return;
+      }
       display(status === "not-recording" ? "not-recording" : "unavailable");
+    }
+    function accept(target, state) {
+      target.state = STATES.has(state) ? state : "unavailable";
+      target.confirmedAt = now();
+      if (target.state === "unavailable") {
+        target.failedProbes = Math.min(2, target.failedProbes + 1);
+      } else {
+        target.failedProbes = 0;
+        target.coveredAt = ["recording", "paused"].includes(state) ? target.confirmedAt : null;
+      }
+      if (state === "starting" && target.startingAt === null) target.startingAt = target.confirmedAt;
+      if (["recording", "paused", "not-recording"].includes(state)) target.startingAt = null;
+      if (state === "skipped") target.suppressed = true;
+      refresh();
     }
     function clear() { call = null; sequence++; display(null); }
     function observe(evidence, meeting) {
@@ -38,7 +59,7 @@
         sequence++;
         call = { id: randomID(), provider: evidence.provider, since: time, joinedAt: time,
           requestedAt: -Infinity, confirmedAt: -Infinity, state: "unavailable",
-          startingAt: null, dismissed: false, suppressed: false };
+          startingAt: null, coveredAt: null, failedProbes: 0, dismissed: false, suppressed: false };
       }
       call.joinedAt = time;
       // A warning-only call uses its own opaque ID until strict detection has
@@ -49,6 +70,8 @@
         // available strict identity, even if its reply arrives last.
         sequence++;
         call.requestedAt = -Infinity;
+        call.coveredAt = null;
+        call.failedProbes = 0;
       }
       if (!invalidated && time - call.requestedAt >= 5000) {
         call.requestedAt = time;
@@ -57,18 +80,10 @@
         Promise.resolve().then(() => requestStatus({ meeting: target.meeting || target.id, provider: target.provider }))
           .then(answer => {
             if (call !== target || request !== sequence || invalidated) return;
-            const state = answer?.recordingStatus?.state;
-            target.state = STATES.has(state) ? state : "unavailable";
-            target.confirmedAt = now();
-            if (state === "starting" && target.startingAt === null) target.startingAt = now();
-            if (["recording", "paused", "not-recording"].includes(state)) target.startingAt = null;
-            if (state === "skipped") target.suppressed = true;
-            refresh();
+            accept(target, answer?.recordingStatus?.state);
           }).catch(() => {
             if (call !== target || request !== sequence) return;
-            target.state = "unavailable";
-            target.confirmedAt = now();
-            refresh();
+            accept(target, "unavailable");
           });
       }
       refresh();

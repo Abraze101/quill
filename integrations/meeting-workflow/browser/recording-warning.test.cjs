@@ -67,9 +67,82 @@ test('pause and explicit skip are respected; a stale recording confirmation cann
     await h.step(); await h.answer(state);
     await h.step(15000); await h.answer(state);
     assert.equal(h.rendered.at(-1) ?? null, null, state);
-    await h.step(9000);
+    await h.step(12000);
     assert.equal(h.rendered.at(-1), state === 'skipped' ? undefined : 'unavailable', state);
   }
+});
+
+async function confirmedCall(state = 'recording') {
+  const h = harness();
+  await h.step(); await h.answer(state);
+  for (let i = 0; i < 3; i++) { await h.step(5000); await h.answer(state); }
+  assert.deepEqual(h.rendered, []);
+  return h;
+}
+
+test('one failed probe between confirmations never mounts the browser banner', async () => {
+  for (const prior of ['recording', 'paused']) {
+    for (const failure of ['unavailable', 'malformed', 'rejected']) {
+      const h = await confirmedCall(prior);
+      await h.step(5000);
+      if (failure === 'rejected') { h.requests.at(-1).reject(new Error('bridge unavailable')); await flush(); }
+      else await h.answer(failure);
+      await h.idle(4000); // The positive reply is now older than the ordinary eight-second freshness window.
+      await h.step(1000); await h.answer(prior);
+      assert.deepEqual(h.rendered, [], `${prior} / ${failure}`);
+    }
+  }
+});
+
+test('a healthy reply after a 9–10 second polling gap does not paint and immediately remove a banner', async () => {
+  for (const gap of [9000, 10000]) {
+    const h = await confirmedCall();
+    await h.step(gap);
+    assert.deepEqual(h.rendered, [], 'refresh must not mount a banner before its in-flight reply');
+    await h.answer('recording');
+    assert.deepEqual(h.rendered, []);
+  }
+});
+
+test('two delayed recording confirmations 8.8 seconds apart avoid a 67 ms banner flash', async () => {
+  const h = await confirmedCall();
+  for (let i = 0; i < 2; i++) {
+    // A refresh tick crosses the old eight-second boundary before the probe;
+    // another occurs while Chrome is still awaiting the healthy bridge reply.
+    await h.idle(8100);
+    await h.step(633);
+    await h.idle(67);
+    await h.answer('recording');
+  }
+  assert.deepEqual(h.rendered, [], 'no frame should mount the unavailable banner');
+});
+
+test('two probe failures, a hung bridge, and explicit lost connection still warn', async () => {
+  const twice = await confirmedCall();
+  await twice.step(5000); await twice.answer('unavailable');
+  await twice.step(5000); await twice.answer('unavailable');
+  assert.deepEqual(twice.rendered, ['unavailable'], 'a second failed reply must warn immediately');
+
+  const hung = await confirmedCall();
+  await hung.step(5000); await hung.answer('unavailable');
+  await hung.step(5000); // The next probe never returns.
+  await hung.idle(2000);
+  assert.deepEqual(hung.rendered, ['unavailable'], 'last success expires at 12 s even if a newer probe hangs');
+  await hung.idle(1000);
+  assert.deepEqual(hung.rendered, ['unavailable']);
+
+  const disconnected = await confirmedCall();
+  disconnected.monitor.connectionLost();
+  assert.deepEqual(disconnected.rendered, ['unavailable']);
+});
+
+test('explicit not-recording after a covered call bypasses uncertainty grace', async () => {
+  const h = await confirmedCall();
+  await h.step(5000); await h.answer('unavailable');
+  await h.step(5000); await h.answer('not-recording');
+  assert.deepEqual(h.rendered, ['not-recording']);
+  await h.step(5000); await h.answer('unavailable');
+  assert.deepEqual(h.rendered, ['not-recording', 'unavailable']);
 });
 
 test('a new start or resume receives fresh bounded grace after a confirmed recording or pause', async () => {

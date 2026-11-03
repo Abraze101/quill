@@ -218,13 +218,7 @@ final class RecordingStatusController: NSObject, NSWindowDelegate {
     }
 
     private func buildContent() {
-        let material = NSVisualEffectView()
-        material.material = .hudWindow
-        material.blendingMode = .behindWindow
-        material.state = .active
-        material.wantsLayer = true
-        material.layer?.cornerRadius = 14
-        material.layer?.masksToBounds = true
+        let material = RecordingPanelSurface(frame: .zero)
         panel.contentView = material
         root.orientation = .vertical
         root.alignment = .leading
@@ -249,8 +243,13 @@ final class RecordingStatusController: NSObject, NSWindowDelegate {
         compactElapsed.setAccessibilityLabel("Recording duration")
         compactStopButton.controlSize = .small
         compactPauseButton.controlSize = .small
-        collapseButton.controlSize = .small
-        collapseButton.isBordered = false
+        collapseButton.bezelStyle = .flexiblePush
+        collapseButton.imagePosition = .imageOnly
+        collapseButton.setAccessibilityIdentifier("quill-status-disclosure")
+        NSLayoutConstraint.activate([
+            collapseButton.widthAnchor.constraint(equalToConstant: 40),
+            collapseButton.heightAnchor.constraint(equalToConstant: 28)
+        ])
         collapseButton.onClick = { [weak self] in
             guard let self else { return }
             self.compact.toggle()
@@ -523,6 +522,43 @@ final class RecordingStatusController: NSObject, NSWindowDelegate {
 private final class RecordingControlPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
+}
+
+/// The window server draws the HUD material separately from this view's
+/// layers. Mask the material (and its shadow), clip the children, and reject
+/// hits outside the same outline when AppKit dispatches events.
+private final class RecordingPanelSurface: NSVisualEffectView {
+    private static let radius: CGFloat = 14
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        material = .hudWindow
+        blendingMode = .behindWindow
+        state = .active
+        let radius = Self.radius
+        let side = 2 * radius + 1
+        let mask = NSImage(size: NSSize(width: side, height: side), flipped: false) { rect in
+            NSColor.white.setFill()
+            NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius).fill()
+            return true
+        }
+        mask.capInsets = NSEdgeInsets(top: radius, left: radius, bottom: radius, right: radius)
+        mask.resizingMode = .stretch
+        maskImage = mask
+        wantsLayer = true
+        layer?.cornerRadius = radius
+        layer?.masksToBounds = true
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let local = convert(point, from: superview)
+        guard NSBezierPath(roundedRect: bounds, xRadius: Self.radius, yRadius: Self.radius).contains(local) else {
+            return nil
+        }
+        return super.hitTest(point)
+    }
 }
 
 /// AppKit may run a nested event loop while a mouse button is held. Freeze the
