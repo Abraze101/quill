@@ -95,6 +95,27 @@ def deletion_options(config_path, state):
         deletion.close()
 
 
+def cancellation_options(config_path, state, job=None):
+    from quill_workflow.local_deletion import LocalMeetingDeletion
+    meetings = LocalMeetingDeletion(state, config_path)
+    try:
+        if job is not None:
+            option = meetings.cancellation_option(job)
+            return [option] if option else []
+        return meetings.cancellation_options()
+    finally:
+        meetings.close()
+
+
+def cancel_processing(job, revision, config_path, state):
+    from quill_workflow.local_deletion import LocalMeetingDeletion
+    meetings = LocalMeetingDeletion(state, config_path)
+    try:
+        return meetings.cancel_processing(job, revision)
+    finally:
+        meetings.close()
+
+
 def deletion_decision(action, job, revision, config_path, state, confirmation=None):
     from quill_workflow.local_deletion import LocalMeetingDeletion
     deletion = LocalMeetingDeletion(state, config_path)
@@ -548,6 +569,8 @@ def main(argv=None):
                          deletion_options=lambda: deletion_options(args.config, queue.state),
                          on_delete=lambda action, job, revision, confirmation=None: deletion_decision(
                              action, job, revision, args.config, queue.state, confirmation),
+                         cancellation_options=lambda job=None: cancellation_options(args.config, queue.state, job),
+                         on_cancel_processing=lambda job, revision: cancel_processing(job, revision, args.config, queue.state),
                          open_browser=not args.no_open, timeout_seconds=args.timeout,
                          on_ready=(lambda url: print(url, flush=True)) if args.print_url else None)
         elif args.command == "delete-work":

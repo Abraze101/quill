@@ -83,6 +83,25 @@ class RecordingIdentityTests(unittest.TestCase):
         with patch("quill_workflow.recording_identity._verify_files", side_effect=AssertionError("Repeated media hashing")):
             self.queue.require_processing(self.job)
 
+    def test_cancelled_recording_can_verify_remounted_source_for_trash(self):
+        from quill_workflow.local_deletion import LocalMeetingDeletion
+        from quill_workflow.recording_safety import CANCEL_MARKER, ProcessingCancelled
+        meta = json.loads((self.session / "meta.json").read_text())
+        atomic_json(self.session / "meta.json", dict(meta, transcription_requested=False))
+        self.enqueue()
+        (self.session / CANCEL_MARKER).touch()
+        self.simulate_device_renumber()
+        config = self.root / "config.json"
+        atomic_json(config, self.config)
+        actions = LocalMeetingDeletion(self.queue.state, config)
+        self.addCleanup(actions.close)
+        item = next(i for i in actions.options() if i["job"] == self.job)
+        self.assertTrue(item["available"])
+        self.assertEqual(actions.prepare(self.job, item["revision"])["job"], self.job)
+        self.assertEqual(self.stored_device(), self.session.stat().st_dev)
+        with self.assertRaises(ProcessingCancelled):
+            self.queue.require_processing(self.job)
+
     def test_named_destination_and_original_hook_keep_same_job_after_device_change(self):
         self.enqueue()
         self.simulate_device_renumber()

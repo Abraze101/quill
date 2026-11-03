@@ -17,13 +17,17 @@ from quill_workflow.routing import (RoutingError, RoutingReviews, preserves_comp
                                     validate_companies)
 from quill_workflow.meeting_title import meeting_title
 from quill_workflow.meeting_dates import recording_timezone
-from quill_workflow.recording_safety import FILENAME, RecordingSafetyHold, read_safety, require_approved
+from quill_workflow.recording_safety import (FILENAME, RecordingSafetyHold, ProcessingCancelled, check_cancellation,
+                                             processing_safety, read_safety, require_approved)
 
 STAGES = ("archive", "notes", "publish")
 ALL_STAGES = STAGES + ("route",)
 MAX_ATTEMPTS = 6
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS local_deletions (job TEXT PRIMARY KEY, record TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS processing_cancellations (
+ job TEXT PRIMARY KEY, device INTEGER NOT NULL, inode INTEGER NOT NULL, started TEXT NOT NULL, session_id TEXT
+);
 CREATE TABLE IF NOT EXISTS jobs (
  id TEXT PRIMARY KEY, session TEXT NOT NULL, created REAL NOT NULL
 );
@@ -203,7 +207,7 @@ def snapshot_session(session, recordings_root, destination):
     root = Path(recordings_root).expanduser().resolve(strict=True)
     if session.parent != root or not session.is_dir():
         raise WorkflowError("Session must be a direct child of the configured recordings root")
-    read_safety(session)
+    processing_safety(session)
     metadata = read_json(safe_member(session, "meta.json"), 100_000)
     if not isinstance(metadata, dict) or not metadata.get("ended") or not metadata.get("started"):
         raise WorkflowError("Session has no completed recording metadata")
@@ -221,7 +225,7 @@ def snapshot_session(session, recordings_root, destination):
     destination.mkdir(parents=True, exist_ok=False)
     manifest = {}
     for member in members:
-        read_safety(session)
+        processing_safety(session)
         before = member.stat()
         digest = hashlib.sha256()
         # O_NOFOLLOW closes the symlink race between checking and opening.
@@ -230,6 +234,7 @@ def snapshot_session(session, recordings_root, destination):
             if os.fstat(source.fileno()).st_ino != before.st_ino:
                 raise WorkflowError("Session changed while being queued")
             while True:
+                check_cancellation(session)
                 block = source.read(1024 * 1024)
                 if not block:
                     break
@@ -241,7 +246,7 @@ def snapshot_session(session, recordings_root, destination):
         if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
             raise WorkflowError("Session is still changing; queue after finalization")
         manifest[member.name] = {"sha256": digest.hexdigest(), "size": before.st_size}
-    read_safety(session)
+    processing_safety(session)
     atomic_json(destination / "manifest.json", manifest)
     return session, manifest
 
@@ -263,6 +268,8 @@ class Queue:
         """Check the live original, following only recorded local-name moves."""
         if self.db.execute("SELECT 1 FROM local_deletions WHERE job=?", (job,)).fetchone():
             raise RecordingSafetyHold("This local meeting was deleted; processing stays stopped")
+        if self.db.execute("SELECT 1 FROM processing_cancellations WHERE job=?", (job,)).fetchone():
+            raise ProcessingCancelled("Processing cancelled; local files are kept")
         from quill_workflow.local_naming import session_path
         from quill_workflow.recording_identity import remember_identity, verify_directory
         try:
@@ -272,6 +279,7 @@ class Queue:
             # later completion when the worker reconciles its saved queue.
             # Keep the original identity binding; never silently trust a new one.
             raise RecordingSafetyHold("Original recording location needs review: " + str(error)) from error
+        check_cancellation(session)
         binding = self.db.execute("SELECT * FROM recording_safety_bindings WHERE job=?", (job,)).fetchone()
         marker_exists = os.path.lexists(session / FILENAME)
         if binding or marker_exists:
@@ -304,12 +312,22 @@ class Queue:
             return data
         return None
 
+    def stop_remaining(self, job):
+        """Caller owns the transaction. Completed receipts and upload journals stay intact."""
+        self.db.execute("UPDATE tasks SET status='cancelled',error='Processing cancelled',next_attempt=0 "
+                        "WHERE job=? AND status NOT IN ('succeeded','deleted','cancelled')", (job,))
+        self.db.execute("UPDATE local_names SET status='cancelled',error=NULL WHERE job=? "
+                        "AND status IN ('pending','planned','retry')", (job,))
+
     def reconcile_safety(self):
         """Withdraw queued work, or resume only this distinct safety hold."""
         jobs = self.db.execute("SELECT DISTINCT job FROM tasks WHERE status IN ('pending','retry','safety_held')").fetchall()
         for row in jobs:
             try:
                 self.require_processing(row["job"])
+            except ProcessingCancelled:
+                with self.db:
+                    self.stop_remaining(row["job"])
             except RecordingSafetyHold as error:
                 with self.db:
                     self.db.execute("UPDATE tasks SET status='safety_held',error=? WHERE job=? "
@@ -323,7 +341,7 @@ class Queue:
         from quill_workflow.local_deletion import MARKER
         if os.path.lexists(Path(session).expanduser() / MARKER):
             raise WorkflowError("This local meeting was deleted; completion cannot enqueue it again")
-        read_safety(Path(session).expanduser())
+        processing_safety(Path(session).expanduser())
         # Relocation and repeated hooks share the same database lock. Keep it
         # through snapshotting so a completed folder cannot move mid-copy.
         from quill_workflow.local_naming import relocated_job
@@ -334,6 +352,16 @@ class Queue:
                 self.db.rollback()
                 return previous
             info = Path(session).expanduser().stat()
+            source = Path(session).expanduser()
+            safety = processing_safety(source)
+            candidates = self.db.execute("SELECT started,session_id FROM processing_cancellations "
+                                         "WHERE (device=? AND inode=?) OR session_id=?",
+                                         (info.st_dev, info.st_ino, (safety or {}).get("session_id"))).fetchall()
+            if candidates:
+                started = read_json(safe_member(source, "meta.json"), 100_000).get("started")
+                if any(row["started"] == started and row["session_id"] == (safety or {}).get("session_id")
+                       for row in candidates):
+                    raise ProcessingCancelled("Processing cancelled; this meeting cannot be queued again")
             for row in self.db.execute("SELECT record FROM local_deletions"):
                 tree = json.loads(row[0])["snapshot"]["trees"][0]
                 if (info.st_dev, info.st_ino) == (tree["device"], tree["inode"]):
@@ -626,13 +654,16 @@ class Queue:
                 with self.db:
                     self.db.execute("UPDATE tasks SET status=CASE WHEN status='deleted' THEN 'deleted' ELSE 'succeeded' END,receipt=?,error=NULL "
                                     "WHERE job=? AND stage=?", (json.dumps(receipt), row["job"], row["stage"]))
+            except ProcessingCancelled:
+                with self.db:
+                    self.stop_remaining(row["job"])
             except RecordingSafetyHold as error:
                 with self.db:
-                    self.db.execute("UPDATE tasks SET status='safety_held',error=? WHERE job=? AND stage=? AND status<>'deleted'",
+                    self.db.execute("UPDATE tasks SET status='safety_held',error=? WHERE job=? AND stage=? AND status NOT IN ('deleted','cancelled')",
                                     (str(error), row["job"], row["stage"]))
             except NeedsConfiguration as error:
                 with self.db:
-                    self.db.execute("UPDATE tasks SET status='held',error=? WHERE job=? AND stage=? AND status<>'deleted'",
+                    self.db.execute("UPDATE tasks SET status='held',error=? WHERE job=? AND stage=? AND status NOT IN ('deleted','cancelled')",
                                     (str(error), row["job"], row["stage"]))
             except Exception as error:
                 recoverable_upload = row["stage"] == "archive" and isinstance(error, RecoverableUploadError)
@@ -641,14 +672,15 @@ class Queue:
                 # Clamp before exponentiation even after arbitrarily many retries.
                 delay = min(3600, 30 * (2 ** min(7, max(0, attempt - 1))))
                 with self.db:
-                    self.db.execute("UPDATE tasks SET status=?,next_attempt=?,error=? WHERE job=? AND stage=? AND status<>'deleted'",
+                    self.db.execute("UPDATE tasks SET status=?,next_attempt=?,error=? WHERE job=? AND stage=? AND status NOT IN ('deleted','cancelled')",
                                     ("failed" if failed else "retry", now + delay,
                                      str(error)[:500], row["job"], row["stage"]))
             else:
                 # Completion observers run only after the receipt commits.
                 # A failed optional follow-up must never undo successful
                 # filing or cause the connector to upload a second copy.
-                if on_completed is not None and not self.db.execute("SELECT 1 FROM local_deletions WHERE job=?", (row["job"],)).fetchone():
+                from .local_deletion import stopped_jobs
+                if on_completed is not None and row["job"] not in stopped_jobs(self.state):
                     try:
                         on_completed(row["stage"], row["job"], dict(receipt))
                     except Exception:

@@ -291,6 +291,14 @@ class ReviewLibraryTests(unittest.TestCase):
         self.assertEqual(result["storage_status"], "upload_uncertain")
         self.assertEqual(result["storage"]["document"]["status"], "confirmed")
 
+    def test_cancelled_upload_keeps_confirmed_and_in_flight_evidence(self):
+        self.unset_stage("archive", "cancelled")
+        result = self.view()
+        self.assertEqual(result["storage"]["media"]["status"], "cancelled")
+        self.assertEqual(result["storage"]["document"]["status"], "confirmed")
+        atomic_json(self.result / "drive-archive.json", {"operations": {"file:mic.caf": {"state": "dispatched"}}})
+        self.assertEqual(self.view()["storage"]["media"]["status"], "uncertain")
+
     def test_missing_or_mismatched_receipt_cannot_confirm(self):
         for path in (self.result / "publish-receipt.json", self.result / "drive-publish.json"):
             original = path.read_bytes()

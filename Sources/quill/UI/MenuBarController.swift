@@ -30,6 +30,9 @@ final class MenuBarController {
     private let statusItem: NSStatusItem?
     private let stateLabel: NSMenuItem
     private let transcriptionLabel: NSMenuItem
+    private let cancelTranscriptionItem: NSMenuItem
+    private var currentTranscription: (session: String, reservation: UUID)?
+    private var displayedTranscription: (session: String, reservation: UUID)?
     private let processingItem: NSMenuItem
     private let toggleItem: NSMenuItem
     private let pauseItem: NSMenuItem
@@ -61,6 +64,7 @@ final class MenuBarController {
     var onSettings: (() -> Void)?
     var onReviewMeetings: (() -> Void)?
     var onRetryTranscriptions: (() -> Void)?
+    var onCancelTranscription: ((String, UUID) -> Void)?
     var onShowControls: (() -> Void)?
     var onWarningHistory: (() -> Void)?
     var onStopRecording: ((String, Int?) -> Void)?
@@ -82,6 +86,12 @@ final class MenuBarController {
         transcriptionLabel.isEnabled = false
         transcriptionLabel.isHidden = true
         menu.addItem(transcriptionLabel)
+
+        cancelTranscriptionItem = NSMenuItem(title: "Cancel transcription", action: #selector(cancelTranscriptionClicked), keyEquivalent: "")
+        cancelTranscriptionItem.toolTip = "Stop processing this meeting and keep its local files."
+        cancelTranscriptionItem.isHidden = true
+        cancelTranscriptionItem.isEnabled = false
+        menu.addItem(cancelTranscriptionItem)
 
         processingItem = NSMenuItem(title: "", action: #selector(reviewClicked), keyEquivalent: "")
         processingItem.isHidden = true
@@ -168,7 +178,7 @@ final class MenuBarController {
         )
         menu.addItem(quit)
 
-        for item in [processingItem, showControls, warningHistory, automaticItem, screenVideoItem, toggleItem, pauseItem, skipItem, retryItem, openFolder, reviewItem, transcriptionRetryItem, settings, about, quit] {
+        for item in [processingItem, showControls, warningHistory, automaticItem, screenVideoItem, toggleItem, pauseItem, skipItem, retryItem, openFolder, reviewItem, transcriptionRetryItem, cancelTranscriptionItem, settings, about, quit] {
             item.target = self
         }
 
@@ -180,7 +190,7 @@ final class MenuBarController {
                 ("Quill", [about, settings, .separator(), quit]),
                 ("Recording", [toggleItem, pauseItem, .separator(), automaticItem, screenVideoItem,
                                skipItem, retryItem, .separator(), showControls]),
-                ("Meetings", [reviewItem, openFolder, transcriptionRetryItem, .separator(), warningHistory])
+                ("Meetings", [transcriptionLabel, cancelTranscriptionItem, reviewItem, openFolder, transcriptionRetryItem, .separator(), warningHistory])
             ]
             for (title, items) in sections {
                 let section = NSMenu(title: title)
@@ -189,7 +199,7 @@ final class MenuBarController {
                 let parent = NSMenuItem(title: title, action: nil, keyEquivalent: "")
                 parent.submenu = section
                 menu.addItem(parent)
-                if title == "Recording" { section.delegate = menuDelegate }
+                if title == "Recording" || title == "Meetings" { section.delegate = menuDelegate }
             }
         } else {
             statusItem?.menu = menu
@@ -198,6 +208,7 @@ final class MenuBarController {
         menuDelegate.onWillOpen = { [weak self] in
             guard let self else { return }
             self.bindRecordingAction()
+            self.bindTranscriptionAction()
             self.menuIsTracking = true
         }
         menuDelegate.onDidClose = { [weak self] in self?.menuIsTracking = false }
@@ -293,9 +304,24 @@ final class MenuBarController {
     /// Show transcription progress/failure as a second status line in the
     /// menu; nil hides it. Independent of recording state — a new recording
     /// can run while the last one transcribes.
-    func updateTranscription(_ text: String?) {
+    func updateTranscription(_ text: String?, cancelTarget: (session: String, reservation: UUID)? = nil) {
         transcriptionLabel.title = text ?? ""
         transcriptionLabel.isHidden = text == nil
+        currentTranscription = cancelTarget
+        // A queue rollover while the pointer is over Cancel must not retarget the click.
+        if !menuIsTracking { bindTranscriptionAction() }
+        cancelTranscriptionItem.isEnabled = cancelTarget != nil && displayedTranscription?.reservation == cancelTarget?.reservation
+    }
+
+    private func bindTranscriptionAction() {
+        displayedTranscription = currentTranscription
+        cancelTranscriptionItem.isHidden = currentTranscription == nil
+        cancelTranscriptionItem.isEnabled = currentTranscription != nil
+    }
+
+    @objc private func cancelTranscriptionClicked() {
+        guard let target = displayedTranscription, target.reservation == currentTranscription?.reservation else { return }
+        onCancelTranscription?(target.session, target.reservation)
     }
 
     // Inlined Lucide feather SVG. Keeping it in source means the executable

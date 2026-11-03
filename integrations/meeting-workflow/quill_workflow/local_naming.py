@@ -251,5 +251,5 @@ def name_pending(queue, config):
             name_session(queue, row["job"])
         except Exception as error:
             with queue.db:
-                queue.db.execute("UPDATE local_names SET status='retry',error=? WHERE job=? AND status<>'deleted'",
+                queue.db.execute("UPDATE local_names SET status='retry',error=? WHERE job=? AND status NOT IN ('deleted','cancelled')",
                                  (str(error)[:500], row["job"]))

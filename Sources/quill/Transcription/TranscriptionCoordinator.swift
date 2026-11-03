@@ -13,8 +13,9 @@ import MeetingWorkflow
 actor TranscriptionCoordinator {
     enum Status: Sendable {
         case idle
-        case preparing
-        case transcribing(session: String, queued: Int)
+        case preparing(session: String, reservation: UUID)
+        case transcribing(session: String, queued: Int, reservation: UUID)
+        case cancelling(session: String, queued: Int, reservation: UUID)
         case failed(session: String)
     }
 
@@ -30,6 +31,13 @@ actor TranscriptionCoordinator {
     private var draining = false
     private var activeSession: URL?
     private var activeCompletion: String?
+    private struct Reservation {
+        let id = UUID()
+        let session: URL
+        let sessionID: UUID?
+        let lease: RecordingReviewGate.ProcessingLease
+    }
+    private var reservation: Reservation?
     private var engine: TranscriptionEngine?
     private var lastFailure: URL?
     private var status: Status = .idle
@@ -42,6 +50,35 @@ actor TranscriptionCoordinator {
 
     func setStatusHandler(_ handler: @escaping @Sendable (Status) -> Void) {
         statusHandler = handler
+    }
+
+    /// A menu action carries the reservation that produced its label. Never
+    /// substitute the next session, even when it reuses the same folder name.
+    func cancelActiveTranscription(expectedSession: String, expectedReservation: UUID) throws -> Bool {
+        guard let reservation, reservation.id == expectedReservation,
+              reservation.session.lastPathComponent == expectedSession,
+              try RecordingReviewGate.cancelLeasedTranscription(session: reservation.session,
+                sessionID: reservation.sessionID, lease: reservation.lease) else { return false }
+        refreshProcessingCancellations()
+        return true
+    }
+
+    func refreshProcessingCancellations() {
+        let previousCount = queue.count
+        queue.removeAll { RecordingReviewGate.processingCancellationRequested(session: $0.dir) }
+        var reconcileJournal = previousCount != queue.count
+        defer { if reconcileJournal { try? journal.reconcileCancellations() } }
+        if let lastFailure, RecordingReviewGate.processingCancellationRequested(session: lastFailure) {
+            self.lastFailure = nil
+            reconcileJournal = true
+            if case .failed = status { publish(.idle) }
+        }
+        if let reservation, RecordingReviewGate.processingCancellationRequested(session: reservation.session) {
+            if case .cancelling(_, let queued, let id) = status,
+               queued == queue.count, id == reservation.id { return }
+            reconcileJournal = true
+            publish(.cancelling(session: reservation.session.lastPathComponent, queued: queue.count, reservation: reservation.id))
+        } else if previousCount != queue.count { refreshQueueStatus() }
     }
 
     /// Queue a finished session. With transcription disabled in config, the
@@ -76,6 +113,7 @@ actor TranscriptionCoordinator {
     /// Retry only sessions already opted into transcription. This neither
     /// registers new hooks nor retries previously delivered downstream work.
     func retryPending(root: URL) -> RetryResult {
+        refreshProcessingCancellations()
         guard Config.transcriptionEnabled() else { return .disabled }
         let registered = (try? journal.jobs()) ?? []
         let count = queuePending(root: root, registered: registered)
@@ -133,8 +171,8 @@ actor TranscriptionCoordinator {
     }
 
     private func refreshQueueStatus() {
-        if case .transcribing(let session, _) = status, activeSession != nil {
-            publish(.transcribing(session: session, queued: queue.count))
+        if case .transcribing(let session, _, let id) = status, reservation?.id == id {
+            publish(.transcribing(session: session, queued: queue.count, reservation: id))
         }
     }
 
@@ -154,7 +192,7 @@ actor TranscriptionCoordinator {
             // preparation, so repeated scans cannot enqueue this session again.
             activeSession = dir
             activeCompletion = work.completion
-            defer { activeSession = nil; activeCompletion = nil }
+            defer { reservation = nil; activeSession = nil; activeCompletion = nil }
             guard !RecordingReviewGate.blocksProcessing(session: dir) else { continue }
             let lease: RecordingReviewGate.ProcessingLease
             do { lease = try RecordingReviewGate.acquireProcessingLease(session: dir) }
@@ -180,13 +218,14 @@ actor TranscriptionCoordinator {
             guard TranscriptionRecovery.isPending(session: dir, root: dir.deletingLastPathComponent(),
                                                   registeredWaiting: work.completion != nil) else { continue }
             do {
+                reservation = try Reservation(session: dir, sessionID: RecordingReviewGate.read(session: dir)?.sessionID, lease: lease)
                 try await transcribeUntilCancelled(dir)
                 try RecordingReviewGate.requireProcessingAllowed(session: dir)
                 if lastFailure == dir { lastFailure = nil }
                 notifyUser(title: "quill — transcript ready", body: dir.lastPathComponent)
                 runHook(completion: activeCompletion, for: dir)
             } catch is CancellationError {
-                // A confirmed removal cancels this session only. Keep the
+                // A user cancellation or removal stops this session only. Keep the
                 // shared lease until all model work has actually unwound.
             } catch RecordingReviewGate.GateError.processingHeld {
                 // A held/deleted session must not acquire new output or hooks.
@@ -205,6 +244,7 @@ actor TranscriptionCoordinator {
         }
         await engine?.release()
         engine = nil
+        refreshProcessingCancellations()
         publish(lastFailure.map { .failed(session: $0.lastPathComponent) } ?? .idle)
         draining = false
         // An enqueue that landed between the loop exiting and the release
@@ -219,6 +259,7 @@ actor TranscriptionCoordinator {
                 while true {
                     try Task.checkCancellation()
                     guard !RecordingReviewGate.blocksProcessing(session: dir) else {
+                        await self.refreshProcessingCancellations()
                         throw CancellationError()
                     }
                     try await Task.sleep(for: .milliseconds(250))
@@ -237,7 +278,8 @@ actor TranscriptionCoordinator {
         let meta = try SessionMeta.read(from: dir)
         let engine = try await preparedEngine()
         try RecordingReviewGate.requireProcessingAllowed(session: dir)
-        publish(.transcribing(session: dir.lastPathComponent, queued: queue.count))
+        guard let reservation, reservation.session == dir else { throw CancellationError() }
+        publish(.transcribing(session: dir.lastPathComponent, queued: queue.count, reservation: reservation.id))
 
         var merged: [Transcript.Segment] = []
         var speakers: [String: Transcript.Speaker] = [:]
@@ -332,7 +374,8 @@ actor TranscriptionCoordinator {
 
     private func preparedEngine() async throws -> TranscriptionEngine {
         if let engine { return engine }
-        publish(.preparing)
+        guard let reservation else { throw CancellationError() }
+        publish(.preparing(session: reservation.session.lastPathComponent, reservation: reservation.id))
         let configured = Config.transcriptionEngine()
         if configured != "parakeet" {
             FileHandle.standardError.write(Data(

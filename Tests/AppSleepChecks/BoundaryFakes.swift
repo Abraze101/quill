@@ -197,6 +197,7 @@ final class MenuBarController {
     var onSkipMeeting: (() -> Void)?
     var onRetryMeeting: ((String) -> Void)?
     var onRetryTranscriptions: (() -> Void)?
+    var onCancelTranscription: ((String, UUID) -> Void)?
     var onSettings: (() -> Void)?
     var onReviewMeetings: (() -> Void)?
     var onShowControls: (() -> Void)?
@@ -206,7 +207,7 @@ final class MenuBarController {
     func update(recording: Bool, elapsed: String?) {}
     func updateOptions(_ options: MenuBarOptions) {}
     func updateStatus(_ snapshot: RecordingStatusSnapshot) {}
-    func updateTranscription(_ text: String?) {}
+    func updateTranscription(_ text: String?, cancelTarget: (session: String, reservation: UUID)? = nil) {}
 }
 
 @MainActor
@@ -344,10 +345,15 @@ final class CompletionJournal {
 
 @MainActor
 final class TranscriptionCoordinator {
-    enum Status: Sendable { case idle, preparing, transcribing(session: String, queued: Int), failed(session: String) }
+    enum Status: Sendable {
+        case idle, preparing(session: String, reservation: UUID), transcribing(session: String, queued: Int, reservation: UUID)
+        case cancelling(session: String, queued: Int, reservation: UUID), failed(session: String)
+    }
     enum RetryResult { case disabled, queued(Int) }
     func setStatusHandler(_ handler: @Sendable @escaping (Status) -> Void) async {}
     func resumePending(root: URL) async {}
+    func refreshProcessingCancellations() async {}
+    func cancelActiveTranscription(expectedSession: String, expectedReservation: UUID) async throws -> Bool { false }
     func retryPending(root: URL) async -> RetryResult {
         Fixture.retryCalls += 1
         await Fixture.retryGate.wait()

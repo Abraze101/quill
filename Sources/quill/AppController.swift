@@ -61,6 +61,7 @@ final class AppController {
     private var ticker: Timer?
     private var shuttingDown = false
     private var transcriptionRetryInFlight = false
+    private var transcriptionCancellationInFlight = false
     private var completionWorker: Process?
     private var completionWorkerID: UUID?
     private var completionRecovery = CompletionWorkerRecovery()
@@ -203,6 +204,9 @@ final class AppController {
         }
         menu.onOpenFolder = { [weak self] in self?.openFolder() }
         menu.onRetryTranscriptions = { [weak self] in self?.retryTranscriptions() }
+        menu.onCancelTranscription = { [weak self] session, reservation in
+            self?.cancelTranscription(session: session, reservation: reservation)
+        }
         menu.onQuit = { [weak self] in self?.shutdown() }
         menu.onSettings = { [weak self] in self?.showSettings() }
         menu.onShowControls = { [weak self] in self?.showRecordingControls() }
@@ -830,6 +834,7 @@ final class AppController {
     private func refreshUI() {
         updateMeetingReminder()
         if Date().timeIntervalSince(completionStatusChecked) >= 5 {
+            Task { [transcription] in await transcription.refreshProcessingCancellations() }
             completionStatus = CompletionUIStatus(settingsURL: Config.workflowSettingsURL(), statusURL: Config.completionStatusURL())
             completionStatusChecked = Date()
             notifyCompletionIssueIfNeeded()
@@ -1516,13 +1521,32 @@ final class AppController {
         }
     }
 
+    private func cancelTranscription(session: String, reservation: UUID) {
+        guard !shuttingDown, !transcriptionCancellationInFlight else { return }
+        transcriptionCancellationInFlight = true
+        Task { [weak self, transcription] in
+            guard let self else { return }
+            defer { transcriptionCancellationInFlight = false }
+            do {
+                let accepted = try await transcription.cancelActiveTranscription(expectedSession: session, expectedReservation: reservation)
+                if !accepted && !shuttingDown {
+                    showInformation("Transcription has changed", "Open Review processing to see the remaining work for this meeting.")
+                }
+            } catch {
+                if !shuttingDown { showInformation("Couldn’t cancel transcription", "Open Review processing and try again for this meeting.") }
+            }
+        }
+    }
+
     private func showTranscription(_ status: TranscriptionCoordinator.Status) {
         for menu in menus {
             switch status {
             case .idle: menu.updateTranscription(nil)
-            case .preparing: menu.updateTranscription("Preparing local transcription…")
-            case .transcribing(let name, let queued):
-                menu.updateTranscription(queued > 0 ? "transcribing \(name) · \(queued) queued" : "transcribing \(name)")
+            case .preparing(let name, let reservation):
+                menu.updateTranscription("Preparing transcription · \(name)", cancelTarget: (name, reservation))
+            case .transcribing(let name, let queued, let reservation):
+                menu.updateTranscription(queued > 0 ? "Transcribing \(name) · \(queued) queued" : "Transcribing \(name)", cancelTarget: (name, reservation))
+            case .cancelling(let name, _, _): menu.updateTranscription("Cancelling transcription · \(name)")
             case .failed(let name): menu.updateTranscription("transcription failed · \(name)")
             }
         }

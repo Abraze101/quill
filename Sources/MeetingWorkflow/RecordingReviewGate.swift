@@ -8,6 +8,7 @@ import CoreFoundation
 public enum RecordingReviewGate {
     public static let filename = "recording-safety.json"
     public static let deletionFilename = ".quill-deleted.json"
+    public static let processingCancellationFilename = ".quill-processing-cancelled.json"
     public static let processingLockFilename = ".meeting-files.lock"
     public static let processingLeaseMarkerFilename = ".meeting-files-v1.json"
     public enum Owner: String, Codable, Sendable { case manual, automatic }
@@ -23,7 +24,19 @@ public enum RecordingReviewGate {
     /// all session reads/writes. It is acquired without waiting on a UI action.
     public final class ProcessingLease {
         private let descriptor: Int32
-        fileprivate init(descriptor: Int32) { self.descriptor = descriptor }
+        fileprivate let directoryDevice: dev_t
+        fileprivate let directoryInode: ino_t
+        fileprivate init(descriptor: Int32, directory: stat) {
+            self.descriptor = descriptor
+            directoryDevice = directory.st_dev
+            directoryInode = directory.st_ino
+        }
+        fileprivate func stillProtects(_ directory: Int32) -> Bool {
+            var held = stat(), current = stat()
+            return fstat(descriptor, &held) == 0 && held.st_nlink == 1
+                && fstatat(directory, RecordingReviewGate.processingLockFilename, &current, AT_SYMLINK_NOFOLLOW) == 0
+                && held.st_dev == current.st_dev && held.st_ino == current.st_ino
+        }
         deinit { flock(descriptor, LOCK_UN); close(descriptor) }
     }
 
@@ -60,6 +73,7 @@ public enum RecordingReviewGate {
         guard fstat(directory, &directoryInfo) == 0,
               directoryInfo.st_mode & S_IFMT == S_IFDIR else { throw LeaseError.unavailable }
         guard !hasDeletionMarker(directory: directory) else { throw LeaseError.deleted }
+        if requiresApproval, markerBlocks(directory, processingCancellationFilename) { throw GateError.processingHeld }
         let descriptor = openat(directory, processingLockFilename, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, 0o600)
         guard descriptor >= 0 else { throw LeaseError.unavailable }
         var transferred = false
@@ -87,7 +101,7 @@ public enum RecordingReviewGate {
         else { try requireCompletedManagedSession(session) }
         try ensureProcessingLeaseMarker(directory: directory)
         transferred = true
-        return ProcessingLease(descriptor: descriptor)
+        return ProcessingLease(descriptor: descriptor, directory: directoryInfo)
     }
 
     private static func requireCompletedManagedSession(_ session: URL) throws {
@@ -150,9 +164,71 @@ public enum RecordingReviewGate {
     }
 
     private static func hasDeletionMarker(directory: Int32) -> Bool {
+        markerBlocks(directory, deletionFilename)
+    }
+
+    /// Any marker node, even malformed or a dangling link, is a stop signal.
+    /// Unexpected lookup failures also prohibit processing, without following links.
+    private static func markerBlocks(_ directory: Int32, _ name: String) -> Bool {
         var info = stat()
-        if fstatat(directory, deletionFilename, &info, AT_SYMLINK_NOFOLLOW) == 0 { return true }
+        if fstatat(directory, name, &info, AT_SYMLINK_NOFOLLOW) == 0 { return true }
         return errno != ENOENT
+    }
+
+    /// A missing/inaccessible folder is not evidence of a user cancellation.
+    public static func processingCancellationRequested(session: URL) -> Bool {
+        guard session.isFileURL else { return false }
+        let directory = open(session.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard directory >= 0 else { return false }
+        defer { close(directory) }
+        var info = stat()
+        return fstatat(directory, processingCancellationFilename, &info, AT_SYMLINK_NOFOLLOW) == 0
+    }
+
+    /// Publish only for the exact unfinished transcript whose directory and
+    /// processing lease the caller already owns. Never replace an existing
+    /// marker or let a same-named replacement capture a stale menu action.
+    public static func cancelLeasedTranscription(session: URL, sessionID: UUID?,
+                                                  lease: ProcessingLease) throws -> Bool {
+        guard session.isFileURL else { return false }
+        let directory = open(session.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard directory >= 0 else { return false }
+        defer { close(directory) }
+        var info = stat()
+        guard fstat(directory, &info) == 0, info.st_dev == lease.directoryDevice,
+              info.st_ino == lease.directoryInode, lease.stillProtects(directory), !hasDeletionMarker(directory: directory),
+              !markerBlocks(directory, "transcript.json"),
+              !markerBlocks(directory, processingCancellationFilename),
+              hasFinalizedMetadata(session: session),
+              !blocksProcessing(session: session), try read(session: session)?.sessionID == sessionID else { return false }
+        var marker: [String: Any] = ["schema_version": 1, "reason": "user_requested",
+                                     "cancelled_at": Date().timeIntervalSince1970]
+        if let sessionID { marker["session_id"] = sessionID.uuidString }
+        let data = try JSONSerialization.data(withJSONObject: marker, options: .sortedKeys)
+        let temporary = ".quill-cancel-\(UUID().uuidString).tmp"
+        let fd = openat(directory, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { throw LeaseError.unavailable }
+        defer { close(fd); unlinkat(directory, temporary, 0) }
+        try data.withUnsafeBytes { bytes in
+            var offset = 0
+            while offset < bytes.count {
+                let count = Darwin.write(fd, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
+                if count < 0, errno == EINTR { continue }
+                guard count > 0 else { throw LeaseError.unavailable }
+                offset += count
+            }
+        }
+        guard fsync(fd) == 0 else { throw LeaseError.unavailable }
+        guard lstat(session.path, &info) == 0, info.st_dev == lease.directoryDevice,
+              info.st_ino == lease.directoryInode, lease.stillProtects(directory), !hasDeletionMarker(directory: directory),
+              !markerBlocks(directory, "transcript.json"), try read(session: session)?.sessionID == sessionID else { return false }
+        guard linkat(directory, temporary, directory, processingCancellationFilename, 0) == 0 else {
+            if errno == EEXIST { return false }
+            throw LeaseError.unavailable
+        }
+        unlinkat(directory, temporary, 0)
+        guard fsync(directory) == 0 else { throw LeaseError.unavailable }
+        return true
     }
 
     private static func sessionIsAvailable(_ session: URL) -> Bool {
@@ -161,6 +237,7 @@ public enum RecordingReviewGate {
         guard directory >= 0 else { return false }
         defer { close(directory) }
         return !hasDeletionMarker(directory: directory)
+            && !markerBlocks(directory, processingCancellationFilename)
             && (try? hasValidProcessingLeaseMarker(directory: directory)) != nil
     }
 

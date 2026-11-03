@@ -67,6 +67,60 @@ class ReviewServerTests(unittest.TestCase):
         path.write_text(content)
         return path
 
+    def test_cancel_processing_targets_exact_meeting_without_deleting_or_releasing_work(self):
+        option = {"job": "local-sample", "revision": "r1", "title": "Synthetic meeting",
+                  "phase": "transcription", "state": "available", "recorded_at": 200}
+        self.server.cancellation_options = lambda job=None: [option] if job in (None, option["job"]) else []
+        calls = []
+        def cancel(job, revision):
+            calls.append((job, revision))
+            if (job, revision) != ("local-sample", "r1"):
+                raise ValueError("Stale revision")
+            option.update(state="cancelling", revision="r2")
+        self.server.on_cancel_processing = cancel
+        self.server.on_delete = lambda *a, **kw: self.fail("Cancellation must never delete files")
+        status, _, page = self.detail("local-sample", "transcript")
+        self.assertEqual(status, 200)
+        self.assertIn("Transcription pending", page)
+        self.assertIn('value="cancel_processing">Cancel transcription', page)
+        self.assertLess(page.index('value="cancel_processing"'), page.index('More meeting actions'))
+        self.assertNotIn('value="cancel_processing"', self.detail("test-job")[2])
+        self.assertEqual(calls, [])
+
+        action = self.server.review_path + "decision"
+        form = {"action": "cancel_processing", "job": "local-sample", "revision": "r1"}
+        self.assertEqual(self.request("POST", action, urlencode(form), {"Origin": "https://example.com"})[0], 403)
+        self.assertEqual(self.request("POST", action, urlencode(dict(form, company_id="example")))[0], 400)
+        self.assertEqual(self.request("POST", action, urlencode(dict(form, revision="")))[0], 400)
+        self.assertEqual(calls, [])
+        self.assertEqual(self.request("POST", action, urlencode(dict(form, revision="stale")))[0], 409)
+        self.assertEqual(option["state"], "available")
+        status, headers, _ = self.request("POST", action, urlencode(form))
+        self.assertEqual(status, 303)
+        self.assertIn("meeting=" + _selection("local-sample"), headers["Location"])
+        self.assertEqual(calls, [("local-sample", "stale"), ("local-sample", "r1")])
+        page = self.request(path=headers["Location"])[2]
+        self.assertIn("Stopping processing…", page)
+        self.assertNotIn('value="cancel_processing"', page)
+        self.assertNotIn("move to Trash", page)
+        option["state"] = "cancelled"
+        page = self.detail("local-sample")[2]
+        self.assertIn("Processing cancelled", page)
+        self.assertNotIn("Notes will appear", page)
+        self.assertEqual(self.decisions, [])
+
+    def test_stale_folder_and_sharing_forms_after_cancellation_do_not_dispatch(self):
+        self.server.on_sharing = lambda *a, **kw: self.fail("Stale sharing callback dispatched")
+        for state in ("cancelling", "cancelled"):
+            self.server.cancellation_options = lambda job: [{"job": job, "state": state}]
+            status, _, page = self.decide()
+            self.assertEqual(status, 409)
+            self.assertIn("This action is no longer available", page)
+            self.assertEqual(self.request("POST", self.server.review_path + "decision", urlencode({
+                "job": "test-job", "revision": "old", "action": "sharing_confirm"}))[0], 409)
+            self.assertEqual(self.reviews.get("test-job")["status"], "pending")
+            self.assertEqual(self.decisions, [])
+
     def test_loopback_token_and_escaped_review_contents(self):
         self.write_notes('# Notes <script>alert("notes")</script>\nMeeting & action items')
         status, headers, body = self.detail()

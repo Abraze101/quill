@@ -296,8 +296,8 @@ class RoutingReviews:
     def list(self, status=None):
         if status is not None and status not in ("pending", "approved", "skipped"):
             raise RoutingError("Unknown review status")
-        from .local_deletion import deleted_jobs
-        removed = deleted_jobs(self.state.absolute())
+        from .local_deletion import stopped_jobs
+        removed = stopped_jobs(self.state.absolute())
         records = [json.loads(row[0]) for row in self.db.execute("SELECT record FROM routing_reviews")]
         records = [record for record in records if record["job"] not in removed]
         return sorted((record for record in records if status is None or record["status"] == status),
@@ -356,9 +356,9 @@ class RoutingReviews:
             raise
 
     def _decide(self, job, expected_revision, company_id=None, skip=False):
-        from .local_deletion import deleted_jobs
-        if job in deleted_jobs(self.state.absolute()):
-            raise RoutingError("This local meeting was deleted; its review is closed")
+        from .local_deletion import stopped_jobs
+        if job in stopped_jobs(self.state.absolute()):
+            raise RoutingError("Processing stopped for this meeting; its routing review is closed")
         self.db.execute("BEGIN IMMEDIATE")
         try:
             record = self.get(job)

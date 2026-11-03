@@ -76,9 +76,9 @@ class SharingReviews:
             except BlockingIOError as error:
                 raise WorkflowError("Software recovery is in progress; reopen this review when it finishes") from error
             with self._job_lock(job):
-                from .local_deletion import deleted_jobs
-                if job in deleted_jobs(self.state):
-                    raise WorkflowError("This local meeting was deleted; sharing is stopped")
+                from .local_deletion import stopped_jobs
+                if job in stopped_jobs(self.state, job):
+                    raise WorkflowError("Processing stopped for this meeting; sharing is stopped")
                 yield
 
     @contextmanager
@@ -123,11 +123,12 @@ class SharingReviews:
             raise WorkflowError("Automatic calendar lookup was turned off or its settings changed. Find attendees manually to retry.")
 
     def _eligible_automatic_jobs(self, since):
+        from .local_deletion import stopped_jobs
         queue = Queue(self.state)
         try:
             return {row[0] for row in queue.db.execute(
                 "SELECT j.id FROM jobs j JOIN tasks t ON j.id=t.job "
-                "WHERE j.created>=? AND t.stage='publish' AND t.status='succeeded'", (since,))}
+                "WHERE j.created>=? AND t.stage='publish' AND t.status='succeeded'", (since,))} - stopped_jobs(self.state)
         finally:
             queue.close()
 
@@ -281,12 +282,17 @@ class SharingReviews:
         finally:
             queue.close()
         jobs.extend(row[0] for row in self.db.execute("SELECT job FROM sharing_reviews") if row[0] not in jobs)
-        from .local_deletion import deleted_jobs
-        removed = deleted_jobs(self.state)
+        from .local_deletion import deleted_jobs, stopped_jobs
+        removed, stopped = deleted_jobs(self.state), stopped_jobs(self.state)
         cards = []
         for job in jobs:
             if job in removed:
                 continue
+            if job in stopped:
+                # Previously submitted permission changes remain auditable.
+                record = self.get(job)
+                if not record or not (record.get("approval") or record.get("status") == "shared"):
+                    continue
             try:
                 card = self.card(job)
                 if card["status"] != "private":
@@ -439,7 +445,7 @@ class SharingReviews:
         return context
 
     def run_suggestions(self, job, revision, invoke=None, suggest=None):
-        from .local_deletion import deleted_jobs
+        from .local_deletion import stopped_jobs
         with self.locked(job):
             record = self.get(job)
             if (not record or record["revision"] != revision or record.get("suggestion_status") != "searching"
@@ -460,12 +466,14 @@ class SharingReviews:
                     transport = CodexCalendarTransport(settings.get("codex", "/Applications/Codex.app/Contents/Resources/codex"),
                         account_email=snapshot["owner"],
                         timeout=min(90, max(1, int(settings.get("timeout_seconds", 180)))))
-                    transport.cancelled = lambda: job in deleted_jobs(self.state)
+                    transport.cancelled = lambda: job in stopped_jobs(self.state, job)
                     invoke = transport.invoke
                 if suggest is None:
                     from .recipient_suggestions import suggest_recipients
                     suggest = suggest_recipients
                 def guarded(tool, arguments):
+                    if job in stopped_jobs(self.state, job):
+                        raise WorkflowError("Processing stopped for this meeting; the calendar lookup was cancelled")
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise WorkflowError("The calendar lookup reached its time limit; review partial results or retry")
@@ -501,7 +509,7 @@ class SharingReviews:
             return copy.deepcopy(record)
 
     def run(self, job, revision, adapter=None):
-        from .local_deletion import deleted_jobs
+        from .local_deletion import deleted_jobs, stopped_jobs
         with self.locked(job):
             record = self.get(job)
             if not record or record["revision"] != revision or record["status"] not in ("preparing", "sharing"):
@@ -509,6 +517,8 @@ class SharingReviews:
             try:
                 snapshot = self._current(record)
                 def guard():
+                    if job in stopped_jobs(self.state, job):
+                        raise WorkflowError("Processing stopped for this meeting; sharing is stopped")
                     live = self.get(job)
                     if (not live or live["revision"] != revision or live["status"] != record["status"]
                             or live.get("recipients") != record["recipients"] or live.get("approval") != record.get("approval")):
@@ -528,6 +538,7 @@ class SharingReviews:
                     transport = CodexSharingTransport(settings.get("codex", "/Applications/Codex.app/Contents/Resources/codex"),
                         account_link_id=snapshot.get("account_link_id"),
                         model=settings.get("model"), timeout=min(7200, max(1, int(settings.get("timeout_seconds", 180)))))
+                    # Let an in-flight permission write return its receipt; guard() blocks the next call.
                     transport.cancelled = lambda: job in deleted_jobs(self.state)
                     adapter = SharingDrive(transport.invoke)
                 save = lambda: self.put(record)

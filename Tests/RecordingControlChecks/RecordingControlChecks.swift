@@ -9,6 +9,7 @@ struct RecordingControlChecks {
         checkMeetingReminder()
         checkRecordingHeartbeat()
         checkTranscriptionRetryMenu()
+        checkTranscriptionCancellationMenus()
         checkWarningHistoryMenu()
         checkApplicationMenus()
         let suiteName = "com.digimata.quill.control-tests.\(UUID().uuidString)"
@@ -426,6 +427,35 @@ struct RecordingControlChecks {
         expect(Set(NSApp.windows.filter(\.isVisible).map(\.windowNumber)) == visibleWindows,
             "Application menus must not create another status surface or open a window")
         print("Application menus: grouped actions, callbacks, keyboard shortcuts, state, guarded actions, and session-bound Stop/Pause passed")
+    }
+
+    @MainActor
+    static func checkTranscriptionCancellationMenus() {
+        for layout in [MenuBarController.Layout.statusItem, .application] {
+            let top = NSMenu()
+            let controller = MenuBarController(menu: top, layout: layout)
+            let menu = top.item(withTitle: "Meetings")?.submenu ?? top
+            guard let item = menu.item(withTitle: "Cancel transcription"), let action = item.action,
+                  let tracking = menu.delegate else { fatalError("Missing session-bound cancellation control") }
+            var cancelled: [UUID] = []
+            controller.onCancelTranscription = { _, id in cancelled.append(id) }
+            let first = UUID(), next = UUID()
+            controller.updateTranscription("Preparing", cancelTarget: ("same-name", first))
+            expect(!item.isHidden && item.isEnabled, "Preparing transcription must be cancellable")
+            tracking.menuWillOpen?(menu)
+            // The next run reuses the folder name, but not its reservation.
+            controller.updateTranscription("Transcribing", cancelTarget: ("same-name", next))
+            NSApp.sendAction(action, to: item.target, from: item)
+            expect(!item.isEnabled && cancelled.isEmpty, "A stale Cancel cannot move to the next recording")
+            tracking.menuDidClose?(menu)
+            tracking.menuWillOpen?(menu)
+            NSApp.sendAction(action, to: item.target, from: item)
+            expect(cancelled == [next], "A fresh menu must cancel the displayed transcription")
+            tracking.menuDidClose?(menu)
+            controller.updateTranscription(nil)
+            NSApp.sendAction(action, to: item.target, from: item)
+            expect(item.isHidden && !item.isEnabled && cancelled == [next], "Idle Cancel cannot dispatch")
+        }
     }
 
     @MainActor

@@ -258,6 +258,36 @@ class ReviewStateResolutionTests(unittest.TestCase):
                 if flag == "interrupted":
                     self.assertIn('value="delete_prepare"', entry["deletion_body"])
 
+    def test_cancellation_keeps_saved_content_and_disables_stale_next_steps(self):
+        self.routing(approved=True)
+        self.resume["meeting"] = ["publish"]
+        self.processing = [self.processing_item("running"), self.processing_item("needs_attention", True)]
+        self.sharing = [self.sharing_item("ready")]
+        self.deletion = [{"job": "meeting", "revision": "removal", "available": True}]
+        notes = self.notes()
+        item = {"job": "meeting", "revision": "current", "state": "available"}
+        self.server.cancellation_options = lambda: [item]
+        self.server.on_cancel_processing = lambda *args: self.calls.append(args)
+        for work in ("queued", "running"):
+            self.processing[0]["state"] = work
+            entry = self.entry()
+            self.assertIn('value="cancel_processing">Cancel processing', entry["cancel_controls"])
+            self.assertIn('value="current"', entry["cancel_controls"])
+        for state, label in (("cancelling", "Stopping processing…"), ("cancelled", "Processing cancelled")):
+            item["state"] = state
+            entry = self.entry()
+            self.assertEqual(entry["status"], label)
+            self.assertEqual(entry["notes"], notes)
+            self.assertFalse(entry["attention"])
+            self.assertEqual(entry["body"], "")
+            self.assertEqual(entry["sharing_body"], "")
+            self.assertNotIn("cancel_controls", entry)
+            self.assertIn('value="delete_prepare"', entry["deletion_body"])
+        self.sharing = [self.sharing_item("shared")]
+        self.assertIn("Shared view-only with:", self.entry()["sharing_body"])
+        self.deletion[0]["cancelling"] = True
+        self.assertIn("Trash", self.entry()["detail"])
+
     def test_workspace_receives_one_normalized_meeting_without_prebuilt_headers(self):
         self.routing(approved=True)
         self.resume["meeting"] = ["publish"]

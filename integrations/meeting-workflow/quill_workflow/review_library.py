@@ -460,7 +460,10 @@ def _storage(sources, job, stage, tasks, transcript_hash, route, metadata, notes
             op.get("state") in ("dispatched", "acknowledged", "verified")
             or isinstance(op.get("fill"), dict) and op["fill"].get("state") in ("dispatched", "acknowledged", "verified"))
             for op in operations.values())
-    result["status"] = "uncertain" if external_evidence else "failed" if task.get("status") == "failed" else "pending"
+    if external_evidence:
+        result["status"] = "uncertain"
+    else:
+        result["status"] = {"failed": "failed", "cancelled": "cancelled"}.get(task.get("status"), "pending")
     return result
 
 
@@ -501,7 +504,7 @@ def meeting_library(state):
 
     storage_status: saved_in_drive, partly_saved, upload_uncertain,
     not_confirmed, or not_requested. Individual document/media status is
-    confirmed, uncertain, pending, failed, unknown, or not_requested.
+    confirmed, uncertain, pending, failed, cancelled, unknown, or not_requested.
     Unknown means unverified, never proof that a cloud copy does not exist.
     """
     try:

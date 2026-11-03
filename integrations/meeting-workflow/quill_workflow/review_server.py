@@ -334,6 +334,16 @@ def _resume_body(server, record, stages):
     return body + '<button name="action" value="resume">Resume waiting work</button></form>'
 
 
+def _cancel_controls(server, item):
+    transcribing = item.get("phase") == "transcription"
+    label = "Cancel transcription" if transcribing else "Cancel processing"
+    detail = "Also cancels later steps. Keeps your recording." if transcribing else "Keeps your recording and completed files."
+    return ('<section class="workflow-action neutral" aria-label="Processing controls">'
+            '<p>' + detail + '</p>'
+            + _identity_form(server, item) + '<button name="action" value="cancel_processing">'
+            + label + '</button></form></section>')
+
+
 def _review_entries(server):
     """Resolve one presentation state without changing any workflow decision."""
     reviews = RoutingReviews(server.review_state)
@@ -360,6 +370,9 @@ def _review_entries(server):
 
     for index, item in enumerate(server.processing_options() if server.processing_options else []):
         source_for(item.get("job", ("worker", index)))["processing"].append(item)
+    if server.cancellation_options:
+        for item in server.cancellation_options():
+            source_for(item["job"])["cancellation"] = item
     for index, item in enumerate(server.sharing_options() if server.sharing_options else []):
         source_for(item["job"])["sharing"] = (index, item)
     if server.deletion_options and server.on_delete:
@@ -374,12 +387,13 @@ def _review_entries(server):
         processing = source["processing"]
         sharing_index, sharing = source.get("sharing", (0, None))
         deletion = source.get("deletion")
+        cancellation = source.get("cancellation") or {}
         notes = _notes_preview(server.review_state, job)
         if notes is None and sharing:
             notes = sharing.get("preview")
         fallback = (sharing.get("title") if sharing else None) or next(
             (item.get("title") for item in processing if item.get("title")), None)
-        fallback = fallback or (deletion.get("title") if deletion else None) or "Saved meeting"
+        fallback = fallback or cancellation.get("title") or (deletion.get("title") if deletion else None) or "Saved meeting"
         entry = {"job": job, "title": _notes_heading(notes, fallback), "status": "On this Mac",
                  "detail": "Local files are available. Drive and sharing status are not established by this view.",
                  "tone": "neutral", "priority": 6, "attention": False, "selection": _selection(job),
@@ -387,6 +401,8 @@ def _review_entries(server):
                  "sharing_status": "unknown", "sharing_label": "No sharing confirmation available"}
         if record and record.get("companies"):
             entry["companies"] = record["companies"]
+        if cancellation.get("recorded_at") is not None:
+            entry["recorded_at"] = cancellation["recorded_at"]
         if record and record.get("approved_route"):
             route = record["approved_route"]
             entry.update(folder_id=route["company_id"], folder_name=route["company_name"])
@@ -413,6 +429,8 @@ def _review_entries(server):
                   ("running", "retrying", "queued", "waiting_for_company", "idle")]
         process = active or (errors[0] if errors else None)
         deletion_pending = deletion and (deletion.get("cancelling") or deletion.get("interrupted"))
+        cancelled = cancellation.get("state") if cancellation.get("state") in ("cancelling", "cancelled") else next(
+            (item["state"] for item in processing if item.get("state") in ("cancelling", "cancelled")), None)
         if deletion_pending:
             cancelling = bool(deletion.get("cancelling"))
             entry.update(status="Stopping processing…" if cancelling else "Removal needs attention",
@@ -423,6 +441,14 @@ def _review_entries(server):
                          sharing_body="")
             # Cancellation takes precedence over every old retry, folder and
             # sharing form. Its own removal action remains in deletion_body.
+        elif cancelled:
+            stopping = cancelled == "cancelling"
+            entry.update(status="Stopping processing…" if stopping else "Processing cancelled",
+                         detail=("Waiting for the current step to stop. Your recording is kept."
+                                 if stopping else "Your recording and completed files are unchanged."),
+                         tone="neutral", priority=3 if stopping else 6, processing_cancelled=True)
+            if sharing and sharing["status"] not in ("shared", "private"):
+                entry["sharing_body"] = ""
         elif process:
             state = process.get("state", "needs_attention")
             status, tone, priority, attention = {
@@ -440,6 +466,8 @@ def _review_entries(server):
             if not active and process.get("retryable") and server.on_retry:
                 entry["body"] = (_identity_form(server, process) +
                                  '<button name="action" value="retry">Retry this meeting</button></form>')
+        elif cancellation.get("state") == "available" and cancellation.get("phase") == "transcription":
+            entry.update(status="Transcription pending", detail="Local transcription has not finished.", priority=3)
         elif pending:
             entry.update(status="Choose a folder", detail="Your notes are ready. Choose where to file this meeting.",
                          tone="amber", priority=1, attention=True,
@@ -466,9 +494,12 @@ def _review_entries(server):
         elif record and record["status"] == "skipped":
             entry.update(status="Kept on this Mac", detail="You chose to keep this meeting local without filing it in Drive.")
 
+        if not deletion_pending and not cancelled and cancellation.get("state") == "available" and server.on_cancel_processing:
+            entry["cancel_controls"] = _cancel_controls(server, cancellation)
+
         # Sharing remains an independent action, but a prepared approval or a
         # sharing failure must still be discoverable in the attention filter.
-        if sharing and sharing["status"] in ("ready", "needs_attention") and not deletion_pending:
+        if sharing and sharing["status"] in ("ready", "needs_attention") and not deletion_pending and not cancelled:
             entry["attention"] = True
             if process or pending or source.get("resume"):
                 entry["metadata"].append("Sharing also needs review.")
@@ -617,10 +648,10 @@ class _ReviewHandler(BaseHTTPRequestHandler):
             if any(len(values) != 1 for values in fields.values()):
                 raise ValueError("Unexpected form fields")
             form = {key: values[0] for key, values in fields.items()}
-            if form.get("action") not in {"approve", "skip", "resume", "retry"} | SHARING_ACTIONS | DELETION_ACTIONS:
+            if form.get("action") not in {"approve", "skip", "resume", "retry", "cancel_processing"} | SHARING_ACTIONS | DELETION_ACTIONS:
                 raise ValueError("Unknown action")
             expected = {"job", "revision", "company_id", "action"}
-            if form["action"] == "retry" or form["action"] in DELETION_ACTIONS:
+            if form["action"] in ("retry", "cancel_processing") or form["action"] in DELETION_ACTIONS:
                 expected.remove("company_id")
             if form["action"] == "delete_confirm":
                 expected.add("confirmation")
@@ -634,6 +665,8 @@ class _ReviewHandler(BaseHTTPRequestHandler):
                     expected.add("suggestion")
             if set(form) != expected:
                 raise ValueError("Unexpected form fields")
+            if form["action"] == "cancel_processing" and (not form["job"] or not form["revision"]):
+                raise ValueError("Missing meeting identity")
             if form["action"] in SHARING_ACTIONS and (not form["job"] or not form["revision"]):
                 raise ValueError("Missing sharing review identity")
             if form["action"] == "sharing_use_suggestions" and not form["suggestion"]:
@@ -646,6 +679,32 @@ class _ReviewHandler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeError, OSError):
             self._error(400, "The review form could not be read. Reload the page and try again.")
             return
+        if form["action"] == "cancel_processing":
+            try:
+                if not self.server.on_cancel_processing:
+                    raise ValueError("Cancelling processing is unavailable")
+                self.server.on_cancel_processing(form["job"], form["revision"])
+            except Exception as error:
+                self._send(409, _page('<h1>Couldn’t cancel processing</h1><p>' + _escape(str(error)[:500])
+                                     + '</p><p><a href="' + _escape(_selected_path(self.server, form["job"]))
+                                     + '">Back to this meeting</a></p>'))
+                return
+            self._send(303, "", location=_selected_path(self.server, form["job"]))
+            return
+        # A tab opened before cancellation can still submit its former forms.
+        # Recheck before recording a folder decision or dispatching a callback.
+        if self.server.cancellation_options and form["action"] not in DELETION_ACTIONS:
+            try:
+                stopped = any(item["job"] == form["job"] and item["state"] in ("cancelling", "cancelled")
+                              for item in self.server.cancellation_options(form["job"]))
+            except Exception:
+                self._error(409, "Quill could not verify the current processing state. Reload this meeting.")
+                return
+            if stopped:
+                self._send(409, _page('<h1>Processing has been cancelled</h1><p>This action is no longer available.</p>'
+                                     '<p><a href="' + _escape(_selected_path(self.server, form["job"]))
+                                     + '">Back to this meeting</a></p>'))
+                return
         if form["action"] in DELETION_ACTIONS:
             try:
                 if not self.server.on_delete or not form["job"] or not form["revision"]:
@@ -732,10 +791,10 @@ class _ReviewHandler(BaseHTTPRequestHandler):
 
 def create_server(state, on_decision=None, resume_options=None, on_resume=None,
                   processing_options=None, on_retry=None, sharing_options=None, on_sharing=None,
-                  deletion_options=None, on_delete=None):
+                  deletion_options=None, on_delete=None, cancellation_options=None, on_cancel_processing=None):
     """Create an unstarted loopback server. Caller owns shutdown/server_close."""
     for callback in (on_decision, resume_options, on_resume, processing_options, on_retry,
-                     sharing_options, on_sharing, deletion_options, on_delete):
+                     sharing_options, on_sharing, deletion_options, on_delete, cancellation_options, on_cancel_processing):
         if callback is not None and not callable(callback):
             raise TypeError("Review callbacks must be callable")
     reviews = RoutingReviews(state)
@@ -758,18 +817,22 @@ def create_server(state, on_decision=None, resume_options=None, on_resume=None,
     server.on_sharing = on_sharing
     server.deletion_options = deletion_options
     server.on_delete = on_delete
+    server.cancellation_options = cancellation_options
+    server.on_cancel_processing = on_cancel_processing
     return server
 
 
 def serve_review(state, on_decision=None, open_browser=True, timeout_seconds=1800, on_ready=None,
                  resume_options=None, on_resume=None, processing_options=None, on_retry=None,
-                 sharing_options=None, on_sharing=None, deletion_options=None, on_delete=None):
+                 sharing_options=None, on_sharing=None, deletion_options=None, on_delete=None,
+                 cancellation_options=None, on_cancel_processing=None):
     """Serve until timeout. Closing the UI never discards saved decisions."""
     if (isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float))
             or not math.isfinite(timeout_seconds) or not 0 < timeout_seconds <= 86400):
         raise ValueError("Review timeout must be between zero and 86400 seconds")
     server = create_server(state, on_decision, resume_options, on_resume, processing_options, on_retry,
-                           sharing_options, on_sharing, deletion_options=deletion_options, on_delete=on_delete)
+                           sharing_options, on_sharing, deletion_options=deletion_options, on_delete=on_delete,
+                           cancellation_options=cancellation_options, on_cancel_processing=on_cancel_processing)
     timer = threading.Timer(timeout_seconds, server.shutdown)
     timer.daemon = True
     try:

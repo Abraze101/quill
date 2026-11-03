@@ -1,5 +1,6 @@
 """Explicit, reversible local meeting removal. Never calls a cloud connector."""
 from contextlib import contextmanager, ExitStack
+from datetime import datetime
 import fcntl
 import hashlib
 import json
@@ -15,7 +16,7 @@ import time
 
 from .pipeline import Queue, WorkflowError, atomic_json, load_config, read_json
 from .local_naming import session_path
-from .recording_safety import FILENAME, read_safety
+from .recording_safety import CANCEL_MARKER, FILENAME, RecordingSafetyHold, read_safety
 
 MARKER = ".quill-deleted.json"
 LEASE = ".meeting-files.lock"
@@ -72,6 +73,75 @@ def deleted_jobs(state):
         if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='local_deletions'").fetchone():
             return set()
         return {row[0] for row in db.execute("SELECT job FROM local_deletions")}
+
+
+def stopped_jobs(state, job=None):
+    """Close processing actions without hiding the kept recording or its receipts."""
+    removed = deleted_jobs(state)
+    if job is not None:
+        removed.intersection_update({job})
+    arguments = (job,) if job is not None else ()
+    path = Path(state) / "jobs.sqlite3"
+    if not path.exists():
+        return removed
+    with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True) as db:
+        tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "processing_cancellations" in tables:
+            query = "SELECT job FROM processing_cancellations" + (" WHERE job=?" if arguments else "")
+            removed.update(row[0] for row in db.execute(query, arguments))
+        if "jobs" in tables:
+            query = ("SELECT j.id,j.session,n.destination FROM jobs j LEFT JOIN local_names n ON n.job=j.id"
+                     if "local_names" in tables else "SELECT j.id,j.session,NULL FROM jobs j")
+            if arguments:
+                query += " WHERE j.id=?"
+            for candidate, original, destination in db.execute(query, arguments):
+                source = destination if destination and os.path.lexists(destination) else original
+                if os.path.lexists(Path(source) / CANCEL_MARKER):
+                    removed.add(candidate)
+    return removed
+
+
+def _busy(path):
+    """Inspect an existing writer lease without creating a file during review."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return False
+    with os.fdopen(fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise WorkflowError("Cannot check the meeting's processing lock")
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        return False
+
+
+def _mark_cancelled(source, expected, safety):
+    fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    temporary = ".quill-cancel-" + secrets.token_hex(12)
+    try:
+        info = os.fstat(fd)
+        if (info.st_dev, info.st_ino) != expected:
+            raise WorkflowError("The recording folder changed before cancellation")
+        content = {"schema_version": 1, "cancelled_at": time.time(), "reason": "user_requested"}
+        if safety:
+            content["session_id"] = safety["session_id"]
+        with os.fdopen(os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600, dir_fd=fd), "w") as file:
+            json.dump(content, file)
+            file.flush()
+            os.fsync(file.fileno())
+        try:
+            os.link(temporary, CANCEL_MARKER, src_dir_fd=fd, dst_dir_fd=fd, follow_symlinks=False)
+        except FileExistsError:
+            pass  # A native cancellation of the same recording can win the race.
+        os.fsync(fd)
+    finally:
+        try:
+            os.unlink(temporary, dir_fd=fd)
+        except FileNotFoundError:
+            pass
+        os.close(fd)
 
 
 def _digest(value):
@@ -260,7 +330,7 @@ class LocalMeetingDeletion:
             known.add(str(Path(os.path.abspath(Path(row[0]).expanduser()))))
         return known
 
-    def _snapshot(self, job):
+    def _snapshot(self, job, *, for_cancellation=False):
         if self._get(job):
             raise WorkflowError("This meeting has already been removed from processing")
         tasks = self.queue.tasks(job)
@@ -290,7 +360,8 @@ class LocalMeetingDeletion:
             raise WorkflowError("Stop the recording before deleting its meeting folder")
         # Older installed apps lack the lease. A missing requested transcript
         # is not proof of an idle transcriber, so remain conservative.
-        capable = lease_capable(source)
+        # Publishing a stop marker never moves or unlinks media under an older writer.
+        capable = for_cancellation or lease_capable(source)
         if (meta.get("transcription_requested") is not False and not (source / "transcript.json").is_file()
                 and not capable):
             raise WorkflowError("Local transcription has not finished. Wait before deleting this meeting.")
@@ -352,6 +423,154 @@ class LocalMeetingDeletion:
         with self.queue.db:
             self.queue.db.execute("INSERT INTO local_deletion_source_bindings VALUES (?,?,?)",
                                   (job, info.st_dev, info.st_ino))
+
+    def _cancel_option(self, snapshot, meta=None):
+        job = snapshot["job"]
+        source = Path(snapshot["trees"][0]["path"])
+        meta = meta or read_json(source / "meta.json", 100000)
+        if not isinstance(meta, dict) or not isinstance(meta.get("started"), str) or not meta.get("ended"):
+            return None
+        item = {"job": job, "revision": _revision(snapshot), "title": source.name}
+        try:
+            recorded = datetime.fromisoformat(meta["started"].replace("Z", "+00:00"))
+            if recorded.tzinfo is not None:
+                item["recorded_at"] = recorded.timestamp()
+        except (ValueError, OverflowError, OSError):
+            pass
+        # Both native transcription and a queued connector can still be unwinding.
+        if os.path.lexists(source / CANCEL_MARKER) or self.queue.db.execute(
+                "SELECT 1 FROM processing_cancellations WHERE job=?", (job,)).fetchone():
+            tree = snapshot["trees"][0]
+            aliases = self.queue.db.execute("SELECT job FROM processing_cancellations WHERE device=? AND inode=?",
+                                            (tree["device"], tree["inode"]))
+            locks = [source / LEASE]
+            for candidate in set(snapshot["jobs"]).union(row[0] for row in aliases):
+                hashed = hashlib.sha256(candidate.encode()).hexdigest()
+                locks.extend(self.queue.state / (prefix + hashed + ".lock") for prefix in ("processing-", "sharing-"))
+            item["state"] = "cancelling" if any(_busy(path) for path in locks) else "cancelled"
+            return item
+        transcription = (meta.get("transcription_requested") is True and not (source / "transcript.json").is_file()
+                         and (not snapshot["safety"] or snapshot["safety"]["review_status"] == "approved"))
+        def unfinished(task):
+            if task["status"] in ("running", "pending", "retry", "failed", "safety_held"):
+                return True
+            settings = json.loads(task["settings"]) if task["status"] == "held" else None
+            return isinstance(settings, dict) and settings.get("enabled") is True
+        if not (transcription or any(unfinished(task) for task in snapshot["tasks"])):
+            return None
+        item["state"] = "available"
+        if transcription:
+            item["phase"] = "transcription"
+        return item
+
+    def _cancel_preview(self, job, root, source, tasks):
+        """Only stat capture members to bind the same revision as the full confirmation."""
+        if self._get(job) or source.parent != root:
+            return None
+        info = _directory(source)
+        meta = read_json(source / "meta.json", 100000)
+        if not isinstance(meta, dict) or not isinstance(meta.get("files"), dict) or not meta.get("ended"):
+            return None
+        safety = read_safety(source, require_approval=False)
+        if safety and safety["phase"] != "finished":
+            return None
+        names = {"meta.json", "mic.caf", "system.caf", meta["files"].get("screen", "screen.mp4")}
+        entries = []
+        for name in sorted(names):
+            if not isinstance(name, str) or Path(name).name != name or name in ("", ".", ".."):
+                return None
+            member = source / name
+            try:
+                saved = member.lstat()
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(saved.st_mode):
+                return None
+            entries.append([name, saved.st_dev, saved.st_ino, saved.st_mode,
+                            saved.st_size, saved.st_mtime_ns, saved.st_ctime_ns])
+        tree = {"path": str(source), "device": info.st_dev, "inode": info.st_ino, "entries": entries}
+        return self._cancel_option({"job": job, "jobs": [job], "trees": [tree], "capture_files": names,
+                                    "tasks": tasks, "safety": safety}, meta)
+
+    def cancellation_option(self, job):
+        if self._get(job):
+            return None
+        root = Path(load_config(self.config_path).get("recordings_root", Path.home() / "Recordings")).expanduser().resolve()
+        try:
+            return self._cancel_preview(job, root, self._source(job), self.queue.tasks(job))
+        except (OSError, ValueError, TypeError, KeyError, WorkflowError, RecordingSafetyHold):
+            if self.queue.db.execute("SELECT 1 FROM processing_cancellations WHERE job=?", (job,)).fetchone():
+                row = self.queue.db.execute("SELECT session FROM jobs WHERE id=?", (job,)).fetchone()
+                return {"job": job, "title": Path(row[0]).name if row else "Local meeting",
+                        "revision": "unavailable", "state": "cancelled"}
+            return None
+
+    def cancellation_options(self):
+        root = Path(load_config(self.config_path).get("recordings_root", Path.home() / "Recordings")).expanduser().resolve()
+        tasks = {}
+        for task in self.queue.tasks():
+            tasks.setdefault(task["job"], []).append(task)
+        results, known = [], set()
+        def append(job, source):
+            try:
+                item = self._cancel_preview(job, root, source, tasks.get(job, []))
+                if item:
+                    results.append(item)
+            except (OSError, ValueError, TypeError, KeyError, WorkflowError, RecordingSafetyHold):
+                pass  # An unavailable historical source can't hide other recordings.
+        for row in self.queue.db.execute("SELECT j.id,j.session,n.destination FROM jobs j "
+                                         "LEFT JOIN local_names n ON n.job=j.id ORDER BY j.created DESC"):
+            known.add(str(row["session"]))
+            if row["destination"]:
+                known.add(row["destination"])
+            try:
+                source = session_path(self.queue, row["id"])
+                known.add(str(source))
+                append(row["id"], source)
+            except (OSError, ValueError, WorkflowError, RecordingSafetyHold):
+                continue
+        known.update(row[0] for row in self.queue.db.execute("SELECT path FROM local_name_aliases"))
+        for job, source in self._local_sources():
+            if str(source) not in known:
+                append(job, source)
+        listed = {item["job"] for item in results}
+        for row in self.queue.db.execute("SELECT j.id, j.session FROM processing_cancellations c JOIN jobs j ON c.job=j.id "
+                                         "LEFT JOIN local_deletions d ON d.job=c.job WHERE d.job IS NULL"):
+            if row["id"] not in listed:
+                results.append({"job": row["id"], "title": Path(row["session"]).name,
+                                "revision": "unavailable", "state": "cancelled"})
+        return results
+
+    def cancel_processing(self, job, revision):
+        """Stop this finished recording at its next processing boundary. Keep all files."""
+        with _lock(self.queue.state / "local-deletion-control.lock"):
+            snapshot = self._snapshot(job, for_cancellation=True)
+            if _revision(snapshot) != revision:
+                raise WorkflowError("This recording changed. Reload before cancelling processing.")
+            if self._cancel_option(snapshot) is None:
+                raise WorkflowError("This recording has no remaining processing to cancel")
+            self._bind_legacy_source(job, snapshot)
+            self.queue.db.execute("BEGIN IMMEDIATE")
+            try:
+                # Serialize with enqueue/rename and recheck the exact finished capture,
+                # including any raw-only and transcribed queue IDs for the same source.
+                snapshot = self._snapshot(job, for_cancellation=True)
+                if _revision(snapshot) != revision or self._cancel_option(snapshot) is None:
+                    raise WorkflowError("Processing or the recording changed. Reload its review.")
+                tree, safety = snapshot["trees"][0], snapshot["safety"]
+                source = Path(tree["path"])
+                started = read_json(source / "meta.json", 100000)["started"]
+                _mark_cancelled(source, (tree["device"], tree["inode"]), safety)
+                for candidate in snapshot["jobs"]:
+                    self.queue.db.execute("INSERT OR IGNORE INTO processing_cancellations VALUES (?,?,?,?,?)",
+                                          (candidate, tree["device"], tree["inode"], started, (safety or {}).get("session_id")))
+                    self.queue.stop_remaining(candidate)
+                self.queue.db.commit()
+            except BaseException:
+                self.queue.db.rollback()
+                raise
+        self.queue.write_status()
+        return self._cancel_option(snapshot)
 
     def options(self):
         items = []

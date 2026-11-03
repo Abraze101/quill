@@ -8,11 +8,26 @@ import stat
 import uuid
 
 FILENAME = "recording-safety.json"
+CANCEL_MARKER = ".quill-processing-cancelled.json"
 MAX_BYTES = 100_000
 
 
 class RecordingSafetyHold(Exception):
     """Capture is unfinished or requires the user's explicit processing decision."""
+
+
+class ProcessingCancelled(RecordingSafetyHold):
+    """A user permanently stopped further processing for this recording."""
+
+
+def check_cancellation(session):
+    if os.path.lexists(Path(session) / CANCEL_MARKER):
+        raise ProcessingCancelled("Processing cancelled; local files are kept")
+
+
+def processing_safety(session):
+    check_cancellation(session)
+    return read_safety(session)
 
 
 def _iso8601(value):

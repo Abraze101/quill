@@ -219,12 +219,16 @@ def _meeting_content(entry, path, navigation, tab):
     if storage and storage.casefold() != status.casefold():
         body += '<span>' + escape(storage) + '</span>'
     body += '</div></header>'
+    if entry.get("cancel_controls"):
+        body += entry["cancel_controls"]
+    if entry.get("processing_cancelled"):
+        body += '<p role="status">' + escape(entry["detail"]) + '</p>'
     if tab == "notes" and (entry.get("body") or entry.get("detail") and entry.get("attention")):
         body += '<section class="workflow-action ' + escape(entry.get("tone", "neutral")) + '" aria-label="Next action">'
         if entry.get("detail"):
             body += '<p>' + escape(entry["detail"]) + '</p>'
         body += entry.get("body", "") + '</section>'
-    elif tab == "notes" and entry.get("detail") and not entry.get("notes"):
+    elif tab == "notes" and entry.get("detail") and not entry.get("notes") and not entry.get("processing_cancelled"):
         body += '<p class="muted">' + escape(entry["detail"]) + '</p>'
     body += '<nav class="tabs" aria-label="Meeting content">'
     for key, label in (("notes", "Notes"), ("transcript", "Transcript"), ("recording", "Recording")):
@@ -234,8 +238,10 @@ def _meeting_content(entry, path, navigation, tab):
         body += (entry.get("sharing_body") or '<p class="muted">Sharing is unavailable until this meeting’s private notes document is ready.</p>')
     elif tab == "transcript":
         transcript = entry.get("transcript") or entry.get("transcript_text")
+        absent = ("No transcript preview is available for this meeting." if entry.get("processing_cancelled") else
+                  "A transcript preview is not available for this meeting yet. Its local files are unchanged.")
         body += ('<div class="transcript">' + escape(transcript) + '</div>' if transcript else
-                 '<p class="muted">A transcript preview is not available for this meeting yet. Its local files are unchanged.</p>')
+                 '<p class="muted">' + absent + '</p>')
     elif tab == "recording":
         body += '<h2>Recording files</h2>'
         if entry.get("recording_files"):
@@ -255,7 +261,8 @@ def _meeting_content(entry, path, navigation, tab):
                            ("Sharing", entry.get("sharing_label") or "No sharing confirmation available")):
             body += '<dt>' + key + '</dt><dd>' + escape(value) + '</dd>'
         storage_states = {"confirmed": "Save confirmed", "uncertain": "Save unconfirmed", "pending": "Waiting",
-                          "failed": "Needs attention", "unknown": "No verified save information", "not_requested": "Not requested"}
+                          "failed": "Needs attention", "unknown": "No verified save information", "not_requested": "Not requested",
+                          "cancelled": "Save cancelled"}
         for key, label in (("document", "Notes & transcript"), ("media", "Recording files")):
             if entry.get("storage", {}).get(key):
                 body += '<dt>' + label + '</dt><dd>' + storage_states.get(entry["storage"][key]["status"], "No verified save information") + '</dd>'
@@ -263,7 +270,8 @@ def _meeting_content(entry, path, navigation, tab):
     elif entry.get("notes"):
         body += _reading_notes(entry["notes"])
     else:
-        body += '<p class="muted">Notes will appear here when they’re ready.</p>'
+        body += ('<p class="muted">No notes are available for this meeting.</p>' if entry.get("processing_cancelled")
+                 else '<p class="muted">Notes will appear here when they’re ready.</p>')
     body += '<details class="meeting-actions"><summary>More meeting actions</summary>'
     body += '<p>' + _link('View activity', url('activity')) + '</p>'
     body += entry.get("deletion_body", "") + '</details></div></section>'

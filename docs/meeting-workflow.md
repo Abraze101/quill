@@ -266,6 +266,15 @@ access. Calendar suggestions are tentative; they establish invitees, not who
 spoke. Closing the review preserves pending decisions. The temporary page binds
 to loopback and expires after thirty minutes; reopen it from Quill as needed.
 
+### Cancelling a dud recording
+
+Open **Review processing**, select the recording, and choose **Cancel processing**
+(**Cancel transcription** while its local transcript is pending). During transcription
+you can also choose **Cancel transcription** from the feather menu or **Meetings**.
+Quill keeps the recording and any finished work. The cancellation applies to this
+meeting across restarts and retries. **Stopping processing…** means a step is still
+finishing or releasing its files. Check the Drive receipts for anything already sent.
+
 ### Removing local meeting files
 
 After stopping capture, choose **More meeting actions → Delete local meeting…**.

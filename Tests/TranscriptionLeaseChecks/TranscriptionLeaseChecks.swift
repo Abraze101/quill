@@ -117,7 +117,10 @@ struct TranscriptionLeaseChecks {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         try checkLeaseEnrollment(root: root)
-        let coordinator = TranscriptionCoordinator(journal: CompletionJournal(directory: root.appendingPathComponent("test-journal")))
+        let journal = CompletionJournal(directory: root.appendingPathComponent("test-journal"))
+        let coordinator = TranscriptionCoordinator(journal: journal)
+        let activeStatuses = StatusProbe()
+        await coordinator.setStatusHandler { activeStatuses.update($0) }
 
         let session = try fixture("active", root: root)
         await coordinator.enqueue(session)
@@ -208,10 +211,16 @@ struct TranscriptionLeaseChecks {
         // Some engines return a final buffer even after cancellation. It is
         // still unsafe to publish that text or proceed to the second track.
         await EngineProbe.shared.holdSamples()
-        let returningCancelled = try fixture("cancel-returned-text", root: root)
+        let cancellationRoot = root.appendingPathComponent("user-cancel-fixtures")
+        let returningCancelled = try fixture("cancel-returned-text", root: cancellationRoot)
+        let sessionID = UUID(), time = Date()
+        try RecordingReviewGate.write(.init(sessionID: sessionID, owner: .manual, phase: .finished,
+            startedAt: time, checkInAt: time.addingTimeInterval(60), stopAt: time.addingTimeInterval(120),
+            reviewStatus: .approved), session: returningCancelled)
+        let waitingID = try journal.register(session: returningCancelled, command: "exit 87", waitingForTranscript: true)
         let beforeReturnedCancellation = await EngineProbe.shared.callCount()
         let previousCancellations = await EngineProbe.shared.cancelledCount()
-        await coordinator.enqueue(returningCancelled)
+        await coordinator.enqueue(returningCancelled, completion: waitingID)
         let returningBy = Date().addingTimeInterval(3)
         while await EngineProbe.shared.callCount() == beforeReturnedCancellation, Date() < returningBy {
             try await Task.sleep(for: .milliseconds(10))
@@ -221,7 +230,34 @@ struct TranscriptionLeaseChecks {
         precondition(returningFD >= 0)
         defer { close(returningFD) }
         let returningLog = try Data(contentsOf: returningCancelled.appendingPathComponent("transcribe.log"))
-        try Data("deleted".utf8).write(to: returningCancelled.appendingPathComponent(RecordingReviewGate.deletionFilename))
+        guard case .transcribing(let displayedName, _, let reservation) = activeStatuses.read() else {
+            preconditionFailure("Active transcription did not publish a cancellation reservation")
+        }
+        let queuedCancellation = try fixture("cancel-queued", root: cancellationRoot)
+        await coordinator.enqueue(queuedCancellation)
+        let otherCall = try await coordinator.cancelActiveTranscription(expectedSession: queuedCancellation.lastPathComponent,
+                                                                         expectedReservation: reservation)
+        let stale = try await coordinator.cancelActiveTranscription(expectedSession: displayedName, expectedReservation: UUID())
+        precondition(!otherCall && !stale, "A stale action cancelled another transcription")
+        let externalMarker = queuedCancellation.appendingPathComponent(RecordingReviewGate.processingCancellationFilename)
+        try Data("{}".utf8).write(to: externalMarker)
+        let accepted = try await coordinator.cancelActiveTranscription(expectedSession: displayedName, expectedReservation: reservation)
+        precondition(accepted)
+        guard case .cancelling(let stoppingName, let queueCount, let stoppingID) = activeStatuses.read() else {
+            preconditionFailure("Cancellation was reported complete before model cleanup")
+        }
+        precondition(stoppingName == displayedName && stoppingID == reservation && queueCount == 0)
+        let markerURL = returningCancelled.appendingPathComponent(RecordingReviewGate.processingCancellationFilename)
+        let marker = try JSONSerialization.jsonObject(with: Data(contentsOf: markerURL)) as! [String: Any]
+        precondition(marker["schema_version"] as? Int == 1 && marker["reason"] as? String == "user_requested"
+                     && marker["session_id"] as? String == sessionID.uuidString && marker["cancelled_at"] is NSNumber)
+        let permissions = try FileManager.default.attributesOfItem(atPath: markerURL.path)[.posixPermissions] as? NSNumber
+        precondition(permissions?.intValue == 0o600)
+        let savedHandoff = try JSONDecoder().decode(CompletionJournal.Job.self,
+            from: Data(contentsOf: journal.directory.appendingPathComponent(waitingID + ".json")))
+        precondition(savedHandoff.state == .cancelled, "A waiting handoff stayed in attention until the next restart")
+        let secondClick = try await coordinator.cancelActiveTranscription(expectedSession: displayedName, expectedReservation: reservation)
+        precondition(!secondClick)
         let returnedCancelBy = Date().addingTimeInterval(3)
         while await EngineProbe.shared.cancelledCount() == previousCancellations, Date() < returnedCancelBy {
             try await Task.sleep(for: .milliseconds(10))
@@ -245,6 +281,19 @@ struct TranscriptionLeaseChecks {
         precondition(!FileManager.default.fileExists(atPath: returningCancelled.appendingPathComponent("transcript.md").path))
         let returningLogAfter = try Data(contentsOf: returningCancelled.appendingPathComponent("transcribe.log"))
         precondition(returningLogAfter == returningLog, "Cancelled model return produced new output")
+        let restarted = TranscriptionCoordinator(journal: journal)
+        await restarted.resumePending(root: cancellationRoot)
+        let retryCancelled = await restarted.retryPending(root: cancellationRoot)
+        precondition(retryCancelled == .queued(0), "Relaunch or retry resurrected a canceled meeting")
+        let handoff = try journal.jobs().first { $0.id == waitingID }
+        precondition(handoff?.state == .cancelled && handoff?.attempts == 0)
+        precondition(!FileManager.default.fileExists(atPath: queuedCancellation.appendingPathComponent("transcribe.log").path))
+        for session in [queuedCancellation, returningCancelled] {
+            for file in ["meta.json", "mic.caf", "system.caf"] {
+                precondition(FileManager.default.fileExists(atPath: session.appendingPathComponent(file).path))
+            }
+            precondition(!FileManager.default.fileExists(atPath: session.appendingPathComponent(RecordingReviewGate.deletionFilename).path))
+        }
         await EngineProbe.shared.releaseSamples()
 
         let blocked = try fixture("deleting", root: root)
@@ -271,7 +320,52 @@ struct TranscriptionLeaseChecks {
         try await checkFailedWritesRemainPending(root: root, coordinator: coordinator)
         try await checkCaptureQuality(root: root, coordinator: coordinator)
         try await checkManualRetry(root: root.appendingPathComponent("retry-checks"))
+        try await checkCancellationBoundaries(root: root.appendingPathComponent("cancellation-boundaries"))
         print("Transcription lease checks passed: held-session enrollment without approval, active/unfinished/legacy/link refusals, source labels, canonical speakers and names, missing/failed-track status, awaited model work, completed writes, active cancellation, swallowed cancellation, cleanup lease, unrelated continuation, busy deletion, tombstone rejection, no denial logs, missing folder, atomic completion ordering, retry after failed Markdown or JSON writes, capture caveats and malformed reports.")
+    }
+
+    private static func checkCancellationBoundaries(root: URL) async throws {
+        let session = try fixture("selected", root: root)
+        let lease = try RecordingReviewGate.acquireProcessingLease(session: session)
+        let moved = root.appendingPathComponent("original")
+        try FileManager.default.moveItem(at: session, to: moved)
+        _ = try fixture("selected", root: root)
+        let reused = try RecordingReviewGate.cancelLeasedTranscription(session: session, sessionID: nil, lease: lease)
+        precondition(!reused && !RecordingReviewGate.processingCancellationRequested(session: session),
+                     "A replacement directory inherited an old cancellation")
+        try FileManager.default.createSymbolicLink(at: session.appendingPathComponent(RecordingReviewGate.processingCancellationFilename),
+            withDestinationURL: root.appendingPathComponent("missing"))
+        precondition(RecordingReviewGate.blocksProcessing(session: session), "Dangling cancellation marker failed open")
+
+        let journal = CompletionJournal(directory: root.appendingPathComponent("hooks"))
+        let completed = try fixture("dispatched", root: root)
+        let doneID = try journal.register(session: completed, command: "exit 0", waitingForTranscript: false)
+        _ = try journal.claim()
+        try journal.finish(doneID, exitCode: 0)
+        let retryID = try journal.register(session: completed, command: "exit 1", waitingForTranscript: false, maxAttempts: 3)
+        _ = try journal.claim()
+        try journal.finish(retryID, exitCode: 1, retryDelay: 0)
+        try Data().write(to: completed.appendingPathComponent(RecordingReviewGate.processingCancellationFilename))
+        let jobs = try journal.jobs()
+        precondition(jobs.first { $0.id == doneID }?.state == .delivered && jobs.first { $0.id == retryID }?.state == .cancelled)
+        let claim = try journal.claim()
+        precondition(claim == nil, "A canceled retry was claimed again")
+
+        let preparing = try fixture("preparing", root: root)
+        let coordinator = TranscriptionCoordinator(journal: journal), statuses = StatusProbe()
+        await coordinator.setStatusHandler { statuses.update($0) }
+        await EngineProbe.shared.holdPreparation()
+        let before = await EngineProbe.shared.callCount()
+        await coordinator.enqueue(preparing)
+        try await waitUntil("Model preparation not shown") { if case .preparing = statuses.read() { return true }; return false }
+        guard case .preparing(let name, let token) = statuses.read() else { preconditionFailure() }
+        let stopped = try await coordinator.cancelActiveTranscription(expectedSession: name, expectedReservation: token)
+        precondition(stopped)
+        try await waitUntil("Cancelled model preparation did not unwind") { if case .idle = statuses.read() { return true }; return false }
+        await EngineProbe.shared.releasePreparation()
+        let after = await EngineProbe.shared.callCount()
+        precondition(before == after && !FileManager.default.fileExists(atPath: preparing.appendingPathComponent("transcript.json").path))
+        print("Processing cancellation passed: exact reservation and directory, preparation/active/queued work, cleanup lease, preserved media, no transcript or hook, durable restart and terminal retry history.")
     }
 
     private static func waitUntil(_ message: String, condition: @Sendable () async -> Bool) async throws {
@@ -376,7 +470,7 @@ struct TranscriptionLeaseChecks {
         }
         let during = await coordinator.retryPending(root: recordings)
         precondition(during == .queued(0), "Active transcription was queued twice")
-        if case .transcribing(_, let count) = statuses.read() {
+        if case .transcribing(_, let count, _) = statuses.read() {
             precondition(count == 7, "Displayed queue count did not reflect pending jobs")
         } else { preconditionFailure("Transcribing status disappeared during a retry scan") }
         await EngineProbe.shared.releaseSamples()
@@ -440,7 +534,7 @@ struct TranscriptionLeaseChecks {
         try FileManager.default.removeItem(at: obstruction)
         let queued = await coordinator.retryPending(root: recordings)
         precondition(queued == .queued(1))
-        if case .transcribing(let session, let count) = statuses.read() {
+        if case .transcribing(let session, let count, _) = statuses.read() {
             precondition(session == other.lastPathComponent && count == 1)
         } else { preconditionFailure("Retry did not preserve the active session status") }
         await EngineProbe.shared.releaseSamples()

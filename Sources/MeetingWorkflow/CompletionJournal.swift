@@ -7,7 +7,7 @@ import Foundation
 public struct CompletionJournal: Sendable {
     public struct Job: Codable, Sendable {
         public enum State: String, Codable, Sendable {
-            case waitingForTranscript, ready, running, retry, delivered, failed
+            case waitingForTranscript, ready, running, retry, delivered, failed, cancelled
         }
         public let id: String
         public let session: URL
@@ -55,6 +55,12 @@ public struct CompletionJournal: Sendable {
         try locked { try allJobs() }
     }
 
+    /// Persist terminal status now so other local readers can see a cancelled
+    /// handoff even when there is no further work to drain in this process.
+    public func reconcileCancellations() throws {
+        try locked { _ = try allJobs() }
+    }
+
     public func ready(_ id: String, now: TimeInterval = Date().timeIntervalSince1970) throws {
         try locked {
             var job = try read(id)
@@ -97,9 +103,10 @@ public struct CompletionJournal: Sendable {
             var job = try read(id)
             guard job.state == .running, job.processID == nil,
                   RecordingReviewGate.blocksProcessing(session: job.session) else { return false }
-            job.state = .ready
+            job.state = RecordingReviewGate.processingCancellationRequested(session: job.session) ? .cancelled : .ready
             job.attempts = max(0, job.attempts - 1)
             job.attemptedAt = nil
+            if job.state == .cancelled { job.error = nil }
             try write(job)
             return true
         }
@@ -112,9 +119,10 @@ public struct CompletionJournal: Sendable {
         try locked {
             var job = try read(id)
             guard job.state == .running, job.processID == nil else { return }
-            job.state = .ready
+            job.state = RecordingReviewGate.processingCancellationRequested(session: job.session) ? .cancelled : .ready
             job.attempts = max(0, job.attempts - 1)
             job.attemptedAt = nil
+            if job.state == .cancelled { job.error = nil }
             job.nextAttempt = now + max(0.25, delay)
             try write(job)
         }
@@ -138,6 +146,9 @@ public struct CompletionJournal: Sendable {
             if exitCode == 0 {
                 job.state = .delivered
                 job.error = nil
+            } else if RecordingReviewGate.processingCancellationRequested(session: job.session) {
+                job.state = .cancelled
+                job.error = nil
             } else {
                 job.state = job.attempts >= job.maxAttempts ? .failed : .retry
                 job.error = "Completion hook exited with status \(exitCode)"
@@ -157,9 +168,10 @@ public struct CompletionJournal: Sendable {
                 // Allow a concurrently launching process time to persist PID.
                 if job.processID == nil, now - (job.attemptedAt ?? now) < 5 { continue }
                 job.processID = nil
-                job.state = job.attempts >= job.maxAttempts ? .failed : .retry
+                let cancelled = RecordingReviewGate.processingCancellationRequested(session: job.session)
+                job.state = cancelled ? .cancelled : (job.attempts >= job.maxAttempts ? .failed : .retry)
                 job.nextAttempt = now
-                job.error = "Quill was interrupted before the hook result was saved"
+                job.error = cancelled ? nil : "Quill was interrupted before the hook result was saved"
                 try write(job)
             }
         }
@@ -184,7 +196,17 @@ public struct CompletionJournal: Sendable {
         return try files.filter { $0.pathExtension == "json" }.map { file in
             let values = try file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
             guard values.isRegularFile == true, values.isSymbolicLink != true else { throw JournalError.invalidRecord }
-            return try read(file.deletingPathExtension().lastPathComponent)
+            var job = try read(file.deletingPathExtension().lastPathComponent)
+            // A waiting/retry/failed hook can no longer run. Reconcile on reads
+            // and claims so it doesn't remain in attention or relaunch after a
+            // restart. Keep delivered history and genuinely running children.
+            if [.waitingForTranscript, .ready, .retry, .failed].contains(job.state),
+               RecordingReviewGate.processingCancellationRequested(session: job.session) {
+                job.state = .cancelled
+                job.error = nil
+                try write(job)
+            }
+            return job
         }
     }
 

@@ -19,8 +19,10 @@ def retry_revision(tasks):
 
 def meetings(queue):
     from .routing import RoutingReviews
+    from .local_deletion import stopped_jobs
     removed = {row[0] for row in queue.db.execute("SELECT job FROM local_deletions")}
     tasks = [task for task in queue.tasks() if task["job"] not in removed]
+    cancelled = stopped_jobs(queue.state) - removed
     skipped = set()
     if (queue.state / "reviews.sqlite3").exists():
         reviews = RoutingReviews(queue.state)
@@ -46,7 +48,9 @@ def meetings(queue):
         pending = any(task["status"] == "pending" for task in saved)
         state, detail = "idle", "Finished or kept local"
         chosen = running or failed or retry
-        if job in skipped:
+        if job in cancelled:
+            state, detail = "idle", "Processing cancelled"
+        elif job in skipped:
             state, detail = "idle", "Kept local"
         elif running:
             state, detail = "running", STAGE_LABELS[running["stage"]]
@@ -58,7 +62,7 @@ def meetings(queue):
             state, detail = "waiting_for_company", "Choose this meeting's company folder"
         elif pending:
             state, detail = "queued", "Waiting for an earlier step"
-        retryable = job not in skipped and not running and not any(task["status"] == "safety_held" for task in saved) and any(task["status"] in ("failed", "retry")
+        retryable = job not in cancelled and job not in skipped and not running and not any(task["status"] == "safety_held" for task in saved) and any(task["status"] in ("failed", "retry")
                                        and task["receipt"] is None for task in saved)
         summaries.append({"job": job, "title": titles.get(job, "Meeting"), "state": state,
                           "detail": str(detail)[:500], "retryable": retryable,
