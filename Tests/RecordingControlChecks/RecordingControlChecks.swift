@@ -33,7 +33,7 @@ struct RecordingControlChecks {
         let initial = RecordingStatusSnapshot(phase: .recording, sessionID: "first", elapsed: "00:42:15",
             microphoneStatus: "Recording", systemAudioStatus: "Recording", videoStatus: "Entire display", actionRevision: 4, stopEnabled: true)
         control.update(initial)
-        checkPanelGeometry(panel, content: content, compact: false)
+        var geometryFailures = checkPanelGeometry(panel, content: content, compact: false)
         render(content, name: "recording")
         expect(!panel.isVisible, "Offscreen checks must not reveal a panel")
         expect(stop.isEnabled && !stop.isHiddenOrHasHiddenAncestor, "Recording needs a visible Stop")
@@ -60,7 +60,8 @@ struct RecordingControlChecks {
                "Collapsing must leave an enabled Stop")
         expect(labels(content).contains("REC"), "Compact indicator must contain REC text")
         expect(panel.frame.width < 366, "Compact recording control must be narrower")
-        checkPanelGeometry(panel, content: content, compact: true)
+        geometryFailures += checkPanelGeometry(panel, content: content, compact: true)
+        expect(geometryFailures.isEmpty, "Recording panel geometry:\n" + geometryFailures.joined(separator: "\n"))
         render(content, name: "recording-compact")
 
         control.update(.init(phase: .recording, sessionID: "pause-first", elapsed: "00:42:15",
@@ -834,90 +835,133 @@ struct RecordingControlChecks {
         print("Recording heartbeat publication checks passed")
     }
 
-    @MainActor static func checkPanelGeometry(_ panel: NSWindow, content: NSView, compact: Bool) {
-        content.layoutSubtreeIfNeeded()
-        func hit(_ p: NSPoint) -> NSView? {
-            content.hitTest(content.convert(p, to: content.superview))
-        }
-        let disclosure = button("quill-status-disclosure", in: content)
-        let target = content.convert(disclosure.bounds, from: disclosure)
+    @MainActor static func checkPanelGeometry(_ panel: NSWindow, content: NSView, compact: Bool) -> [String] {
         let mode = compact ? "compact" : "expanded"
-        expect(target.width >= 40 && target.height >= 28 && disclosure.isBordered,
-            "Collapse and expand need a visible rectangular target: \(mode), target=\(target)")
-        var clicks = 0
-        let original = disclosure.onClick
+        // Native HUD hit testing and button tracking need an ordered window on
+        // macOS 15. Keep this nonactivating fixture outside every screen.
+        let frame = panel.frame, delegate = panel.delegate
+        panel.delegate = nil // The app normally brings offscreen panels back.
+        defer {
+            panel.orderOut(nil)
+            panel.setFrame(frame, display: false)
+            panel.delegate = delegate
+        }
+        let screens = NSScreen.screens.map(\.frame)
+        panel.setFrameOrigin(NSPoint(x: (screens.map(\.minX).min() ?? 0) - frame.width - 200, y: frame.minY))
+        func offscreen() -> Bool { !screens.contains { $0.intersects(panel.frame) } }
+        guard offscreen() else { return ["\(mode): couldn't isolate test panel, panel=\(panel.frame), screens=\(screens)"] }
+        panel.orderBack(nil)
+        content.layoutSubtreeIfNeeded()
+        panel.displayIfNeeded()
+        CATransaction.flush()
+        guard panel.isVisible && offscreen() else {
+            return ["\(mode): ordered=\(panel.isVisible), panel=\(panel.frame), screens=\(screens)"]
+        }
+
+        let disclosure = button("quill-status-disclosure", in: content)
+        let stop = button(compact ? "quill-status-compact-stop" : "quill-status-stop", in: content)
+        let target = content.convert(disclosure.bounds, from: disclosure), stopFrame = content.convert(stop.bounds, from: stop)
+        var failures: [String] = [], clicks = 0, stops = 0
+        func check(_ ok: Bool, _ detail: @autoclosure () -> String) {
+            if !ok {
+                failures.append("\(mode): \(detail()); panel=\(panel.frame), content=\(content.bounds), disclosure=\(target), Stop=\(stopFrame)")
+            }
+        }
+        func hit(_ p: NSPoint) -> NSView? { content.hitTest(content.convert(p, to: content.superview)) }
+        func path(_ receiver: NSView?) -> String {
+            var view = receiver, names: [String] = []
+            while let v = view {
+                let identifier = v.accessibilityIdentifier()
+                names.append(String(describing: type(of: v)) + (identifier.isEmpty ? "" : "#" + identifier))
+                view = v.superview
+            }
+            return names.isEmpty ? "nil" : names.joined(separator: "→")
+        }
+        let original = disclosure.onClick, originalStop = stop.onClick
         disclosure.onClick = { clicks += 1 }
-        defer { disclosure.onClick = original }
+        stop.onClick = { stops += 1 }
+        defer { disclosure.onClick = original; stop.onClick = originalStop }
         func event(_ type: NSEvent.EventType, at point: NSPoint) -> NSEvent {
             NSEvent.mouseEvent(with: type, location: content.convert(point, to: nil), modifierFlags: [],
                 timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: panel.windowNumber,
                 context: nil, eventNumber: 1, clickCount: 1, pressure: type == .leftMouseUp ? 0 : 1)!
         }
+        func click(_ point: NSPoint, nativeTracking: Bool = false) {
+            let down = event(.leftMouseDown, at: point), up = event(.leftMouseUp, at: point)
+            // A native NSButton consumes mouse-up inside its mouseDown tracking
+            // loop. The disclosure returns and receives a separate mouseUp.
+            if nativeTracking { NSApp.postEvent(up, atStart: true) }
+            panel.sendEvent(down)
+            if !nativeTracking { panel.sendEvent(up) }
+        }
+
+        check(target.width >= 40 && target.height >= 28 && disclosure.isBordered, "missing visible 40×28 target")
         for x in [target.minX + 0.5, target.midX, target.maxX - 0.5] {
             for y in [target.minY + 0.5, target.midY, target.maxY - 0.5] {
-                let point = NSPoint(x: x, y: y)
-                let receiver = hit(point)
-                let receiverClass = receiver.map { String(describing: type(of: $0)) } ?? "nil"
-                let context = "\(mode), point=\(point), target=\(target), content=\(content.bounds), hit=\(receiverClass), descendant=\(receiver?.isDescendant(of: disclosure) == true)"
-                expect(receiver === disclosure, "Button padding must accept the click: \(context)")
-                // AppKit delivers drag and release to the original down receiver.
-                let previous = clicks
-                receiver?.mouseDown(with: event(.leftMouseDown, at: point))
-                receiver?.mouseUp(with: event(.leftMouseUp, at: point))
-                expect(clicks == previous + 1, "Routed padding click must invoke the action exactly once: \(context)")
+                let point = NSPoint(x: x, y: y), previous = clicks, receiver = hit(point)
+                check(receiver === disclosure, "padding point \(point) hit \(path(receiver))")
+                if receiver === disclosure { click(point) }
+                check(clicks == previous + 1, "padding point \(point) invoked \(clicks-previous) actions; hit \(path(receiver))")
             }
         }
-        let stop = button(compact ? "quill-status-compact-stop" : "quill-status-stop", in: content)
-        let stopFrame = content.convert(stop.bounds, from: stop)
-        expect(!target.intersects(stopFrame) && hit(NSPoint(x: stopFrame.midX, y: stopFrame.midY)) === stop,
-               "Disclosure must not intercept Stop")
+        check(!target.intersects(stopFrame), "disclosure and Stop frames overlap")
+        let stopCenter = NSPoint(x: stopFrame.midX, y: stopFrame.midY), beforeStop = clicks, priorStops = stops
+        let stopReceiver = hit(stopCenter)
+        check(stopReceiver !== disclosure && stopReceiver?.isDescendant(of: disclosure) != true,
+              "Stop center \(stopCenter) routed to disclosure: \(path(stopReceiver))")
+        click(stopCenter, nativeTracking: true)
+        check(stops == priorStops + 1 && clicks == beforeStop,
+              "window click at Stop center \(stopCenter): Stop fired \(stops-priorStops), disclosure fired \(clicks-beforeStop); hit \(path(stopReceiver)), enabled=\(stop.isEnabled), hidden=\(stop.isHiddenOrHasHiddenAncestor)")
+
         let b = content.bounds
         for x in [b.minX + 1, b.maxX - 1] {
             for y in [b.minY + 1, b.maxY - 1] {
-                expect(hit(NSPoint(x: x, y: y)) == nil, "Transparent corners must not take clicks")
+                let point = NSPoint(x: x, y: y), corner = hit(point)
+                check(corner == nil, "clear corner \(point) hit \(path(corner))")
             }
         }
-        let gutter = hit(NSPoint(x: b.midX, y: b.maxY - 4))
-        expect(panel.isMovableByWindowBackground && gutter != nil && !(gutter is NSControl),
-               "The top gutter must remain available for dragging")
-        let center = NSPoint(x: target.midX, y: target.midY)
-        let outside = NSPoint(x: target.minX - 2, y: target.midY)
-        let receiver = hit(center)!
-        let beforeDrag = clicks
-        receiver.mouseDown(with: event(.leftMouseDown, at: center))
-        receiver.mouseDragged(with: event(.leftMouseDragged, at: outside))
-        receiver.mouseUp(with: event(.leftMouseUp, at: outside))
-        expect(clicks == beforeDrag, "Dragging out and releasing must cancel the click: \(mode)")
-        receiver.mouseDown(with: event(.leftMouseDown, at: center))
-        receiver.mouseDragged(with: event(.leftMouseDragged, at: outside))
-        receiver.mouseDragged(with: event(.leftMouseDragged, at: center))
-        receiver.mouseUp(with: event(.leftMouseUp, at: center))
-        receiver.mouseUp(with: event(.leftMouseUp, at: center))
-        expect(clicks == beforeDrag + 1, "Reentering and releasing must click exactly once: \(mode)")
-        disclosure.performClick(nil)
-        let expectedLabel = compact ? "Expand recording controls" : "Collapse recording controls"
-        expect(clicks == beforeDrag + 2 && disclosure.accessibilityLabel() == expectedLabel,
-               "Native button action and its accessibility label must remain available: \(mode)")
-        disclosure.isEnabled = false
-        let beforeDisabledClick = clicks
-        if hit(center) === disclosure {
-            disclosure.mouseDown(with: event(.leftMouseDown, at: center))
-            disclosure.mouseUp(with: event(.leftMouseUp, at: center))
+        let gutterPoint = NSPoint(x: b.midX, y: b.maxY - 4)
+        let gutter = hit(gutterPoint)
+        check(panel.isMovableByWindowBackground && gutter != nil && !(gutter is NSControl),
+              "drag gutter \(gutterPoint) hit \(path(gutter)); movable=\(panel.isMovableByWindowBackground)")
+        let center = NSPoint(x: target.midX, y: target.midY), outside = NSPoint(x: target.minX - 2, y: target.midY)
+        let receiver = hit(center), beforeDrag = clicks
+        if receiver === disclosure {
+            receiver?.mouseDown(with: event(.leftMouseDown, at: center))
+            receiver?.mouseDragged(with: event(.leftMouseDragged, at: outside))
+            receiver?.mouseUp(with: event(.leftMouseUp, at: outside))
+            check(clicks == beforeDrag, "released outside at \(outside), click delta \(clicks-beforeDrag)")
+            receiver?.mouseDown(with: event(.leftMouseDown, at: center))
+            receiver?.mouseDragged(with: event(.leftMouseDragged, at: outside))
+            receiver?.mouseDragged(with: event(.leftMouseDragged, at: center))
+            receiver?.mouseUp(with: event(.leftMouseUp, at: center))
+            receiver?.mouseUp(with: event(.leftMouseUp, at: center))
+            check(clicks == beforeDrag + 1, "reentered at \(center), click delta \(clicks-beforeDrag)")
         }
-        expect(clicks == beforeDisabledClick, "Disabled disclosure must not invoke its action: \(mode)")
+        let beforeNative = clicks
+        disclosure.performClick(nil)
+        let label = compact ? "Expand recording controls" : "Collapse recording controls"
+        check(clicks == beforeNative + 1 && disclosure.accessibilityLabel() == label,
+              "native button click delta \(clicks-beforeNative), label \(disclosure.accessibilityLabel() ?? "nil")")
+        disclosure.isEnabled = false
+        let beforeDisabled = clicks
+        if hit(center) === disclosure { click(center) }
+        check(clicks == beforeDisabled, "disabled click at \(center) fired; hit \(path(hit(center)))")
         disclosure.isEnabled = true
         disclosure.isHidden = true
-        expect(hit(center) !== disclosure, "Hidden disclosure must not intercept its old location: \(mode)")
+        check(hit(center) !== disclosure, "hidden disclosure still intercepted \(center)")
         disclosure.isHidden = false
         content.layoutSubtreeIfNeeded()
-        guard let mask = (content as? NSVisualEffectView)?.maskImage,
-              let bitmap = mask.tiffRepresentation.flatMap(NSBitmapImageRep.init(data:)) else {
-            fatalError("A layer corner radius alone does not clip the behind-window material")
-        }
-        expect(bitmap.colorAt(x: 0, y: 0)!.alphaComponent < 0.02 &&
-               bitmap.colorAt(x: bitmap.pixelsWide / 2, y: bitmap.pixelsHigh / 2)!.alphaComponent > 0.98 &&
-               mask.capInsets.top == content.layer?.cornerRadius && mask.resizingMode == .stretch &&
-               content.layer?.masksToBounds == true, "Material and child views need the same rounded corners")
+        if let mask = (content as? NSVisualEffectView)?.maskImage,
+           let bitmap = mask.tiffRepresentation.flatMap(NSBitmapImageRep.init(data:)),
+           let cornerAlpha = bitmap.colorAt(x: 0, y: 0)?.alphaComponent,
+           let interiorAlpha = bitmap.colorAt(x: bitmap.pixelsWide/2, y: bitmap.pixelsHigh/2)?.alphaComponent {
+            check(cornerAlpha < 0.02 && interiorAlpha > 0.98 && mask.capInsets.top == content.layer?.cornerRadius
+                    && mask.resizingMode == .stretch && content.layer?.masksToBounds == true,
+                  "material corner/interior alpha=\(cornerAlpha)/\(interiorAlpha), cap=\(mask.capInsets), layer radius=\(String(describing: content.layer?.cornerRadius)), stretch=\(mask.resizingMode == .stretch), clips=\(String(describing: content.layer?.masksToBounds))")
+        } else { check(false, "missing or unreadable visual effect mask") }
+        for issue in failures { print("Panel geometry: \(issue)") }
+        return failures
     }
 
     @MainActor static func render(_ content: NSView, name: String) {

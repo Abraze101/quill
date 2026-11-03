@@ -7,7 +7,6 @@ import os
 from pathlib import Path
 import re
 import shutil
-import signal
 import sqlite3
 import subprocess
 import tempfile
@@ -937,23 +936,8 @@ class ConnectorRunner:
             # subprocess.run kills its immediate child on timeout or an
             # interrupt. Give our adapter time to unwind its own Codex process
             # group before escalating; retain the worker lock until cleanup.
-            def signal_group(signum):
-                try:
-                    os.killpg(process.pid, signum)
-                except ProcessLookupError:
-                    pass
-                except PermissionError:
-                    # macOS can deny a signal during the exit/reap race.
-                    if process.poll() is None:
-                        raise
-
-            signal_group(signal.SIGTERM)
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
-            signal_group(signal.SIGKILL)
-            process.wait()
+            from .owned_process import stop_process_group
+            stop_process_group(process, grace_seconds=5)
 
     def task(self, job, stage):
         path = self.state / "jobs.sqlite3"

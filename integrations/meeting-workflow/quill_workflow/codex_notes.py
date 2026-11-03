@@ -20,6 +20,7 @@ import unicodedata
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from quill_workflow.owned_process import stop_process_group
 from quill_workflow.pipeline import WorkflowError, atomic_json, read_json, render_notes
 from quill_workflow.capture_quality import validated_quality
 from quill_workflow.transcript_sources import (bind_speaker_review, effective_attributions,
@@ -189,22 +190,6 @@ def child_environment(executable):
     env = {key: os.environ[key] for key in names if key in os.environ}
     env["PATH"] = str(Path(executable).parent) + os.pathsep + os.defpath
     return env
-
-
-def stop_process_group(process):
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    try:
-        process.wait(timeout=2)
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    process.wait()
 
 
 def validate_result(data, transcript, require_title=False):
