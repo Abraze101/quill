@@ -3,6 +3,7 @@ from datetime import datetime
 import hashlib
 import html
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import TCPServer
 import math
 import os
 import re
@@ -789,6 +790,14 @@ class _ReviewHandler(BaseHTTPRequestHandler):
         self._send(303, "", location=_selected_path(self.server, form["job"]))
 
 
+class _LoopbackReviewServer(HTTPServer):
+    def server_bind(self):
+        # HTTPServer normally looks up the machine's DNS name before listening.
+        # This private URL always uses its bound numeric loopback address.
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address
+
+
 def create_server(state, on_decision=None, resume_options=None, on_resume=None,
                   processing_options=None, on_retry=None, sharing_options=None, on_sharing=None,
                   deletion_options=None, on_delete=None, cancellation_options=None, on_cancel_processing=None):
@@ -802,7 +811,7 @@ def create_server(state, on_decision=None, resume_options=None, on_resume=None,
         review_state = reviews.state.absolute()
     finally:
         reviews.close()
-    server = HTTPServer(("127.0.0.1", 0), _ReviewHandler)
+    server = _LoopbackReviewServer(("127.0.0.1", 0), _ReviewHandler)
     server.review_state = review_state
     server.review_host = "127.0.0.1:" + str(server.server_address[1])
     server.review_origin = "http://" + server.review_host

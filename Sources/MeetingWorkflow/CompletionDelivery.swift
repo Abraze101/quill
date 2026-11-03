@@ -56,19 +56,23 @@ public actor CompletionDelivery {
         while process.isRunning && Date() < deadline {
             try? await Task.sleep(for: .milliseconds(100))
         }
-        if process.isRunning {
+        let timedOut = process.isRunning
+        if timedOut {
             process.terminate()
             let grace = Date().addingTimeInterval(2)
             while process.isRunning && Date() < grace { try? await Task.sleep(for: .milliseconds(100)) }
             if process.isRunning { kill(process.processIdentifier, SIGKILL) }
-            process.waitUntilExit()
-            if let launchJournalError { throw launchJournalError }
-            try journal.finish(job.id, exitCode: -2, retryDelay: retryDelay)
-        } else {
-            process.waitUntilExit()
-            if let launchJournalError { throw launchJournalError }
-            try journal.finish(job.id, exitCode: process.terminationStatus, retryDelay: retryDelay)
         }
+        // Foundation also calls a handler installed after exit. Waiting for
+        // that event keeps the lease until exit without blocking an actor
+        // thread in Process.waitUntilExit's run loop.
+        let status: Int32 = await withCheckedContinuation { continuation in
+            process.terminationHandler = { child in
+                continuation.resume(returning: child.terminationStatus)
+            }
+        }
+        if let launchJournalError { throw launchJournalError }
+        try journal.finish(job.id, exitCode: timedOut ? -2 : status, retryDelay: retryDelay)
         if let finished = try journal.jobs().first(where: { $0.id == job.id }), finished.state == .failed {
             onFailure?(job.session.lastPathComponent)
         }

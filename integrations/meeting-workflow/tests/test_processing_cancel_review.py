@@ -62,8 +62,16 @@ class CancelReviewEntryPointTests(unittest.TestCase):
                                      "--state", str(state), "review", "--no-open", "--print-url", "--timeout", "30"],
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             try:
-                self.assertTrue(select.select([proc.stdout], [], [], 10)[0], "Review server did not start")
-                url = urlsplit(proc.stdout.readline().strip())
+                readable, _, _ = select.select([proc.stdout], [], [], 10)
+                address = proc.stdout.readline().strip() if readable else ""
+                if not address:
+                    status = proc.poll()
+                    outcome = f"exited with status {status}" if status is not None else "did not announce a URL within 10 seconds"
+                    if status is None:
+                        proc.terminate()
+                    _, error = proc.communicate(timeout=5)
+                    self.fail(f"Review server {outcome}. stderr: {error[-2000:].strip() or '(empty)'}")
+                url = urlsplit(address)
                 self.assertEqual(url.hostname, "127.0.0.1")
                 def request(path, form=None):
                     conn = http.client.HTTPConnection(url.hostname, url.port, timeout=5)

@@ -380,6 +380,12 @@ class ReviewServerTests(unittest.TestCase):
             self.assertEqual(self.decide("resume", revision=saved["revision"], stages=stages)[0], 400)
         self.assertEqual(resumed, [])
 
+    def test_loopback_review_startup_does_not_require_dns(self):
+        with patch("socket.getfqdn", side_effect=AssertionError("Unexpected DNS lookup")):
+            with create_server(self.state) as server:
+                self.assertEqual(server.server_name, "127.0.0.1")
+                self.assertEqual(server.review_origin, f"http://127.0.0.1:{server.server_port}")
+
     def test_serve_review_times_out_without_opening_browser(self):
         with patch("quill_workflow.review_server.webbrowser.open") as browser:
             serve_review(self.state, open_browser=False, timeout_seconds=0.03)
