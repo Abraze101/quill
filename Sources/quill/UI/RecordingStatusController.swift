@@ -260,6 +260,9 @@ final class RecordingStatusController: NSObject, NSWindowDelegate {
         let header = NSStackView(views: [marker, heading, spacer(), compactElapsed, compactPauseButton, compactStopButton, collapseButton])
         header.orientation = .horizontal
         header.spacing = 8
+        // AppKit lays out alignment rectangles. On macOS 15 the native
+        // button frames extend a combined nine points into this gap.
+        header.setCustomSpacing(16, after: compactStopButton)
         header.alignment = .centerY
         add(header, to: root)
 
