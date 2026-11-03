@@ -841,11 +841,31 @@ struct RecordingControlChecks {
         }
         let disclosure = button("quill-status-disclosure", in: content)
         let target = content.convert(disclosure.bounds, from: disclosure)
+        let mode = compact ? "compact" : "expanded"
         expect(target.width >= 40 && target.height >= 28 && disclosure.isBordered,
-            "Collapse and expand need a visible rectangular target")
-        for x in [target.minX + 3, target.maxX - 3] {
-            for y in [target.minY + 3, target.maxY - 3] {
-                expect(hit(NSPoint(x: x, y: y)) === disclosure, "Button padding must accept the click")
+            "Collapse and expand need a visible rectangular target: \(mode), target=\(target)")
+        var clicks = 0
+        let original = disclosure.onClick
+        disclosure.onClick = { clicks += 1 }
+        defer { disclosure.onClick = original }
+        for x in [target.minX + 0.5, target.midX, target.maxX - 0.5] {
+            for y in [target.minY + 0.5, target.midY, target.maxY - 0.5] {
+                let point = NSPoint(x: x, y: y)
+                let receiver = hit(point)
+                let receiverClass = receiver.map { String(describing: type(of: $0)) } ?? "nil"
+                let context = "\(mode), point=\(point), target=\(target), content=\(content.bounds), hit=\(receiverClass), descendant=\(receiver?.isDescendant(of: disclosure) == true)"
+                expect(receiver === disclosure, "Button padding must accept the click: \(context)")
+                // The panel stays offscreen. Dispatch to the view selected by
+                // hitTest and let NSButton track the paired local mouse-up.
+                func event(_ type: NSEvent.EventType) -> NSEvent {
+                    NSEvent.mouseEvent(with: type, location: content.convert(point, to: nil), modifierFlags: [],
+                        timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: panel.windowNumber,
+                        context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!
+                }
+                let previous = clicks
+                NSApp.postEvent(event(.leftMouseUp), atStart: true)
+                receiver?.mouseDown(with: event(.leftMouseDown))
+                expect(clicks == previous + 1, "Routed padding click must invoke the action exactly once: \(context)")
             }
         }
         let stop = button(compact ? "quill-status-compact-stop" : "quill-status-stop", in: content)
@@ -861,6 +881,16 @@ struct RecordingControlChecks {
         let gutter = hit(NSPoint(x: b.midX, y: b.maxY - 4))
         expect(panel.isMovableByWindowBackground && gutter != nil && !(gutter is NSControl),
                "The top gutter must remain available for dragging")
+        let center = NSPoint(x: target.midX, y: target.midY)
+        disclosure.isEnabled = false
+        let beforeDisabledClick = clicks
+        (hit(center) as? NSButton)?.performClick(nil)
+        expect(clicks == beforeDisabledClick, "Disabled disclosure must not invoke its action: \(mode)")
+        disclosure.isEnabled = true
+        disclosure.isHidden = true
+        expect(hit(center) !== disclosure, "Hidden disclosure must not intercept its old location: \(mode)")
+        disclosure.isHidden = false
+        content.layoutSubtreeIfNeeded()
         guard let mask = (content as? NSVisualEffectView)?.maskImage,
               let bitmap = mask.tiffRepresentation.flatMap(NSBitmapImageRep.init(data:)) else {
             fatalError("A layer corner radius alone does not clip the behind-window material")

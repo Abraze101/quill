@@ -219,6 +219,7 @@ final class RecordingStatusController: NSObject, NSWindowDelegate {
 
     private func buildContent() {
         let material = RecordingPanelSurface(frame: .zero)
+        material.disclosure = collapseButton
         panel.contentView = material
         root.orientation = .vertical
         root.alignment = .leading
@@ -529,6 +530,7 @@ private final class RecordingControlPanel: NSPanel {
 /// hits outside the same outline when AppKit dispatches events.
 private final class RecordingPanelSurface: NSVisualEffectView {
     private static let radius: CGFloat = 14
+    weak var disclosure: NSButton?
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -556,6 +558,14 @@ private final class RecordingPanelSurface: NSVisualEffectView {
         let local = convert(point, from: superview)
         guard NSBezierPath(roundedRect: bounds, xRadius: Self.radius, yRadius: Self.radius).contains(local) else {
             return nil
+        }
+        // On macOS 15 normal HUD/stack hit testing can pass over the native
+        // bezel's padding. Route only this button's rectangle before deferring
+        // to AppKit for adjacent buttons, the drag gutter, and all other hits.
+        if let disclosure, disclosure.window === window, disclosure.isEnabled,
+           !disclosure.isHiddenOrHasHiddenAncestor,
+           disclosure.bounds.contains(disclosure.convert(local, from: self)) {
+            return disclosure
         }
         return super.hitTest(point)
     }
