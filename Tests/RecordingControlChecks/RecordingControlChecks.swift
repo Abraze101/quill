@@ -848,6 +848,11 @@ struct RecordingControlChecks {
         let original = disclosure.onClick
         disclosure.onClick = { clicks += 1 }
         defer { disclosure.onClick = original }
+        func event(_ type: NSEvent.EventType, at point: NSPoint) -> NSEvent {
+            NSEvent.mouseEvent(with: type, location: content.convert(point, to: nil), modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: panel.windowNumber,
+                context: nil, eventNumber: 1, clickCount: 1, pressure: type == .leftMouseUp ? 0 : 1)!
+        }
         for x in [target.minX + 0.5, target.midX, target.maxX - 0.5] {
             for y in [target.minY + 0.5, target.midY, target.maxY - 0.5] {
                 let point = NSPoint(x: x, y: y)
@@ -855,16 +860,10 @@ struct RecordingControlChecks {
                 let receiverClass = receiver.map { String(describing: type(of: $0)) } ?? "nil"
                 let context = "\(mode), point=\(point), target=\(target), content=\(content.bounds), hit=\(receiverClass), descendant=\(receiver?.isDescendant(of: disclosure) == true)"
                 expect(receiver === disclosure, "Button padding must accept the click: \(context)")
-                // The panel stays offscreen. Dispatch to the view selected by
-                // hitTest and let NSButton track the paired local mouse-up.
-                func event(_ type: NSEvent.EventType) -> NSEvent {
-                    NSEvent.mouseEvent(with: type, location: content.convert(point, to: nil), modifierFlags: [],
-                        timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: panel.windowNumber,
-                        context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!
-                }
+                // AppKit delivers drag and release to the original down receiver.
                 let previous = clicks
-                NSApp.postEvent(event(.leftMouseUp), atStart: true)
-                receiver?.mouseDown(with: event(.leftMouseDown))
+                receiver?.mouseDown(with: event(.leftMouseDown, at: point))
+                receiver?.mouseUp(with: event(.leftMouseUp, at: point))
                 expect(clicks == previous + 1, "Routed padding click must invoke the action exactly once: \(context)")
             }
         }
@@ -882,9 +881,29 @@ struct RecordingControlChecks {
         expect(panel.isMovableByWindowBackground && gutter != nil && !(gutter is NSControl),
                "The top gutter must remain available for dragging")
         let center = NSPoint(x: target.midX, y: target.midY)
+        let outside = NSPoint(x: target.minX - 2, y: target.midY)
+        let receiver = hit(center)!
+        let beforeDrag = clicks
+        receiver.mouseDown(with: event(.leftMouseDown, at: center))
+        receiver.mouseDragged(with: event(.leftMouseDragged, at: outside))
+        receiver.mouseUp(with: event(.leftMouseUp, at: outside))
+        expect(clicks == beforeDrag, "Dragging out and releasing must cancel the click: \(mode)")
+        receiver.mouseDown(with: event(.leftMouseDown, at: center))
+        receiver.mouseDragged(with: event(.leftMouseDragged, at: outside))
+        receiver.mouseDragged(with: event(.leftMouseDragged, at: center))
+        receiver.mouseUp(with: event(.leftMouseUp, at: center))
+        receiver.mouseUp(with: event(.leftMouseUp, at: center))
+        expect(clicks == beforeDrag + 1, "Reentering and releasing must click exactly once: \(mode)")
+        disclosure.performClick(nil)
+        let expectedLabel = compact ? "Expand recording controls" : "Collapse recording controls"
+        expect(clicks == beforeDrag + 2 && disclosure.accessibilityLabel() == expectedLabel,
+               "Native button action and its accessibility label must remain available: \(mode)")
         disclosure.isEnabled = false
         let beforeDisabledClick = clicks
-        (hit(center) as? NSButton)?.performClick(nil)
+        if hit(center) === disclosure {
+            disclosure.mouseDown(with: event(.leftMouseDown, at: center))
+            disclosure.mouseUp(with: event(.leftMouseUp, at: center))
+        }
         expect(clicks == beforeDisabledClick, "Disabled disclosure must not invoke its action: \(mode)")
         disclosure.isEnabled = true
         disclosure.isHidden = true

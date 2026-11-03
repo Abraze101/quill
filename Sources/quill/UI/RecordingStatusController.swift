@@ -119,7 +119,7 @@ final class RecordingStatusController: NSObject, NSWindowDelegate {
     private let keepLocalButton = RecordingActionButton(title: "Keep local")
     private let processButton = RecordingActionButton(title: "Process entire recording")
     private let openFolderButton = RecordingActionButton(title: "Show recording in Finder")
-    private let collapseButton = RecordingActionButton(title: "")
+    private let collapseButton = RecordingDisclosureButton(title: "")
     private let dismissButton = RecordingActionButton(title: "Close")
     private let reviewActions = NSStackView()
     private var snapshot = RecordingStatusSnapshot()
@@ -573,7 +573,7 @@ private final class RecordingPanelSurface: NSVisualEffectView {
 
 /// AppKit may run a nested event loop while a mouse button is held. Freeze the
 /// action from mouse-down through dispatch, even if a newer snapshot arrives.
-final class RecordingActionButton: NSButton {
+class RecordingActionButton: NSButton {
     var onClick: (() -> Void)?
     private var trackingAction: (() -> Void)?
 
@@ -593,4 +593,42 @@ final class RecordingActionButton: NSButton {
         super.mouseDown(with: event)
     }
     @objc private func invoke() { (trackingAction ?? onClick)?() }
+}
+
+/// Older AppKit bezels ignore clicks on their frame's outer rim, even after
+/// hit testing selects the button. Keep native drawing, keyboard, and
+/// accessibility actions; use the full frame for this pointer gesture.
+private final class RecordingDisclosureButton: RecordingActionButton {
+    private var pressedAction: (() -> Void)?
+
+    private func containsMouse(_ event: NSEvent) -> Bool {
+        window != nil && event.window === window && isEnabled && !isHiddenOrHasHiddenAncestor
+            && bounds.contains(convert(event.locationInWindow, from: nil))
+    }
+
+    override var mouseDownCanMoveWindow: Bool { false }
+
+    override func mouseDown(with event: NSEvent) {
+        pressedAction = containsMouse(event) ? onClick : nil
+        highlight(pressedAction != nil)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        highlight(pressedAction != nil && containsMouse(event))
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        let action = pressedAction
+        pressedAction = nil
+        highlight(false)
+        if containsMouse(event) { action?() }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            pressedAction = nil
+            highlight(false)
+        }
+    }
 }
