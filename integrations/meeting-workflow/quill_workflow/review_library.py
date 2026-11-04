@@ -32,6 +32,7 @@ _JOB = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _ID = re.compile(r"[A-Za-z0-9_-]{10,200}")
 MAX_JSON_BYTES = 8_000_000
 MAX_TRANSCRIPT_CHARACTERS = 200_000
+MAX_NOTES_CHARACTERS = 200_000
 _INVALID = object()
 
 
@@ -467,7 +468,7 @@ def _storage(sources, job, stage, tasks, transcript_hash, route, metadata, notes
     return result
 
 
-def _entry(sources, row, tasks):
+def _entry(sources, row, tasks, *, include_notes=False):
     job = row["id"]
     transcript, transcript_hash, transcript_text, participants = _transcript(sources, job)
     metadata = sources.json(f"recordings/{job}/meta.json", 100_000)
@@ -488,7 +489,7 @@ def _entry(sources, row, tasks):
               "partly_saved" if "confirmed" in states else
               "not_requested" if all(item == "not_requested" for item in states) else "not_confirmed")
     filed = next((value for value in storage.values() if value["status"] == "confirmed"), {})
-    return {"title": title, "display_date": display_date, "recorded_at": recorded_at,
+    result = {"title": title, "display_date": display_date, "recorded_at": recorded_at,
             "participants": participants, "transcript_text": transcript_text,
             "recording_files": _recording_files(metadata), "local_folder": _local_folder(row),
             "company_id": route["company_id"] if route else None,
@@ -497,6 +498,41 @@ def _entry(sources, row, tasks):
             "meeting_folder_id": filed.get("meeting_folder_id"),
             "meeting_folder_name": filed.get("meeting_folder_name"),
             "storage_status": status, "storage": storage}
+    if include_notes:
+        text = render_notes(notes, transcript) if notes is not None else None
+        if text is not None and len(text) > MAX_NOTES_CHARACTERS:
+            text = text[:MAX_NOTES_CHARACTERS] + "\n\n[Notes preview shortened.]"
+        result["notes_text"] = text
+    return result
+
+
+def meeting_detail(state, job):
+    """Read one existing meeting, with notes rendered from validated sources.
+
+    Only the selected job's content is opened. Missing, removed, invalid, or
+    unreadable selections return None. Missing or unverified notes return
+    notes_text=None while the other available meeting details remain visible.
+    Filing states describe saved evidence, not a fresh Drive lookup.
+    """
+    if not isinstance(job, str) or not _JOB.fullmatch(job):
+        return None
+    try:
+        sources = _Sources(state)
+    except (OSError, ValueError, TypeError):
+        return None
+    try:
+        jobs, all_tasks, removed = sources.rows()
+        if job in removed:
+            return None
+        row = next((row for row in jobs if row["id"] == job), None)
+        if row is None:
+            return None
+        return _entry(sources, row, all_tasks.get(job, {}), include_notes=True)
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError,
+            RecursionError, sqlite3.Error, WorkflowError):
+        return None
+    finally:
+        sources.close()
 
 
 def meeting_library(state):

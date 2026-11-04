@@ -128,6 +128,7 @@ It does not import old recordings automatically.
 | [Drive filing](docs/codex-drive.md) | Documents, recordings, upload recovery, and optional OAuth |
 | [Notes sharing](docs/notes-sharing.md) | Calendar suggestions and explicit sharing approval |
 | [Updates and rollback](docs/updating-local-source.md) | Checkpoints, source replay, and safe updates |
+| [ChatGPT desktop plugin](plugins/quill/README.md) | Local recording status, meeting lookup, saved notes, and processing review |
 
 ## Data flow
 

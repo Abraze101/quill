@@ -1,0 +1,4 @@
+interface:
+  display_name: "Set up Quill"
+  short_description: "Connect this plugin to Quill on your Mac"
+  default_prompt: "Use $quill-setup to connect this plugin to my existing Quill installation."

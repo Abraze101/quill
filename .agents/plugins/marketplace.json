@@ -1,0 +1,20 @@
+{
+  "name": "quill-local",
+  "interface": {
+    "displayName": "Quill"
+  },
+  "plugins": [
+    {
+      "name": "quill",
+      "source": {
+        "source": "local",
+        "path": "./plugins/quill"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "name": "quill",
+  "version": "0.1.0",
+  "description": "Check local Quill recording status, find meetings, read saved notes, and open processing review.",
+  "repository": "https://github.com/Abraze101/quill",
+  "license": "MIT",
+  "skills": "./skills/",
+  "requires_local_executor": true,
+  "onboardingSkill": "./skills/quill-setup/SKILL.md",
+  "interface": {
+    "displayName": "Quill",
+    "shortDescription": "Your local recordings and meeting notes",
+    "longDescription": "Check whether Quill is recording, find a meeting, read saved notes or a transcript, and open Quill's existing processing review on your Mac.",
+    "developerName": "Quill contributors",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write"],
+    "websiteURL": "https://github.com/Abraze101/quill",
+    "composerIcon": "./assets/icon.svg",
+    "logo": "./assets/icon.svg",
+    "defaultPrompt": [
+      "Is Quill recording right now?",
+      "Find my latest Quill meeting and show me the notes.",
+      "Open Quill's meeting processing review."
+    ]
+  }
+}

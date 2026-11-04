@@ -1,0 +1,4 @@
+interface:
+  display_name: "Quill"
+  short_description: "Find recordings and read saved meeting notes"
+  default_prompt: "Use $quill to find my latest meeting and show its saved notes."

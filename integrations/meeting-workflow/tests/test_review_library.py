@@ -15,7 +15,7 @@ from quill_workflow.drive_upload import COMBINED_TEXT_FORMAT, NATIVE_TEMPLATE_FO
 from quill_workflow.meeting_document import build_document
 from quill_workflow.native_template import build_payload
 from quill_workflow.pipeline import SCHEMA, atomic_json, render_notes
-from quill_workflow.review_library import meeting_library
+from quill_workflow.review_library import meeting_detail, meeting_library
 
 
 def digest(value):
@@ -139,12 +139,97 @@ class ReviewLibraryTests(unittest.TestCase):
         view = self.view()
         self.assertIn("Jamie (suggested): Thanks.", view["transcript_text"])
         self.assertEqual(view["participants"], ["Anna"])
+        detail = meeting_detail(self.state, self.job)
+        self.assertEqual(detail["transcript_text"], view["transcript_text"])
+        self.assertEqual(detail["participants"], view["participants"])
+        self.assertEqual(detail["notes_text"], render_notes(self.notes, self.transcript))
         self.assertEqual((self.recording / "transcript.json").read_bytes(), self.transcript_bytes)
         self.notes["speaker_review"]["transcript_sha256"] = "0" * 64
         atomic_json(self.result / "notes/notes.json", self.notes)
         view = self.view()
         self.assertNotIn("Jamie", view["transcript_text"])
         self.assertIn("Other speaker 1: Thanks.", view["transcript_text"])
+        self.assertIsNone(meeting_detail(self.state, self.job)["notes_text"])
+
+    def test_detail_reads_only_selected_meeting_content_and_preserves_library_shape(self):
+        from quill_workflow.review_library import _Sources
+        self.db.execute("INSERT INTO jobs VALUES (?,?,?)", ("other-meeting", str(self.root / "private"), 2))
+        self.db.commit()
+        expected = self.view()
+        opened = []
+        original = _Sources.read
+
+        def read_selected(sources, relative, *args, **kwargs):
+            opened.append(str(relative))
+            self.assertEqual(Path(relative).parts[1], self.job)
+            return original(sources, relative, *args, **kwargs)
+
+        with patch.object(_Sources, "read", read_selected):
+            detail = meeting_detail(self.state, self.job)
+        self.assertTrue(opened)
+        self.assertEqual(detail.pop("notes_text"), render_notes(self.notes, self.transcript))
+        self.assertEqual(detail, expected)
+        self.assertNotIn("notes_text", self.view())
+        self.assertNotIn("settings", detail)
+        self.assertNotIn("receipt", detail)
+
+    def test_detail_renders_validated_notes_instead_of_unverified_markdown(self):
+        (self.result / "notes/notes.md").write_text("Unverified edited notes must not escape")
+        detail = meeting_detail(self.state, self.job)
+        self.assertEqual(detail["notes_text"], render_notes(self.notes, self.transcript))
+        self.assertNotIn("Unverified", detail["notes_text"])
+        provenance = dict(self.receipts["notes"], input_sha256="0" * 64)
+        atomic_json(self.result / "notes/provenance.json", provenance)
+        detail = meeting_detail(self.state, self.job)
+        self.assertIsNone(detail["notes_text"])
+        self.assertIsNotNone(detail["transcript_text"])
+
+    def test_detail_does_not_expose_notes_with_changed_source_or_receipt(self):
+        source = self.result / "notes/source-transcript.json"
+        source.write_bytes(b'{"segments": []}')
+        self.assertIsNone(meeting_detail(self.state, self.job)["notes_text"])
+        source.write_bytes(self.transcript_bytes)
+        receipt = self.result / "notes-receipt.json"
+        receipt.unlink()
+        self.assertIsNone(meeting_detail(self.state, self.job)["notes_text"])
+
+    def test_detail_rejects_invalid_absent_and_deleted_selections_before_content_reads(self):
+        with patch("quill_workflow.review_library._Sources", side_effect=AssertionError("Invalid ID opened state")):
+            for job in (None, True, [], "", "../escape", "valid/escape", "a" * 129):
+                self.assertIsNone(meeting_detail(self.state, job))
+        with patch("quill_workflow.review_library._Sources.read", side_effect=AssertionError("Unselected content opened")):
+            self.assertIsNone(meeting_detail(self.state, "missing-meeting"))
+            for status in ("cancelling", "ready", "trashed"):
+                self.db.execute("INSERT OR REPLACE INTO local_deletions VALUES (?,?)",
+                                (self.job, json.dumps({"status": status})))
+                self.db.commit()
+                self.assertIsNone(meeting_detail(self.state, self.job))
+
+    def test_detail_is_read_only_and_missing_state_creates_nothing(self):
+        before = {str(path.relative_to(self.state)): path.read_bytes()
+                  for path in self.state.rglob("*") if path.is_file()}
+        with patch("quill_workflow.pipeline.Queue", side_effect=AssertionError("Must not create Queue")):
+            self.assertIsNotNone(meeting_detail(self.state, self.job))
+        after = {str(path.relative_to(self.state)): path.read_bytes()
+                 for path in self.state.rglob("*") if path.is_file()}
+        self.assertEqual(before, after)
+        missing = self.root / "missing-state"
+        self.assertIsNone(meeting_detail(missing, self.job))
+        self.assertFalse(missing.exists())
+        empty = self.root / "empty-state"
+        empty.mkdir()
+        self.assertIsNone(meeting_detail(empty, self.job))
+        self.assertEqual(list(empty.iterdir()), [])
+
+    def test_detail_bounds_notes_and_does_not_follow_linked_notes(self):
+        with patch("quill_workflow.review_library.MAX_NOTES_CHARACTERS", 20):
+            text = meeting_detail(self.state, self.job)["notes_text"]
+        self.assertEqual(text, render_notes(self.notes, self.transcript)[:20] + "\n\n[Notes preview shortened.]")
+        notes = self.result / "notes/notes.json"
+        outside = self.root / "outside-notes.json"
+        notes.rename(outside)
+        notes.symlink_to(outside)
+        self.assertIsNone(meeting_detail(self.state, self.job)["notes_text"])
 
     def unset_stage(self, stage, status="pending"):
         self.task(stage, status)
