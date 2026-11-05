@@ -49,8 +49,8 @@ def _attributions(transcript, notes=None):
         raise WorkflowError(str(error)) from error
 
 
-def _speaker_context(transcript):
-    people = _attributions(transcript)
+def _speaker_context(transcript, identity=None):
+    people = _attributions(transcript, {"_speaker_identity": identity} if identity else None)
     if people is None:
         return {}
     return {"validated_speaker_names": {identity: person for identity, person in people.items() if "name" in person}}
@@ -71,9 +71,16 @@ def _quality_context(transcript):
 
 
 def _prompt_transcript(transcript):
-    """Pass only validated quality fields while leaving source segments exact."""
+    """Add explicit evidence indexes to prompt copies, never the saved source."""
     quality = _quality_context(transcript).get("capture_quality")
-    return dict(transcript, capture_quality=quality) if quality is not None else transcript
+    result = dict(transcript, segments=[dict(segment, segment_index=index)
+                                       for index, segment in enumerate(transcript["segments"])])
+    result["segment_index_instruction"] = (
+        "Cite each segment's explicit segment_index in evidence arrays. These are zero-based source references; "
+        "do not count segments yourself or use timestamps, speaker numbers, or one-based positions.")
+    if quality is not None:
+        result["capture_quality"] = quality
+    return result
 
 
 def correction_prompt(skill, transcript, draft, validation_error, context=None):
@@ -196,7 +203,7 @@ def validate_result(data, transcript, require_title=False):
     attributions = _attributions(transcript, data)
     required = set(SECTIONS) | {"schema_version", "actions", "follow_up_draft"}
     if (not isinstance(data, dict) or not required <= set(data)
-            or set(data) - required - {"meeting_title", "speaker_review"}
+            or set(data) - required - {"meeting_title", "speaker_review", "_speaker_identity"}
             or type(data.get("schema_version")) is not int
             or require_title and "meeting_title" not in data):
         raise WorkflowError("Codex notes do not match the required output schema")
@@ -241,7 +248,7 @@ def validate_result(data, transcript, require_title=False):
             raise WorkflowError("Action owner name is absent from its cited transcript evidence; use null")
 
 
-def run(input_path, output_path, skill_path, executable="codex", model=None, timeout=900, context_path=None):
+def run(input_path, output_path, skill_path, executable="codex", model=None, timeout=900, context_path=None, speaker_context_path=None, identity_path=None, cancelled=None):
     from quill_workflow.processing_lease import child_lease_fds
     if not math.isfinite(timeout) or timeout <= 0:
         raise WorkflowError("Codex timeout must be positive")
@@ -259,6 +266,21 @@ def run(input_path, output_path, skill_path, executable="codex", model=None, tim
         context = validate_meeting_context(read_json(Path(context_path), limit=100_000)) if context_path else None
     except ValueError as error:
         raise WorkflowError(str(error)) from error
+    started = time.monotonic()
+    identity = None
+    if identity_path:
+        from quill_workflow.speaker_identity import validate_bundle
+        identity = validate_bundle(read_json(Path(identity_path), limit=500_000), transcript)
+    elif speaker_context_path and transcript.get("speaker_labels") == "diarized_v1":
+        from quill_workflow.speaker_review import run as review_speakers, validate_context
+        from quill_workflow.speaker_identity import empty_bundle
+        identity_context = validate_context(read_json(Path(speaker_context_path), limit=100_000))
+        identity = empty_bundle(transcript, identity_context)
+        with tempfile.TemporaryDirectory(prefix="quill-speakers-") as temporary:
+            report_path = Path(temporary) / "review.json"
+            review_speakers(input_path, report_path, executable=executable, model=model,
+                            timeout=min(300, timeout / 2), context_path=speaker_context_path)
+            identity["report"] = read_json(report_path, limit=400_000)
     if (skill_path.is_symlink() or not skill_path.is_file()
             or skill_path.stat().st_size > 100_000):
         raise WorkflowError("Expected a bounded, regular Call Summary skill file")
@@ -269,12 +291,15 @@ def run(input_path, output_path, skill_path, executable="codex", model=None, tim
                         "and null for an unnecessary follow-up draft. Do not use tools.",
                         "call_summary_skill": skill, "transcript": _prompt_transcript(transcript),
                         "meeting_context": context,
-                        **_speaker_context(transcript), **_quality_context(transcript)},
+                        "focused_speaker_review": identity,
+                        **_speaker_context(transcript, identity), **_quality_context(transcript)},
                         ensure_ascii=False, allow_nan=False)
     output_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    deadline = time.monotonic() + timeout
+    deadline = started + timeout
 
     def remaining_time():
+        if cancelled and cancelled():
+            raise WorkflowError("Notes refresh was cancelled; no output was accepted")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise WorkflowError("Codex notes timed out; no output was accepted")
@@ -355,6 +380,14 @@ def run(input_path, output_path, skill_path, executable="codex", model=None, tim
             "repeating the same point across sections. Keep references in evidence arrays; "
             "do not add source lines or timestamps to the prose. "
             "Do not invent details.\n")
+        if identity:
+            instructions += (
+                "A caller-validated focused_speaker_review is supplied. Use its confirmed names and user corrections "
+                "for exactly the indicated voice IDs; its suggestions remain tentative. Do not redo or contradict "
+                "this review. Return an empty speaker_review.assignments array; the caller attaches the validated "
+                "focused review separately. Confirmed user spellings may be used with evidence from that voice "
+                "even if the transcription misspelled their name. Never promote suggested names to definite owners. "
+                "Every use of a suggested name needs independent exact speech evidence or (suggested) beside it.\n")
         for attempt in range(2):
             # Never leave an old answer at the next invocation's output path.
             directory = Path(temporary) / ("attempt-" + str(attempt + 1))
@@ -372,7 +405,17 @@ def run(input_path, output_path, skill_path, executable="codex", model=None, tim
                 raise WorkflowError("Codex CLI could not be started") from error
             try:
                 try:
-                    process.communicate(prompt.encode("utf-8"), timeout=remaining_time())
+                    if cancelled is None:
+                        process.communicate(prompt.encode("utf-8"), timeout=remaining_time())
+                    else:
+                        payload = prompt.encode("utf-8")
+                        while True:
+                            try:
+                                process.communicate(payload, timeout=min(1, remaining_time()))
+                                break
+                            except subprocess.TimeoutExpired:
+                                payload = None
+                                remaining_time()
                 except subprocess.TimeoutExpired as error:
                     raise WorkflowError("Codex notes timed out; no output was accepted") from error
                 if process.returncode != 0:
@@ -386,7 +429,15 @@ def run(input_path, output_path, skill_path, executable="codex", model=None, tim
                     data = json.loads(raw)
                 except ValueError as error:
                     raise WorkflowError("Codex notes are not valid JSON") from error
+                if isinstance(data, dict) and "_speaker_identity" in data:
+                    raise WorkflowError("Model output cannot supply trusted speaker corrections")
+                if (identity and isinstance(data, dict) and isinstance(data.get("speaker_review"), dict)
+                        and data["speaker_review"].get("assignments")):
+                    raise WorkflowError("Use the supplied focused review; leave legacy assignments empty")
                 data = bind_speaker_review(data, transcript, context)
+                if identity:
+                    from quill_workflow.speaker_identity import attach
+                    data = attach(data, transcript, identity)
                 validate_result(data, transcript, require_title=True)
             except (WorkflowError, ValueError) as error:
                 diagnostic = " ".join(str(error).split())[:500]
@@ -394,6 +445,10 @@ def run(input_path, output_path, skill_path, executable="codex", model=None, tim
                     raise WorkflowError("Codex notes failed validation after one correction: "
                                         + diagnostic) from error
                 prompt = correction_prompt(skill, transcript, raw, diagnostic, context)
+                if identity:
+                    payload = json.loads(prompt)
+                    payload.update(focused_speaker_review=identity, **_speaker_context(transcript, identity))
+                    prompt = json.dumps(payload, ensure_ascii=False, allow_nan=False)
                 continue
             remaining_time()
             atomic_json(output_path, data)
@@ -408,6 +463,8 @@ def main(argv=None):
     parser.add_argument("--skill", required=True)
     parser.add_argument("--codex", default="codex", help="Path to the authenticated Codex CLI")
     parser.add_argument("--model", help="Model override; otherwise use the CLI default")
+    parser.add_argument("--speaker-context", help="Invitation and confirmed identity candidates")
+    parser.add_argument("--speaker-identity", help="Previously validated speaker review and corrections")
     parser.add_argument("--context", help="Optional bounded meeting-name context snapshot")
     parser.add_argument("--timeout", type=float, default=900,
                         help="Seconds, shorter than the surrounding connector timeout")
@@ -418,7 +475,7 @@ def main(argv=None):
 
     previous = signal.signal(signal.SIGTERM, interrupted)
     try:
-        run(args.input, args.output, args.skill, args.codex, args.model, args.timeout, args.context)
+        run(args.input, args.output, args.skill, args.codex, args.model, args.timeout, args.context, args.speaker_context, args.speaker_identity)
     except (WorkflowError, OSError, ValueError) as error:
         print(str(error), file=sys.stderr)
         return 1

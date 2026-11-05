@@ -373,6 +373,9 @@ class _RPC:
         "remoteControl/status/changed", "thread/started", "thread/status/changed",
         "mcpServer/startupStatus/updated", "warning", "configWarning",
         "deprecationNotice", "app/list/updated", "skills/changed",
+        # Newer app-servers emit this auth-status notification during startup.
+        # It carries no operation; messages with an id still fail below.
+        "account/updated",
     ))
 
     def __init__(self, directory, tool, arguments):

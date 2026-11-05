@@ -33,7 +33,7 @@ def meeting_title(notes, transcript):
     """
     # Validate the derived view before every notes renderer accepts it.
     from .transcript_sources import effective_attributions
-    attributions = effective_attributions(transcript, notes) if "speaker_review" in notes else None
+    attributions = effective_attributions(transcript, notes) if "speaker_review" in notes or "_speaker_identity" in notes else None
     if "meeting_title" not in notes:
         return None
     title = notes["meeting_title"]

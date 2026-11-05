@@ -498,6 +498,28 @@ def _entry(sources, row, tasks, *, include_notes=False):
             "meeting_folder_id": filed.get("meeting_folder_id"),
             "meeting_folder_name": filed.get("meeting_folder_name"),
             "storage_status": status, "storage": storage}
+    # Cloud receipts describe the filed version above. Local corrections are a
+    # separate derived view and cannot make an old Drive payload look current.
+    if transcript is not None:
+        try:
+            from .speaker_corrections import load_bundle
+            from .speaker_identity import attach
+            bundle = load_bundle(sources, job, transcript, notes)
+            if bundle["report"] or bundle["corrections"]["assignments"] or (notes or {}).get("_speaker_identity"):
+                try:
+                    from .speaker_notes import load_reviewed_notes
+                    revised = load_reviewed_notes(sources, job, transcript, notes, bundle)
+                except ImportError:
+                    revised = None
+                display_notes = attach(revised or notes, transcript, bundle)
+                if notes is not None or revised is not None:
+                    notes = display_notes
+                people = effective_attributions(transcript, display_notes) or {}
+                result["transcript_text"] = render_reviewed_transcript(transcript, display_notes)[:MAX_TRANSCRIPT_CHARACTERS]
+                result["participants"] = list(dict.fromkeys(p["name"] for p in people.values() if p.get("name")))
+                result["speaker_corrections_local"] = bool(bundle["corrections"]["assignments"])
+        except (ValueError, TypeError, KeyError, OSError):
+            result["speaker_review_error"] = "Speaker corrections need review; original text is shown."
     if include_notes:
         text = render_notes(notes, transcript) if notes is not None else None
         if text is not None and len(text) > MAX_NOTES_CHARACTERS:

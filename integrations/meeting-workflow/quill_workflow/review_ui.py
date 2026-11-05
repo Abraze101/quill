@@ -67,7 +67,7 @@ font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
 a{color:var(--accent);text-underline-offset:3px}button,input,select,textarea{font:inherit;color:inherit}
 button,a,summary,label{-webkit-tap-highlight-color:transparent}
 button,.button{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:38px;padding:8px 13px;border:1px solid var(--line);border-radius:7px;background:var(--surface);text-decoration:none;color:var(--ink);font-weight:500;line-height:1.4;cursor:pointer}
-button[value=approve],button[value=sharing_confirm],button[value=sharing_prepare],button[value=resume],button[value=retry]{background:var(--accent);border-color:var(--accent);color:#fff}
+button[value=approve],button[value=sharing_confirm],button[value=sharing_prepare],button[value=resume],button[value=retry],button[value=speaker_save]{background:var(--accent);border-color:var(--accent);color:#fff}
 button[value=skip],button[value=sharing_private],.quiet{background:transparent;color:var(--muted)}
 button:disabled{opacity:.5;cursor:default}:focus-visible{outline:3px solid #6a8fd1;outline-offset:3px}
 input,select,textarea{border:1px solid var(--line);border-radius:7px;background:var(--surface);padding:10px 12px;max-width:100%}
@@ -124,6 +124,12 @@ details>p,details>ul{margin:14px 16px}details>form{margin:14px 16px}details>.not
 .sharing-review h3{margin-top:0}.sharing-review .review-layout{display:flex;flex-direction:column;gap:15px}.sharing-review .action-pane{border:0;padding:0}.sharing-review .reading{min-width:0}
 .sharing-heading{margin-top:0}.calendar-event{padding:14px 17px;border:1px solid var(--line);border-radius:8px;margin:14px 0;background:var(--subtle)}.calendar-event h5{margin:0 0 10px}.calendar-event ul,.calendar-event p{font-size:13px}
 .suggestion{font-size:13px}.suggestion-title{margin:0 0 7px}.notes-caption{font-size:12px;color:var(--muted)}
+.speaker-card{border:1px solid var(--line);border-radius:9px;padding:20px;margin:18px 0;min-width:0}
+.speaker-card>header{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:14px}.speaker-card h2{font-size:17px;margin:0 0 3px}.speaker-card code{font-size:11px;color:var(--muted);overflow-wrap:anywhere}.speaker-card .badge{flex:none}
+.speaker-samples{padding-left:12px;border-left:2px solid var(--line);margin:14px 0}.speaker-samples blockquote{font-size:13px;margin:7px 0;overflow-wrap:anywhere}
+.speaker-card form{margin:12px 0 0}.speaker-card .speaker-fields{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px;margin-top:0}.speaker-fields label{font-size:13px;margin:0 0 6px}.speaker-fields input{width:100%;min-width:0}
+.speaker-card .speaker-remember{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:400;margin:13px 0;min-height:32px}.speaker-remember input{margin:0;width:16px;height:16px;flex:none;accent-color:var(--accent)}.speaker-card form>button{margin-bottom:0}.speaker-card form:has(button.quiet){display:inline-block;margin-right:8px}
+.speaker-notes-status{border-top:1px solid var(--line);padding-top:16px;margin:20px 0}.speaker-notes-status>p:first-child{font-size:13px;font-weight:500;margin-bottom:8px}.speaker-notes-status form{margin:10px 0 0}
 .notice{background:var(--tint);border-radius:8px;padding:12px 16px;margin-bottom:22px;font-size:13px}
 [role=alert]{color:var(--red)}.empty{padding:55px 0;max-width:500px;color:var(--muted)}.empty h2{font-size:20px;color:var(--ink)}
 .review-footer{font-size:12px;color:var(--muted);margin-top:34px;display:flex;gap:15px;flex-wrap:wrap}
@@ -131,10 +137,11 @@ details>p,details>ul{margin:14px 16px}details>form{margin:14px 16px}details>.not
 .error-page{max-width:680px;padding:34px;background:var(--surface);border:1px solid var(--line);border-radius:12px;margin:40px auto}.error-page h1{font-size:25px}.error-page h2{font-size:19px}
 @media(hover:hover){.nav-link:hover,.meeting-row:hover{background:var(--subtle)}.nav-link[aria-current=page]:hover{background:var(--tint)}button:hover,.button:hover{filter:brightness(.97)}}
 @media(prefers-color-scheme:dark){:root{--bg:#141715;--surface:#191c1a;--subtle:#141715;--ink:#e4eae5;--muted:#a2afa6;--line:#343c36;--accent:#b8d9be;--tint:#293b2e;--amber:#e7c18b;--amber-bg:#342b20;--red:#f1aaa4;--red-bg:#3c2928}
-button[value=approve],button[value=sharing_confirm],button[value=sharing_prepare],button[value=resume],button[value=retry]{color:#18291e}}
+button[value=approve],button[value=sharing_confirm],button[value=sharing_prepare],button[value=resume],button[value=retry],button[value=speaker_save]{color:#18291e}}
 @media(max-width:1000px){.app{padding:0 14px;margin:14px auto}.workspace{grid-template-columns:170px minmax(0,1fr)}.meeting-main{padding:24px}.table-head,.meeting-row{grid-template-columns:minmax(0,1fr) 135px}.folder-column{display:none}.panel-header h1{font-size:26px}}
 @media(max-width:620px){.app{margin:0;padding:0}.workspace{display:block;border:0;border-radius:0;min-height:100vh}.sidebar{padding:16px;border-right:0;border-bottom:1px solid var(--line)}.brand{margin:0 0 12px;font-size:19px}.brand svg{width:23px;height:23px}.sidebar nav{display:flex;gap:5px;flex-wrap:wrap}.nav-link{margin:0;min-height:38px;font-size:12px;padding:6px 9px}.nav-label{width:100%;margin:8px 9px 0}.sidebar-foot{display:none}.meeting-main{padding:22px 18px}.toolbar{gap:15px;margin-bottom:24px}.search{width:100%;max-width:none}.search input[type=search]{flex:1;width:100%}.table-head{display:none}.meeting-row{display:flex;flex-direction:column;align-items:flex-start;gap:8px;padding:16px 2px}.row-meta{font-size:12px}.panel-header h1{font-size:25px}.tabs{gap:22px}.activity dl{grid-template-columns:1fr;gap:5px}.activity dd{margin-bottom:14px}.error-page{margin:15px;padding:24px}.toolbar-actions{gap:12px}.workflow-action{padding:15px}.review-footer{margin-top:28px}}
 @media(pointer:coarse){button,.button,.nav-link,.tab,.back,.refresh,summary{min-height:44px}input,textarea,select{font-size:16px}}
+@media(max-width:620px){.speaker-card{padding:16px}.speaker-card .speaker-fields{grid-template-columns:minmax(0,1fr)}.speaker-card>header{flex-wrap:wrap}.speaker-card .speaker-remember{min-height:44px}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;transition:none!important;animation:none!important}}
 """
 
@@ -231,11 +238,17 @@ def _meeting_content(entry, path, navigation, tab):
     elif tab == "notes" and entry.get("detail") and not entry.get("notes") and not entry.get("processing_cancelled"):
         body += '<p class="muted">' + escape(entry["detail"]) + '</p>'
     body += '<nav class="tabs" aria-label="Meeting content">'
-    for key, label in (("notes", "Notes"), ("transcript", "Transcript"), ("recording", "Recording")):
+    tabs = [("notes", "Notes"), ("transcript", "Transcript")]
+    if entry.get("speakers_available"):
+        tabs.append(("speakers", "Speakers"))
+    tabs.append(("recording", "Recording"))
+    for key, label in tabs:
         body += _link(label, url(key), 'tab', tab == key)
     body += '</nav>'
     if tab == "sharing":
         body += (entry.get("sharing_body") or '<p class="muted">Sharing is unavailable until this meeting’s private notes document is ready.</p>')
+    elif tab == "speakers":
+        body += entry.get("speaker_body") or '<p class="muted">Speaker corrections are unavailable for this meeting.</p>'
     elif tab == "transcript":
         transcript = entry.get("transcript") or entry.get("transcript_text")
         absent = ("No transcript preview is available for this meeting." if entry.get("processing_cancelled") else

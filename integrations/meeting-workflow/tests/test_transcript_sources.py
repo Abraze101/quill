@@ -1,10 +1,11 @@
 """Synthetic speaker evidence only; no model, recording or cloud access."""
 from pathlib import Path
+import json
 import sys
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from quill_workflow.transcript_sources import introduction_name, speaker_attributions, segment_label
+from quill_workflow.transcript_sources import introduction_candidates, introduction_name, speaker_attributions, segment_label
 
 
 def diarized_transcript():
@@ -22,6 +23,46 @@ def diarized_transcript():
 
 
 class TranscriptSourcesTests(unittest.TestCase):
+    def test_shared_native_v3_corpus_and_v2_compatibility(self):
+        for version, policies in (("v2", ("explicit_intro_v2", "explicit_intro_v3")),
+                                  ("v3", ("explicit_intro_v3",))):
+            path = Path(__file__).resolve().parents[3] / f"Tests/Fixtures/speaker-name-policy-{version}.json"
+            corpus = json.loads(path.read_text())
+            self.assertEqual(corpus["policy"], policies[0])
+            for policy in policies:
+                for case in corpus["introductions"]:
+                    with self.subTest(policy=policy, text=case["text"]):
+                        self.assertEqual(introduction_name(case["text"], policy), case["name"])
+                for case in corpus["sessions"]:
+                    with self.subTest(policy=policy, session=case["label"]):
+                        candidates = introduction_candidates(case["segments"], policy)
+                        claimed = {}
+                        for identity, names in candidates.items():
+                            for name in names:
+                                claimed.setdefault(name.casefold(), set()).add(identity)
+                        actual = {identity: {"name": next(iter(names)), "evidence": next(iter(names.values()))}
+                                  for identity, names in candidates.items()
+                                  if len(names) == 1 and len(claimed[next(iter(names)).casefold()]) == 1}
+                        self.assertEqual(actual, case["expected"])
+
+    def test_native_v3_natural_intro_metadata_does_not_change_older_policy(self):
+        natural = "I know it doesn't say my name here, but yeah, my name is Jamie."
+        for policy in (None, "explicit_intro_v2", "explicit_intro_v3"):
+            with self.subTest(policy=policy):
+                transcript = diarized_transcript()
+                transcript["segments"][1]["text"] = natural
+                if policy is not None:
+                    transcript["speaker_name_policy"] = policy
+                if policy == "explicit_intro_v3":
+                    people = speaker_attributions(transcript)
+                    self.assertEqual(people["system_speaker_1"]["name"], "Jamie")
+                    self.assertEqual(people["system_speaker_1"]["evidence"], [1])
+                    self.assertEqual(transcript["segments"][1]["text"], natural)
+                else:
+                    self.assertIsNone(introduction_name(natural, policy))
+                    with self.assertRaisesRegex(ValueError, "unsupported"):
+                        speaker_attributions(transcript)
+
     def test_complete_introductions_preserve_name_spelling(self):
         for text, name in (("My name is Jamie.", "Jamie"), ("Hi, I am Anna!", "Anna"),
                            ("Hello I'm O’Connor.", "O’Connor"), ("Hey, I’m Anne-Marie McDonald.", "Anne-Marie McDonald"),

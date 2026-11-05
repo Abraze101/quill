@@ -368,11 +368,20 @@ class CodexDriveTransportTests(unittest.TestCase):
 
     def test_unexpected_server_requests_and_tool_notifications_fail_closed(self):
         for message in ({"id": 9, "method": "item/tool/call", "params": {"tool": "shell"}},
+                        {"id": 9, "method": "account/updated", "params": {"authMode": "chatgpt"}},
+                        {"method": "account/credentials/updated", "params": {}},
                         {"method": "turn/started", "params": {}},
                         {"method": "item/started", "params": {"item": {"type": "mcpToolCall", "tool": "share_file"}}}):
             with self.subTest(message=message):
                 with self.assertRaises(DriveProtocolError):
                     self.run_read(call="send(" + repr(message) + ")")
+
+    def test_account_status_notification_does_not_change_the_authorized_read(self):
+        notice = "send({'method':'account/updated','params':{'authMode':'chatgpt','planType':'pro'}})"
+        self.assertEqual(self.run_read(startup=notice), self.native)
+        self.assertEqual([request["method"] for request in self.requests()],
+                         ["initialize", "initialized", "thread/start", "mcpServer/tool/call"])
+        self.assertEqual(self.requests()[-1]["params"]["arguments"], self.arguments)
 
     def test_duplicate_or_wrong_rpc_ids_fail_closed(self):
         result = {"content": [], "structuredContent": self.native, "isError": False}

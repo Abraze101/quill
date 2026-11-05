@@ -1,0 +1,496 @@
+{
+  "policy": "explicit_intro_v3",
+  "introductions": [
+    {
+      "text": "I know it doesn't say my name here, but yeah, my name is Jamie.",
+      "name": "Jamie"
+    },
+    {
+      "text": "I know it doesn’t say my name here, but yeah, my name is Jamie.",
+      "name": "Jamie"
+    },
+    {
+      "text": "I realize it does not show my name on the screen, so my name is José García.",
+      "name": "José García"
+    },
+    {
+      "text": "It doesn't show my name, but my name is Robin O’Connor.",
+      "name": "Robin O’Connor"
+    },
+    {
+      "text": "Hi, my name is Alex.",
+      "name": "Alex"
+    },
+    {
+      "text": "Well, yeah, my name is Jamie, and I lead operations.",
+      "name": "Jamie"
+    },
+    {
+      "text": "So my name is Jamie from Zebra.",
+      "name": "Jamie"
+    },
+    {
+      "text": "Okay, let me introduce myself, my name is Anne-Marie.",
+      "name": "Anne-Marie"
+    },
+    {
+      "text": "Just to introduce myself, my name is Jamie. I organize the demo.",
+      "name": "Jamie"
+    },
+    {
+      "text": "Yeah, I know it doesn't say my name here, but well, my name is Jamie.",
+      "name": "Jamie"
+    },
+    {
+      "text": "Um uh okay yeah well so my name is Jamie.",
+      "name": "Jamie"
+    },
+    {
+      "text": "Hi, I'm Alex.",
+      "name": "Alex"
+    },
+    {
+      "text": "This is Jamie speaking.",
+      "name": "Jamie"
+    },
+    {
+      "text": "I'm Jamie.",
+      "name": null
+    },
+    {
+      "text": "I am Jamie.",
+      "name": null
+    },
+    {
+      "text": "I'm American.",
+      "name": null
+    },
+    {
+      "text": "Well, I'm Jamie.",
+      "name": null
+    },
+    {
+      "text": "Hi, I'm Ready.",
+      "name": null
+    },
+    {
+      "text": "Um uh okay yeah well so hi my name is Jamie.",
+      "name": null
+    },
+    {
+      "text": "I think my name is Jamie.",
+      "name": null
+    },
+    {
+      "text": "If I say my name is Jamie.",
+      "name": null
+    },
+    {
+      "text": "He said, well, my name is Jamie.",
+      "name": null
+    },
+    {
+      "text": "For example, my name is Jamie.",
+      "name": null
+    },
+    {
+      "text": "Let me introduce myself as a customer, my name is Jamie.",
+      "name": null
+    },
+    {
+      "text": "Let's roleplay, my name is Jamie.",
+      "name": null
+    },
+    {
+      "text": "Let me introduce myself, my name is Jamie, for example.",
+      "name": null
+    },
+    {
+      "text": "Just to introduce myself, my name is Jamie. Just kidding.",
+      "name": null
+    },
+    {
+      "text": "I know it doesn't say my name here, but yeah, my name is Jamie. That was a joke.",
+      "name": null
+    },
+    {
+      "text": "I know it doesn't say my name here, but yeah, my name is Jamie, hypothetically.",
+      "name": null
+    },
+    {
+      "text": "I know it doesn't say my name here, but yeah, \"my name is Jamie.\"",
+      "name": null
+    },
+    {
+      "text": "I know it doesn't say my name here, but yeah, my name is Jamie, said Alex.",
+      "name": null
+    },
+    {
+      "text": "I know it doesn't say my name here, but yeah, my name is Jamie? First question.",
+      "name": null
+    },
+    {
+      "text": "I know it doesn't say my name here, but yeah, my name is jamie.",
+      "name": null
+    },
+    {
+      "text": "I know it doesn't say my name here, but yeah, my name is J.",
+      "name": null
+    },
+    {
+      "text": "I know it doesn't say my name here, but yeah, my name is Unknown.",
+      "name": null
+    },
+    {
+      "text": "I know it doesn't say my name here, but yeah, my name is Jamie. My name is Alex.",
+      "name": null
+    },
+    {
+      "text": "I know it doesn't say my name here, but yeah, my name is not Jamie.",
+      "name": null
+    },
+    {
+      "text": "I know it doesn't say my name here, but yeah, my name is Jamie\nJust kidding.",
+      "name": null
+    },
+    {
+      "text": "I know it doesn't say my name here, but yeah, my name is Jamie happy to be here.",
+      "name": null
+    },
+    {
+      "text": "I know it doesn't say my name here, but yeah, my name is Jamie, and I run the demo.",
+      "name": "Jamie"
+    },
+    {
+      "text": "I know it doesn't say my name here, but yeah, my name is Jamie. For example, I handle support.",
+      "name": "Jamie"
+    },
+    {
+      "text": "I know it doesn't say my name here, but yeah, my name is Jamie. I will introduce the team. I will introduce the team. I will introduce the team. I will introduce the team. I will introduce the team. I will introduce the team. I will introduce the team. I will introduce the team. I will introduce the team. I will introduce the team. I will introduce the team. I will introduce the team. ",
+      "name": null
+    }
+  ],
+  "sessions": [
+    {
+      "label": "natural introduction",
+      "segments": [
+        {
+          "speaker": "mic_speaker_1",
+          "text": "I know it doesn't say my name here, but yeah, my name is Jamie.",
+          "start_ms": 0,
+          "end_ms": 4000
+        }
+      ],
+      "expected": {
+        "mic_speaker_1": {
+          "name": "Jamie",
+          "evidence": [
+            0
+          ]
+        }
+      }
+    },
+    {
+      "label": "three natural fragments",
+      "segments": [
+        {
+          "speaker": "mic_speaker_1",
+          "text": "I know it doesn't say my name here, but yeah,",
+          "start_ms": 0,
+          "end_ms": 2000
+        },
+        {
+          "speaker": "mic_speaker_1",
+          "text": "my name is",
+          "start_ms": 2100,
+          "end_ms": 2600
+        },
+        {
+          "speaker": "mic_speaker_1",
+          "text": "Jamie.",
+          "start_ms": 2700,
+          "end_ms": 3200
+        }
+      ],
+      "expected": {
+        "mic_speaker_1": {
+          "name": "Jamie",
+          "evidence": [
+            0,
+            1,
+            2
+          ]
+        }
+      }
+    },
+    {
+      "label": "two natural fragments",
+      "segments": [
+        {
+          "speaker": "mic_speaker_1",
+          "text": "Well, my name is",
+          "start_ms": 0,
+          "end_ms": 1000
+        },
+        {
+          "speaker": "mic_speaker_1",
+          "text": "Jamie, and I lead the team.",
+          "start_ms": 1100,
+          "end_ms": 2500
+        }
+      ],
+      "expected": {
+        "mic_speaker_1": {
+          "name": "Jamie",
+          "evidence": [
+            0,
+            1
+          ]
+        }
+      }
+    },
+    {
+      "label": "unknown natural introduction",
+      "segments": [
+        {
+          "speaker": "unknown",
+          "text": "I know it doesn't say my name here, but yeah, my name is Jamie.",
+          "start_ms": 0,
+          "end_ms": 4000
+        }
+      ],
+      "expected": {}
+    },
+    {
+      "label": "source only natural introduction",
+      "segments": [
+        {
+          "speaker": "me",
+          "text": "I know it doesn't say my name here, but yeah, my name is Jamie.",
+          "start_ms": 0,
+          "end_ms": 4000
+        }
+      ],
+      "expected": {}
+    },
+    {
+      "label": "natural fragment other speaker",
+      "segments": [
+        {
+          "speaker": "mic_speaker_1",
+          "text": "Well, my name is",
+          "start_ms": 0,
+          "end_ms": 1000
+        },
+        {
+          "speaker": "system_speaker_1",
+          "text": "Jamie.",
+          "start_ms": 1100,
+          "end_ms": 1500
+        }
+      ],
+      "expected": {}
+    },
+    {
+      "label": "natural fragment unknown",
+      "segments": [
+        {
+          "speaker": "mic_speaker_1",
+          "text": "Well, my name is",
+          "start_ms": 0,
+          "end_ms": 1000
+        },
+        {
+          "speaker": "unknown",
+          "text": "Jamie.",
+          "start_ms": 1100,
+          "end_ms": 1500
+        }
+      ],
+      "expected": {}
+    },
+    {
+      "label": "natural fragment too far apart",
+      "segments": [
+        {
+          "speaker": "mic_speaker_1",
+          "text": "Well, my name is",
+          "start_ms": 0,
+          "end_ms": 1000
+        },
+        {
+          "speaker": "mic_speaker_1",
+          "text": "Jamie.",
+          "start_ms": 2501,
+          "end_ms": 3000
+        }
+      ],
+      "expected": {}
+    },
+    {
+      "label": "natural fragment cannot cross punctuation",
+      "segments": [
+        {
+          "speaker": "mic_speaker_1",
+          "text": "Well, my name is.",
+          "start_ms": 0,
+          "end_ms": 1000
+        },
+        {
+          "speaker": "mic_speaker_1",
+          "text": "Jamie.",
+          "start_ms": 1100,
+          "end_ms": 1500
+        }
+      ],
+      "expected": {}
+    },
+    {
+      "label": "natural introduction quoted setup",
+      "segments": [
+        {
+          "speaker": "mic_speaker_1",
+          "text": "Here is what the customer said.",
+          "start_ms": 0,
+          "end_ms": 1000
+        },
+        {
+          "speaker": "mic_speaker_1",
+          "text": "I know it doesn't say my name here, but yeah, my name is Jamie.",
+          "start_ms": 1100,
+          "end_ms": 5000
+        }
+      ],
+      "expected": {}
+    },
+    {
+      "label": "natural introduction roleplay setup",
+      "segments": [
+        {
+          "speaker": "mic_speaker_1",
+          "text": "Let's roleplay.",
+          "start_ms": 0,
+          "end_ms": 1000
+        },
+        {
+          "speaker": "mic_speaker_1",
+          "text": "I know it doesn't say my name here, but yeah, my name is Jamie.",
+          "start_ms": 1100,
+          "end_ms": 5000
+        }
+      ],
+      "expected": {}
+    },
+    {
+      "label": "natural introduction corrected",
+      "segments": [
+        {
+          "speaker": "mic_speaker_1",
+          "text": "I know it doesn't say my name here, but yeah, my name is Jamie.",
+          "start_ms": 0,
+          "end_ms": 4000
+        },
+        {
+          "speaker": "mic_speaker_1",
+          "text": "That isn't my name.",
+          "start_ms": 4100,
+          "end_ms": 5000
+        }
+      ],
+      "expected": {}
+    },
+    {
+      "label": "natural introduction ordinary demo context",
+      "segments": [
+        {
+          "speaker": "mic_speaker_1",
+          "text": "I can show a demo.",
+          "start_ms": 0,
+          "end_ms": 1000
+        },
+        {
+          "speaker": "mic_speaker_1",
+          "text": "I know it doesn't say my name here, but yeah, my name is Jamie.",
+          "start_ms": 1100,
+          "end_ms": 5000
+        },
+        {
+          "speaker": "mic_speaker_1",
+          "text": "For example, I can handle support.",
+          "start_ms": 5100,
+          "end_ms": 6000
+        }
+      ],
+      "expected": {
+        "mic_speaker_1": {
+          "name": "Jamie",
+          "evidence": [
+            1
+          ]
+        }
+      }
+    },
+    {
+      "label": "natural introduction conflicting names",
+      "segments": [
+        {
+          "speaker": "mic_speaker_1",
+          "text": "I know it doesn't say my name here, but yeah, my name is Jamie.",
+          "start_ms": 0,
+          "end_ms": 4000
+        },
+        {
+          "speaker": "mic_speaker_1",
+          "text": "My name is Alex.",
+          "start_ms": 4100,
+          "end_ms": 5000
+        }
+      ],
+      "expected": {}
+    },
+    {
+      "label": "natural introduction duplicate clusters",
+      "segments": [
+        {
+          "speaker": "mic_speaker_1",
+          "text": "I know it doesn't say my name here, but yeah, my name is Jamie.",
+          "start_ms": 0,
+          "end_ms": 4000
+        },
+        {
+          "speaker": "system_speaker_1",
+          "text": "My name is Jamie.",
+          "start_ms": 4100,
+          "end_ms": 5000
+        }
+      ],
+      "expected": {}
+    },
+    {
+      "label": "natural introduction repeated",
+      "segments": [
+        {
+          "speaker": "mic_speaker_1",
+          "text": "I know it doesn't say my name here, but yeah, my name is Jamie.",
+          "start_ms": 0,
+          "end_ms": 4000
+        },
+        {
+          "speaker": "mic_speaker_1",
+          "text": "My name is Jamie.",
+          "start_ms": 4100,
+          "end_ms": 5000
+        }
+      ],
+      "expected": {
+        "mic_speaker_1": {
+          "name": "Jamie",
+          "evidence": [
+            0,
+            1
+          ]
+        }
+      }
+    }
+  ]
+}

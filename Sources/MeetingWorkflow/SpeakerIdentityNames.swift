@@ -6,6 +6,7 @@ public enum SpeakerIdentityNames {
     public enum Policy: String, Sendable {
         case legacy
         case explicitIntroV2 = "explicit_intro_v2"
+        case explicitIntroV3 = "explicit_intro_v3"
     }
 
     public struct Segment: Sendable {
@@ -26,8 +27,8 @@ public enum SpeakerIdentityNames {
         public let evidence: [Int]
     }
 
-    // Keep both versioned grammars in sync with transcript_sources.py. Existing
-    // transcripts continue to use the original whole-utterance grammar.
+    // Keep versioned grammars in sync with transcript_sources.py. Saved
+    // transcripts retain the grammar identified by their policy marker.
     private static let token = #"[\p{Lu}\p{Lt}][\p{L}\p{M}]*(?:['’\-][\p{L}\p{M}]+)*"#
     private static let disallowed: Set<String> = [
         "a", "an", "the", "your", "you", "me", "my", "not", "no", "yes",
@@ -39,11 +40,12 @@ public enum SpeakerIdentityNames {
 
     public static func introduction(in text: String, policy: Policy = .legacy) -> String? {
         guard text.utf8.count <= 300, !text.contains("\n"), !text.contains("\r") else { return nil }
-        let value = text.trimmingCharacters(in: .whitespaces)
-        if policy == .explicitIntroV2,
+        var value = text.trimmingCharacters(in: .whitespaces)
+        if policy != .legacy,
            value.contains("\"") || value.contains("“") || value.contains("”")
             || matches(correctionWarning, in: value)
             || matches(setupWarning, in: String(value.prefix { !".?!".contains($0) })) { return nil }
+        if policy == .explicitIntroV3 { value = removingIntroductionLeadIn(from: value) }
         let name = "(" + token + "(?: " + token + "){0,3})"
         let patterns = [
             "(?i:my name is) " + name,
@@ -63,7 +65,7 @@ public enum SpeakerIdentityNames {
                   candidate.split(separator: " ").allSatisfy({
                       $0.filter(\.isLetter).count >= 2 && !disallowed.contains($0.lowercased())
                   }) else { return nil }
-            if policy == .explicitIntroV2 {
+            if policy != .legacy {
                 let remainder = String(value[range.upperBound...])
                 if matches(#"(?i)\b(?:my name is|(?:hi|hello|hey),? (?:i am|i'm|i’m)|this is .{1,80} speaking)\b"#,
                            in: remainder) { return nil }
@@ -82,7 +84,7 @@ public enum SpeakerIdentityNames {
                 guard let name = introduction(in: segment.text),
                       !hasContextWarning(around: index, in: segments) else { continue }
                 candidates[segment.speaker, default: [:]][name, default: []].append(index)
-            } else if let match = introduction(startingAt: index, in: segments),
+            } else if let match = introduction(startingAt: index, in: segments, policy: policy),
                       !hasV2ContextWarning(around: match.evidence, in: segments) {
                 candidates[segment.speaker, default: [:]][match.name, default: []].append(contentsOf: match.evidence)
             }
@@ -110,11 +112,21 @@ public enum SpeakerIdentityNames {
         text.range(of: pattern, options: .regularExpression) != nil
     }
 
-    private static func introduction(startingAt index: Int, in segments: [Segment]) -> Name? {
+    private static func removingIntroductionLeadIn(from text: String) -> String {
+        // An anchored allowlist permits conversational lead-ins without finding
+        // names inside arbitrary stories, conditionals or quoted speech.
+        let filler = #"(?:(?i:hi|hello|hey|well|so|okay|ok|yeah|yes|um|uh|alright|all right)(?:,\s*|\s+)){0,3}"#
+        let preamble = #"(?:(?i:(?:I (?:know|realize) )?it (?:doesn't|doesn’t|does not) (?:say|show) my name(?: here| on (?:the )?screen)?,? (?:but|so)|let me introduce myself|just to introduce myself)(?:,\s*|\s+))?"#
+        let pattern = #"\A"# + filler + preamble + filler + #"(?=(?i:my name is) )"#
+        guard let range = text.range(of: pattern, options: .regularExpression) else { return text }
+        return String(text[range.upperBound...])
+    }
+
+    private static func introduction(startingAt index: Int, in segments: [Segment], policy: Policy) -> Name? {
         let first = segments[index]
         var text = first.text.trimmingCharacters(in: .whitespaces)
         var evidence = [index]
-        if let name = introduction(in: text, policy: .explicitIntroV2) {
+        if let name = introduction(in: text, policy: policy) {
             return Name(name: name, evidence: evidence)
         }
         // Only adjacent, timed fragments from the same identified voice may be
@@ -132,7 +144,7 @@ public enum SpeakerIdentityNames {
                   nextEnd - firstStart <= 10_000 else { break }
             text += " " + next.text.trimmingCharacters(in: .whitespaces)
             evidence.append(nextIndex)
-            if let name = introduction(in: text, policy: .explicitIntroV2) {
+            if let name = introduction(in: text, policy: policy) {
                 return Name(name: name, evidence: evidence)
             }
         }

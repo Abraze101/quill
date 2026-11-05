@@ -1294,6 +1294,19 @@ class ConnectorRunner:
             if route:
                 values.update(route=str(result_dir / "route.json"), drive_folder_id=route["drive_folder_id"])
             argv = [part.format_map(values) for part in settings["command"]]
+            if (stage == "notes" and self.config_path is not None
+                    and str(Path(__file__).with_name("codex_notes.py").resolve()) in argv
+                    and transcript.get("speaker_labels") == "diarized_v1"):
+                from .speaker_context import build_context
+                from .speaker_corrections import SpeakerCorrections
+                identity_context, lookup_status = build_context(
+                    job, read_json(safe_member(recording, "meta.json"), 100_000), transcript,
+                    config=load_config(self.config_path), learned=SpeakerCorrections(self.state).learned(),
+                    guard=lambda: self.require_processing(job))
+                identity_path = staging / "speaker-context.json"
+                atomic_json(identity_path, identity_context)
+                argv.extend(["--speaker-context", str(identity_path)])
+                atomic_json(result_dir / "speaker-context-status.json", {"status": lookup_status})
             self.require_processing(job)
             self.execute(argv, staging, min(7200, max(1, int(settings.get("timeout_seconds", 1200)))))
             returned = read_json(output)

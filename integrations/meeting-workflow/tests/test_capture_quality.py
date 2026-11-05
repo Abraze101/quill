@@ -73,13 +73,20 @@ class CaptureQualityTests(unittest.TestCase):
     def test_legacy_transcripts_remain_unwarned(self):
         transcript = dict(self.transcript)
         transcript.pop("capture_quality")
+        original = copy.deepcopy(transcript)
         self.assertIsNone(validated_quality(transcript))
         self.assertNotIn(NOTICE, render_notes(self.notes, transcript))
         payload = build_payload(self.notes, transcript, self.metadata, self.route)
         self.assertNotIn(NOTICE, json.dumps(payload))
         prompt = json.loads(correction_prompt("skill", transcript, "draft", "error"))
         self.assertNotIn("capture_quality", prompt)
-        self.assertEqual(prompt["transcript"], transcript)
+        self.assertNotIn("capture_quality", prompt["transcript"])
+        self.assertNotIn(NOTICE, json.dumps(prompt))
+        prompt_transcript = copy.deepcopy(prompt["transcript"])
+        self.assertIn("explicit segment_index", prompt_transcript.pop("segment_index_instruction"))
+        self.assertEqual([segment.pop("segment_index") for segment in prompt_transcript["segments"]], [0])
+        self.assertEqual(prompt_transcript, original)
+        self.assertEqual(transcript, original)
 
     def test_combined_docx_warning_is_once_and_transcript_remains_exact(self):
         for layout in ("clean", "sources"):
@@ -122,12 +129,16 @@ class CaptureQualityTests(unittest.TestCase):
             render_notes(notes, self.transcript)
 
     def test_correction_prompt_keeps_quality_structured_and_segments_exact(self):
+        original = copy.deepcopy(self.transcript)
         payload = json.loads(correction_prompt("skill", self.transcript, "draft", "error"))
         self.assertEqual(payload["capture_quality"], {"status": "incomplete", "affected_sources": ["mic", "system"]})
         self.assertEqual(payload["transcript"]["capture_quality"], payload["capture_quality"])
-        self.assertEqual(payload["transcript"]["segments"], self.transcript["segments"])
+        prompt_segments = copy.deepcopy(payload["transcript"]["segments"])
+        self.assertEqual([segment.pop("segment_index") for segment in prompt_segments], [0])
+        self.assertEqual(prompt_segments, original["segments"])
         self.assertIn("never infer or invent missing speech", payload["capture_quality_instruction"])
         self.assertIn("do not repeat", payload["capture_quality_instruction"])
+        self.assertEqual(self.transcript, original)
 
 
 if __name__ == "__main__":

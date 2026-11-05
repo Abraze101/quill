@@ -127,12 +127,21 @@ class CalendarTransportTests(unittest.TestCase):
             "name": "google_calendar.get_profile", "_meta": {"connector_id": CONNECTOR,
                 "link_accounts": accounts}}}}], "nextCursor": None}
 
-    def matching_transport(self, *, catalog=None, profile=None):
+    def matching_transport(self, *, catalog=None, profile=None, startup=""):
         profile = profile or {"id": "owner123", "email": "owner@example.test"}
         call = "value = " + repr(profile) + " if request['params']['tool']=='google_calendar.get_profile' else {'calendars': [], 'next_page_token': None}\n"
         call += "send({'id':3,'result':{'structuredContent':value,'isError':False}})"
-        executable = self.fixture.fake(catalog=catalog if catalog is not None else self.catalog(), call=call)
+        executable = self.fixture.fake(catalog=catalog if catalog is not None else self.catalog(), call=call, startup=startup)
         return CodexCalendarTransport(executable, account_email="Owner@example.test")
+
+    def test_account_status_notifications_preserve_discovery_verification_and_pinned_read(self):
+        notice = "send({'method':'account/updated','params':{'authMode':'chatgpt','planType':'pro'}})"
+        transport = self.matching_transport(startup=notice)
+        self.assertEqual(transport.invoke("list_calendars", {"max_results": 20})["calendars"], [])
+        calls = [item["params"] for item in self.fixture.requests() if item["method"] == "mcpServer/tool/call"]
+        self.assertEqual([item["tool"] for item in calls], ["google_calendar.get_profile", "google_calendar.list_calendars"])
+        self.assertTrue(all(item["arguments"]["link_id"] == self.link for item in calls))
+        self.assertNotIn("turn/start", [item["method"] for item in self.fixture.requests()])
 
     def test_owner_account_is_discovered_verified_and_pinned_on_all_reads(self):
         transport = self.matching_transport()

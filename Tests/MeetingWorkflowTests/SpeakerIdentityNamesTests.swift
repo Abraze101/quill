@@ -42,11 +42,28 @@ func runSpeakerIdentityNamesTests() {
             .init(speaker: "system_speaker_1", text: "My name is Jamie.")
         ]).count, 0)
     }
-    runSpeakerNamePolicyV2Fixtures()
+    runSpeakerNamePolicyFixtures(version: "v2", policies: [.explicitIntroV2, .explicitIntroV3])
+    runSpeakerNamePolicyFixtures(version: "v3", policies: [.explicitIntroV3])
+    // New lead-ins must not change the validation of frozen V2 transcripts.
+    let natural = "I know it doesn't say my name here, but yeah, my name is Jamie."
+    expectNil(SpeakerIdentityNames.introduction(in: natural))
+    expectNil(SpeakerIdentityNames.introduction(in: natural, policy: .explicitIntroV2))
+    expectEqual(SpeakerIdentityNames.names(in: [
+        .init(speaker: "mic_speaker_1", text: natural)
+    ], policy: .explicitIntroV2).count, 0)
+    expectEqual(SpeakerIdentityNames.names(in: [
+        .init(speaker: "mic_speaker_1", text: natural)
+    ], policy: .explicitIntroV3)["mic_speaker_1"]?.name, "Jamie")
+    // The original policy remains the default for saved legacy payloads.
+    expectNil(SpeakerIdentityNames.introduction(in: "My name is Jamie, and I run operations."))
+    expectEqual(SpeakerIdentityNames.names(in: [
+        .init(speaker: "mic_speaker_1", text: "My name is Jamie."),
+        .init(speaker: "mic_speaker_1", text: "I can show a demo.")
+    ]).count, 0)
     print("Speaker naming checks passed: direct introductions, exact spelling, conflicts, unknown and quoted text")
 }
 
-private func runSpeakerNamePolicyV2Fixtures() {
+private func runSpeakerNamePolicyFixtures(version: String, policies: [SpeakerIdentityNames.Policy]) {
     struct Corpus: Decodable {
         struct Introduction: Decodable { let text: String; let name: String? }
         struct Session: Decodable {
@@ -66,32 +83,28 @@ private func runSpeakerNamePolicyV2Fixtures() {
         let sessions: [Session]
     }
     let path = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
-        .appendingPathComponent("Fixtures/speaker-name-policy-v2.json")
+        .appendingPathComponent("Fixtures/speaker-name-policy-\(version).json")
     guard let data = try? Data(contentsOf: path), let corpus = try? JSONDecoder().decode(Corpus.self, from: data) else {
         preconditionFailure("Could not read shared speaker-name policy fixtures")
     }
-    expectEqual(corpus.policy, SpeakerIdentityNames.Policy.explicitIntroV2.rawValue)
-    for item in corpus.introductions {
-        expectEqual(SpeakerIdentityNames.introduction(in: item.text, policy: .explicitIntroV2), item.name)
-    }
-    for item in corpus.sessions {
-        let segments = item.segments.map {
-            SpeakerIdentityNames.Segment(speaker: $0.speaker, text: $0.text,
-                                         startMs: $0.start_ms, endMs: $0.end_ms)
+    expectEqual(corpus.policy, policies.first?.rawValue)
+    for policy in policies {
+        for item in corpus.introductions {
+            precondition(SpeakerIdentityNames.introduction(in: item.text, policy: policy) == item.name,
+                         "Unexpected introduction under \(policy.rawValue): \(item.text)")
         }
-        let names = SpeakerIdentityNames.names(in: segments, policy: .explicitIntroV2)
-        precondition(Set(names.keys) == Set(item.expected.keys), "Unexpected identities: \(item.label)")
-        for (identity, expected) in item.expected {
-            precondition(names[identity]?.name == expected.name && names[identity]?.evidence == expected.evidence,
-                         "Unexpected name/evidence: \(item.label)")
+        for item in corpus.sessions {
+            let segments = item.segments.map {
+                SpeakerIdentityNames.Segment(speaker: $0.speaker, text: $0.text,
+                                             startMs: $0.start_ms, endMs: $0.end_ms)
+            }
+            let names = SpeakerIdentityNames.names(in: segments, policy: policy)
+            precondition(Set(names.keys) == Set(item.expected.keys), "Unexpected identities under \(policy.rawValue): \(item.label)")
+            for (identity, expected) in item.expected {
+                precondition(names[identity]?.name == expected.name && names[identity]?.evidence == expected.evidence,
+                             "Unexpected name/evidence under \(policy.rawValue): \(item.label)")
+            }
         }
     }
-    // A V2 transcript marker opts into new evidence rules; saved V1 payloads
-    // cannot silently acquire the broader grammar or lose their old names.
-    expectNil(SpeakerIdentityNames.introduction(in: "My name is Jamie, and I run operations."))
-    expectEqual(SpeakerIdentityNames.names(in: [
-        .init(speaker: "mic_speaker_1", text: "My name is Jamie."),
-        .init(speaker: "mic_speaker_1", text: "I can show a demo.")
-    ]).count, 0)
-    print("Versioned speaker naming checks passed: \(corpus.introductions.count) introductions and \(corpus.sessions.count) shared session fixtures")
+    print("Versioned speaker naming checks passed (\(version)): \(corpus.introductions.count) introductions and \(corpus.sessions.count) shared session fixtures")
 }

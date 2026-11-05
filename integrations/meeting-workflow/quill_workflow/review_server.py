@@ -16,13 +16,15 @@ from zoneinfo import ZoneInfo
 
 from .routing import RoutingError, RoutingReviews, StaleReviewError
 from .review_ui import document, notes_html, workspace, meeting_url
-from .review_library import meeting_library
+from .review_library import meeting_library, meeting_detail
 
 DELETION_ACTIONS = {"delete_prepare", "delete_confirm"}
 MAX_FORM_BYTES = 8192
 MAX_NOTES_BYTES = 64 * 1024
 SHARING_ACTIONS = {"sharing_prepare", "sharing_confirm", "sharing_private", "sharing_retry",
                    "sharing_suggest", "sharing_use_suggestions", "sharing_refresh"}
+SPEAKER_ACTIONS = {"speaker_save", "speaker_clear", "speaker_forget", "speaker_refresh_notes"}
+SPEAKER_ID = re.compile(r"(?:mic|system)_speaker_[1-9][0-9]*")
 
 
 def _escape(value):
@@ -38,18 +40,153 @@ def _selected_path(server, job, tab="notes"):
     return meeting_url(server.review_path, _selection(job), tab=tab)
 
 
+def _speaker_identity_form(server, item, speaker):
+    result = '<form method="post" action="' + _escape(server.review_path + 'decision') + '">'
+    for name, value in (("job", item["job"]), ("revision", item["revision"]), ("speaker_id", speaker["id"])):
+        result += '<input type="hidden" name="' + name + '" value="' + _escape(value) + '">'
+    return result
+
+
+def _speaker_removal_pending(server, job):
+    return bool(server.deletion_options and any(
+        item.get("job") == job and (item.get("cancelling") or item.get("interrupted") or item.get("available") is False)
+        for item in server.deletion_options()))
+
+
+def _speaker_record(server, job):
+    if not server.speaker_options or not server.on_speaker:
+        raise ValueError("Speaker corrections are unavailable.")
+    item = server.speaker_options(job)
+    if (not isinstance(item, dict) or item.get("job") != job or not isinstance(item.get("revision"), str)
+            or not item["revision"] or not isinstance(item.get("speakers"), list) or len(item["speakers"]) > 100):
+        raise ValueError("Speaker details are unavailable. Reload this meeting.")
+    identities = set()
+    for speaker in item["speakers"]:
+        identity = speaker.get("id") if isinstance(speaker, dict) else None
+        if not isinstance(identity, str) or not SPEAKER_ID.fullmatch(identity) or identity in identities:
+            raise ValueError("Speaker details are unavailable. Reload this meeting.")
+        identities.add(identity)
+    return item
+
+
+def _speaker_candidate_label(candidate, detail):
+    source = {"calendar": "Calendar attendee", "visible": "Seen in meeting",
+              "confirmed_correction": "Remembered correction"}.get(candidate.get("source"), "Suggestion")
+    value = candidate.get(detail)
+    return (value + " · " if isinstance(value, str) and value else "") + source
+
+
+def _speaker_panel(server, job):
+    try:
+        if (server.cancellation_options and any(item.get("state") in ("cancelling", "cancelled")
+                for item in server.cancellation_options(job))) or _speaker_removal_pending(server, job):
+            return '<p class="muted">Speaker corrections are unavailable while this meeting is stopped or being removed.</p>'
+        item = _speaker_record(server, job)
+    except Exception:
+        return '<p class="muted">Speaker details are unavailable. Refresh this meeting to try again.</p>'
+    candidates = item.get("candidates", [])
+    candidates = [candidate for candidate in candidates[:100] if isinstance(candidate, dict)] if isinstance(candidates, list) else []
+    body = '<div class="speaker-review"><p class="muted">' + (
+        'Match each voice to a person. Saving confirms your correction.' if item["speakers"] else
+        'No separate voices are available to name in this transcript.') + '</p>'
+    labels = {"confirmed": "Confirmed", "suggested": "Suggested", "corrected": "Your correction", "user_confirmed": "Your correction"}
+    for index, speaker in enumerate(item["speakers"]):
+        prefix = "speaker-" + str(index)
+        name = speaker.get("name") if isinstance(speaker.get("name"), str) else ""
+        email = speaker.get("email") if isinstance(speaker.get("email"), str) else ""
+        body += '<section class="speaker-card" aria-labelledby="' + prefix + '-heading">'
+        body += '<header><div><h2 id="' + prefix + '-heading">' + _escape(speaker.get("label") or speaker["id"]) + '</h2>'
+        body += '</div><span class="badge">' + labels.get(speaker.get("status"), "Unnamed") + '</span></header>'
+        if isinstance(speaker.get("reason"), str) and speaker["reason"]:
+            body += '<p class="notes-caption">' + _escape(speaker["reason"][:280]) + '</p>'
+        samples = speaker.get("samples", [])
+        samples = [sample for sample in samples[:3] if isinstance(sample, str)] if isinstance(samples, list) else []
+        if samples:
+            body += '<div class="speaker-samples" aria-label="Speech samples">'
+            body += ''.join('<blockquote>' + _escape(sample[:280]) + ('…' if len(sample) > 280 else '') + '</blockquote>' for sample in samples)
+            body += '</div>'
+        body += _speaker_identity_form(server, item, speaker)
+        body += '<div class="speaker-fields"><div><label for="' + prefix + '-name">Name</label>'
+        body += '<input id="' + prefix + '-name" name="name" value="' + _escape(name) + '" maxlength="60" required autocomplete="off" list="' + prefix + '-names">'
+        body += '<datalist id="' + prefix + '-names">'
+        for candidate in candidates:
+            if isinstance(candidate.get("name"), str) and candidate["name"]:
+                body += '<option value="' + _escape(candidate["name"]) + '" label="' + _escape(_speaker_candidate_label(candidate, "email")) + '"></option>'
+        body += '</datalist></div><div><label for="' + prefix + '-email">Email <span class="muted">(optional)</span></label>'
+        body += '<input id="' + prefix + '-email" name="email" type="email" value="' + _escape(email) + '" maxlength="254" autocomplete="off" list="' + prefix + '-emails">'
+        body += '<datalist id="' + prefix + '-emails">'
+        for candidate in candidates:
+            if isinstance(candidate.get("email"), str) and candidate["email"]:
+                body += '<option value="' + _escape(candidate["email"]) + '" label="' + _escape(_speaker_candidate_label(candidate, "name")) + '"></option>'
+        body += '</datalist></div></div>'
+        body += '<label class="speaker-remember"><input type="checkbox" name="remember" value="yes"> Remember name and email</label>'
+        body += '<button name="action" value="speaker_save">Save correction</button></form>'
+        if speaker.get("status") in ("user_confirmed", "corrected"):
+            body += _speaker_identity_form(server, item, speaker) + '<button class="quiet" name="action" value="speaker_clear">Clear correction</button></form>'
+        if speaker.get("remembered") is True:
+            body += _speaker_identity_form(server, item, speaker) + '<button class="quiet" name="action" value="speaker_forget">Forget for future meetings</button></form>'
+        body += '</section>'
+    unidentified = item.get("unassigned_segments")
+    if type(unidentified) is int and unidentified > 0:
+        body += '<p class="muted">' + str(unidentified) + ' speech segments have no separate voice label and cannot be assigned as one person.</p>'
+    notes_status = item.get("notes_status")
+    notes_label = {"pending": "Updating local notes…", "running": "Updating local notes…",
+                   "succeeded": "Local notes updated", "failed": "Notes need refreshing",
+                   "stale": "Notes need refreshing"}.get(notes_status)
+    if notes_label:
+        body += '<section class="speaker-notes-status" aria-label="Local notes"><p role="status">' + notes_label + '</p>'
+        if notes_status in ("failed", "stale"):
+            if isinstance(item.get("notes_error"), str) and item["notes_error"]:
+                body += '<p class="notes-caption">' + _escape(item["notes_error"][:280]) + '</p>'
+            if item["speakers"]:
+                body += _speaker_identity_form(server, item, item["speakers"][0])
+                body += '<button name="action" value="speaker_refresh_notes">Retry local notes</button></form>'
+        body += '</section>'
+    return body + ('<p class="notes-caption">Corrections update your reviewed local transcript and notes. Existing Drive documents stay unchanged. '
+                   'Sharing still needs your approval.</p></div>')
+
+
 def _notes_preview(state, job):
-    """Read only the fixed notes member, without following linked directories."""
+    """Prefer validated local notes, including a source-bound speaker refresh."""
     if not isinstance(job, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", job):
         return None
+    selected = meeting_detail(state, job)
+    if selected is not None:
+        text = selected.get("notes_text")
+        if not isinstance(text, str):
+            return None
+        data = text.encode("utf-8")
+        return data[:MAX_NOTES_BYTES].decode("utf-8", errors="replace") + (
+            "\n\n[Preview truncated]" if len(data) > MAX_NOTES_BYTES else "")
     directory = None
     try:
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         directory = os.open(state, flags)
-        for part in ("results", job, "notes"):
+        # A missing/invalid registered meeting must never fall back to unverified
+        # Markdown. Only pre-queue, routing-only state retains that older preview.
+        try:
+            os.stat("jobs.sqlite3", dir_fd=directory, follow_symlinks=False)
+            return None
+        except FileNotFoundError:
+            pass
+        for part in ("results", job):
             child = os.open(part, flags, dir_fd=directory)
             os.close(directory)
             directory = child
+        try:
+            os.stat("notes-receipt.json", dir_fd=directory, follow_symlinks=False)
+            return None
+        except FileNotFoundError:
+            pass
+        child = os.open("notes", flags, dir_fd=directory)
+        os.close(directory)
+        directory = child
+        for member in ("notes.json", "provenance.json", "source-transcript.json"):
+            try:
+                os.stat(member, dir_fd=directory, follow_symlinks=False)
+                return None
+            except FileNotFoundError:
+                pass
         descriptor = os.open("notes.md", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
         with os.fdopen(descriptor, "rb") as handle:
             if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
@@ -549,6 +686,10 @@ def _reviews_page(server, notice=None, selected=None, **navigation):
                 entry.update(status="Kept on this Mac", detail="Drive filing was not requested for this meeting.")
     companies = {}
     for entry in entries:
+        if server.speaker_options and server.on_speaker:
+            entry["speakers_available"] = True
+            if entry["selection"] == selected and navigation.get("tab") == "speakers":
+                entry["speaker_body"] = _speaker_panel(server, entry["job"])
         for company in entry.get("companies", []):
             companies[company["id"]] = {"id": company["id"], "name": company["name"]}
     return workspace(entries, server.review_path, notice, bool(server.sharing_options), getattr(server, "preview_mode", False), selected,
@@ -612,7 +753,7 @@ class _ReviewHandler(BaseHTTPRequestHandler):
             if "q" in values:
                 valid_query = valid_query and len(values["q"]) <= 160 and not any(ord(c) < 32 or ord(c) == 127 for c in values["q"])
             if "tab" in values:
-                valid_query = valid_query and "meeting" in values and values["tab"] in ("notes", "transcript", "recording", "sharing", "activity")
+                valid_query = valid_query and "meeting" in values and values["tab"] in ("notes", "transcript", "speakers", "recording", "sharing", "activity")
         except (ValueError, UnicodeError):
             valid_query = False
         if (request.scheme or request.netloc or request.fragment
@@ -645,11 +786,11 @@ class _ReviewHandler(BaseHTTPRequestHandler):
             if len(raw) != int(lengths[0]):
                 raise ValueError("Incomplete form")
             fields = parse_qs(raw.decode("utf-8"), keep_blank_values=True, strict_parsing=True,
-                              encoding="utf-8", errors="strict", max_num_fields=5)
+                              encoding="utf-8", errors="strict", max_num_fields=7)
             if any(len(values) != 1 for values in fields.values()):
                 raise ValueError("Unexpected form fields")
             form = {key: values[0] for key, values in fields.items()}
-            if form.get("action") not in {"approve", "skip", "resume", "retry", "cancel_processing"} | SHARING_ACTIONS | DELETION_ACTIONS:
+            if form.get("action") not in {"approve", "skip", "resume", "retry", "cancel_processing"} | SHARING_ACTIONS | DELETION_ACTIONS | SPEAKER_ACTIONS:
                 raise ValueError("Unknown action")
             expected = {"job", "revision", "company_id", "action"}
             if form["action"] in ("retry", "cancel_processing") or form["action"] in DELETION_ACTIONS:
@@ -664,6 +805,13 @@ class _ReviewHandler(BaseHTTPRequestHandler):
                     expected.add("emails")
                 if form["action"] == "sharing_use_suggestions":
                     expected.add("suggestion")
+            if form["action"] in SPEAKER_ACTIONS:
+                expected.remove("company_id")
+                expected.add("speaker_id")
+                if form["action"] == "speaker_save":
+                    expected.update(("name", "email"))
+                    if "remember" in form:
+                        expected.add("remember")
             if set(form) != expected:
                 raise ValueError("Unexpected form fields")
             if form["action"] == "cancel_processing" and (not form["job"] or not form["revision"]):
@@ -672,6 +820,17 @@ class _ReviewHandler(BaseHTTPRequestHandler):
                 raise ValueError("Missing sharing review identity")
             if form["action"] == "sharing_use_suggestions" and not form["suggestion"]:
                 raise ValueError("Missing calendar suggestion")
+            if form["action"] in SPEAKER_ACTIONS:
+                if (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", form["job"])
+                        or not form["revision"] or len(form["revision"]) > 256
+                        or not SPEAKER_ID.fullmatch(form["speaker_id"])):
+                    raise ValueError("Invalid speaker identity")
+                if form["action"] == "speaker_save":
+                    if (not form["name"].strip() or len(form["name"]) > 60 or len(form["email"]) > 254
+                            or form.get("remember", "yes") != "yes"
+                            or any(ord(char) < 32 or ord(char) == 127 for char in form["name"] + form["email"])
+                            or "remember" in form and not form["email"].strip()):
+                        raise ValueError("Invalid speaker correction")
             if form["action"] == "resume":
                 stages = form["stages"].split(",")
                 if (not stages or len(stages) > 3 or len(set(stages)) != len(stages)
@@ -723,6 +882,28 @@ class _ReviewHandler(BaseHTTPRequestHandler):
                 destination = (_selected_path(self.server, form["job"]) if item.get("status") == "cancelling"
                                else self.server.review_path)
                 self._send(303, "", location=destination)
+            return
+        if form["action"] in SPEAKER_ACTIONS:
+            try:
+                if _speaker_removal_pending(self.server, form["job"]):
+                    raise ValueError("This meeting is being removed. Speaker corrections are unavailable.")
+                item = _speaker_record(self.server, form["job"])
+                speaker = next((speaker for speaker in item["speakers"] if speaker["id"] == form["speaker_id"]), None)
+                if item["revision"] != form["revision"] or speaker is None:
+                    raise ValueError("Speaker details changed. Reload before saving a correction.")
+                if form["action"] == "speaker_forget" and speaker.get("remembered") is not True:
+                    raise ValueError("This identity is not saved for future suggestions.")
+                if form["action"] == "speaker_refresh_notes" and item.get("notes_status") not in ("failed", "stale"):
+                    raise ValueError("A notes retry is no longer needed. Refresh this meeting.")
+                self.server.on_speaker(form["action"], form["job"], form["revision"], form["speaker_id"],
+                                       name=form.get("name", ""), email=form.get("email", ""),
+                                       remember=form.get("remember") == "yes")
+            except Exception as error:
+                self._send(409, _page('<h1>Couldn’t update speaker</h1><p>' + _escape(str(error)[:500])
+                                     + '</p><p><a href="' + _escape(_selected_path(self.server, form["job"], tab="speakers"))
+                                     + '">Back to speakers</a></p>'))
+                return
+            self._send(303, "", location=_selected_path(self.server, form["job"], tab="speakers"))
             return
         if form["action"] in SHARING_ACTIONS:
             try:
@@ -800,10 +981,12 @@ class _LoopbackReviewServer(HTTPServer):
 
 def create_server(state, on_decision=None, resume_options=None, on_resume=None,
                   processing_options=None, on_retry=None, sharing_options=None, on_sharing=None,
-                  deletion_options=None, on_delete=None, cancellation_options=None, on_cancel_processing=None):
+                  deletion_options=None, on_delete=None, cancellation_options=None, on_cancel_processing=None,
+                  speaker_options=None, on_speaker=None):
     """Create an unstarted loopback server. Caller owns shutdown/server_close."""
     for callback in (on_decision, resume_options, on_resume, processing_options, on_retry,
-                     sharing_options, on_sharing, deletion_options, on_delete, cancellation_options, on_cancel_processing):
+                     sharing_options, on_sharing, deletion_options, on_delete, cancellation_options, on_cancel_processing,
+                     speaker_options, on_speaker):
         if callback is not None and not callable(callback):
             raise TypeError("Review callbacks must be callable")
     reviews = RoutingReviews(state)
@@ -828,20 +1011,23 @@ def create_server(state, on_decision=None, resume_options=None, on_resume=None,
     server.on_delete = on_delete
     server.cancellation_options = cancellation_options
     server.on_cancel_processing = on_cancel_processing
+    server.speaker_options = speaker_options
+    server.on_speaker = on_speaker
     return server
 
 
 def serve_review(state, on_decision=None, open_browser=True, timeout_seconds=1800, on_ready=None,
                  resume_options=None, on_resume=None, processing_options=None, on_retry=None,
                  sharing_options=None, on_sharing=None, deletion_options=None, on_delete=None,
-                 cancellation_options=None, on_cancel_processing=None):
+                 cancellation_options=None, on_cancel_processing=None, speaker_options=None, on_speaker=None):
     """Serve until timeout. Closing the UI never discards saved decisions."""
     if (isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float))
             or not math.isfinite(timeout_seconds) or not 0 < timeout_seconds <= 86400):
         raise ValueError("Review timeout must be between zero and 86400 seconds")
     server = create_server(state, on_decision, resume_options, on_resume, processing_options, on_retry,
                            sharing_options, on_sharing, deletion_options=deletion_options, on_delete=on_delete,
-                           cancellation_options=cancellation_options, on_cancel_processing=on_cancel_processing)
+                           cancellation_options=cancellation_options, on_cancel_processing=on_cancel_processing,
+                           speaker_options=speaker_options, on_speaker=on_speaker)
     timer = threading.Timer(timeout_seconds, server.shutdown)
     timer.daemon = True
     try:

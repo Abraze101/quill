@@ -557,7 +557,20 @@ def main(argv=None):
                 start_deletion_worker(args.config, queue.state)
             if reconcile_approved_reviews(queue, config) or queue.has_work():
                 start_worker(args.config, queue.state)
+            from quill_workflow.speaker_corrections import SpeakerCorrections
+            speakers = SpeakerCorrections(queue.state)
+            def speaker_decision(action, job, revision, speaker_id, **fields):
+                from quill_workflow.speaker_notes import start_refresh
+                if action == "speaker_refresh_notes":
+                    current = speakers.options(job)
+                    if not current or current["revision"] != revision:
+                        raise ValueError("Speaker review changed; reload before refreshing notes")
+                else:
+                    speakers.decision(action, job, revision, speaker_id, **fields)
+                if action in ("speaker_save", "speaker_clear", "speaker_refresh_notes"):
+                    start_refresh(queue.state, job, args.config)
             serve_review(queue.state,
+                         speaker_options=speakers.options, on_speaker=speaker_decision,
                          on_decision=lambda record: resume_reviewed_job(record, args.config, queue.state),
                          resume_options=lambda record: resumable_stages(record, args.config, queue.state),
                          on_resume=lambda record, stages: resume_waiting_work(record, args.config, queue.state, stages),

@@ -22,11 +22,15 @@ def introduction_name(text, policy=None):
     """An explicit introduction; V2 also permits a following separate clause."""
     if not isinstance(text, str) or len(text.encode("utf-8")) > 300 or "\n" in text or "\r" in text:
         return None
-    if policy == "explicit_intro_v2" and (any(quote in text for quote in ('"', "“", "”"))
+    if policy in ("explicit_intro_v2", "explicit_intro_v3") and (any(quote in text for quote in ('"', "“", "”"))
                                            or _V2_CORRECTION.search(text)
                                            or _V2_SETUP.search(re.split(r"[.!?]", text, maxsplit=1)[0])):
         return None
-    suffix = r"(?:[.!](?:\s+.*)?|,\s+.*| (?:from|with|and I)\s+.*)?" if policy == "explicit_intro_v2" else r"[.!]?"
+    if policy == "explicit_intro_v3":
+        filler = r"(?:(?:hi|hello|hey|well|so|okay|ok|yeah|yes|um|uh|alright|all right)(?:,\s*|\s+)){0,3}"
+        preamble = r"(?:(?:(?:I (?:know|realize) )?it (?:doesn't|doesn’t|does not) (?:say|show) my name(?: here| on (?:the )?screen)?,? (?:but|so)|let me introduce myself|just to introduce myself)(?:,\s*|\s+))?"
+        text = re.sub(r"\A" + filler + preamble + filler + r"(?=my name is )", "", text.strip(), count=1, flags=re.IGNORECASE)
+    suffix = r"(?:[.!](?:\s+.*)?|,\s+.*| (?:from|with|and I)\s+.*)?" if policy in ("explicit_intro_v2", "explicit_intro_v3") else r"[.!]?"
     patterns = (r"my name is (.+?)" + suffix, r"(?:hi|hello|hey),? (?:i am|i'm|i’m) (.+?)" + suffix,
                 r"this is (.+?) speaking" + suffix)
     for pattern in patterns:
@@ -45,7 +49,7 @@ def introduction_name(text, policy=None):
                         or sum(unicodedata.category(char).startswith("L") for char in word) < 2
                         or word.lower() in _DISALLOWED_NAMES):
                     return None
-            if policy == "explicit_intro_v2" and re.search(
+            if policy in ("explicit_intro_v2", "explicit_intro_v3") and re.search(
                     r"\b(?:my name is|(?:hi|hello|hey),? (?:i am|i'm|i’m)|this is .{1,80} speaking)\b",
                     text.strip()[match.end(1):], re.IGNORECASE):
                 return None
@@ -79,9 +83,9 @@ def introduction_candidates(segments, policy=None):
         identity = segment.get("speaker")
         if not isinstance(identity, str) or not re.fullmatch(r"(?:mic|system)_speaker_[1-9][0-9]*", identity):
             continue
-        text, evidence = segment["text"].strip(" \t") if policy == "explicit_intro_v2" else segment["text"], [index]
+        text, evidence = segment["text"].strip(" \t") if policy in ("explicit_intro_v2", "explicit_intro_v3") else segment["text"], [index]
         name = introduction_name(text, policy)
-        if policy == "explicit_intro_v2" and name is None:
+        if policy in ("explicit_intro_v2", "explicit_intro_v3") and name is None:
             for following in range(index + 1, min(len(segments), index + 3)):
                 previous, next_segment = segments[following - 1], segments[following]
                 first_start, previous_end, next_start, next_end = (segment.get("start_ms"), previous.get("end_ms"),
@@ -98,7 +102,7 @@ def introduction_candidates(segments, policy=None):
                     break
         if name is None:
             continue
-        warning = _v2_context_warning(segments, evidence) if policy == "explicit_intro_v2" else _context_warning(segments, index)
+        warning = _v2_context_warning(segments, evidence) if policy in ("explicit_intro_v2", "explicit_intro_v3") else _context_warning(segments, index)
         if not warning:
             refs = result.setdefault(identity, {}).setdefault(unicodedata.normalize("NFC", name), [])
             refs.extend(index for index in evidence if index not in refs)
@@ -138,7 +142,7 @@ def speaker_attributions(transcript):
         if not isinstance(identity, str) or identity not in result or result[identity]["source"] != segment["source"]:
             raise ValueError("Transcript segment does not match its separated speaker")
     policy = transcript.get("speaker_name_policy")
-    if policy not in (None, "explicit_intro_v2"):
+    if policy not in (None, "explicit_intro_v2", "explicit_intro_v3"):
         raise ValueError("Unknown speaker name policy")
     introductions = introduction_candidates(segments, policy)
     claimed = {}
@@ -230,6 +234,10 @@ def effective_attributions(transcript, notes=None):
     """
     people = speaker_attributions(transcript)
     if not isinstance(notes, dict) or "speaker_review" not in notes:
+        if isinstance(notes, dict) and "_speaker_identity" in notes:
+            from .speaker_identity import apply_bundle
+            people = apply_bundle(people, transcript, notes["_speaker_identity"])
+            return _validate_reviewed_notes(notes, transcript, people)
         return people
     review = notes["speaker_review"]
     if (not isinstance(review, dict)
@@ -293,6 +301,14 @@ def effective_attributions(transcript, notes=None):
             people[identity].update(suggested_name=name, evidence=list(refs))
         seen_ids.add(identity)
         seen_names[key] = identity
+    if "_speaker_identity" in notes:
+        from .speaker_identity import apply_bundle
+        people = apply_bundle(people, transcript, notes["_speaker_identity"])
+    return _validate_reviewed_notes(notes, transcript, people)
+
+
+def _validate_reviewed_notes(notes, transcript, people):
+    segments = transcript["segments"]
     suggested = {_name_key(person["suggested_name"]) for person in (people or {}).values()
                  if person.get("suggested_name")}
     # Enforce this at the common rendering boundary too, not only in the Codex
@@ -349,7 +365,7 @@ def _validate_suggested_prose(notes, segments, people, suggested):
 
 
 def attribution_notice(transcript, notes=None):
-    if isinstance(notes, dict) and "speaker_review" in notes:
+    if isinstance(notes, dict) and ("speaker_review" in notes or "_speaker_identity" in notes):
         return REVIEW_NOTICE
     return DIARIZED_NOTICE if transcript.get("speaker_labels") == "diarized_v1" else SOURCE_NOTICE
 

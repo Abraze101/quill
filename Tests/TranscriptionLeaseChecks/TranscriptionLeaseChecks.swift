@@ -90,10 +90,12 @@ actor ParakeetEngine: TranscriptionEngine {
             speakerStatus = .unavailable
             return try await EngineProbe.shared.transcribe()
         }
-        if fixture == "speakers-v2" {
+        if ["speakers-v2", "speakers-v3"].contains(fixture) {
             speakerStatus = .completed
+            let introduction = fixture == "speakers-v3"
+                ? "I know it doesn't say my name here, but yeah, my name is" : "My name is"
             return audio.lastPathComponent == "mic.caf"
-                ? [.init(start: 0, end: 0.3, text: "My name is", speakerID: "S1"),
+                ? [.init(start: 0, end: 0.3, text: introduction, speakerID: "S1"),
                    .init(start: 0.4, end: 0.9, text: "Alex, and I run operations.", speakerID: "S1")]
                 : [.init(start: 2, end: 3, text: "Hi, I'm Max. I can show the demo.", speakerID: "S1")]
         }
@@ -689,7 +691,7 @@ struct TranscriptionLeaseChecks {
     }
 
     private static func checkCanonicalSpeakers(root: URL, coordinator: TranscriptionCoordinator) async throws {
-        for suffix in ["speakers", "speakers-unavailable", "speakers-missing-track", "speakers-skipped-track", "speakers-v2"] {
+        for suffix in ["speakers", "speakers-unavailable", "speakers-missing-track", "speakers-skipped-track", "speakers-v2", "speakers-v3"] {
             let session = try fixture(suffix, root: root)
             if suffix == "speakers-missing-track" {
                 try FileManager.default.removeItem(at: session.appendingPathComponent("system.caf"))
@@ -707,7 +709,7 @@ struct TranscriptionLeaseChecks {
             let json = try JSONSerialization.jsonObject(with: Data(contentsOf: session.appendingPathComponent("transcript.json"))) as! [String: Any]
             let markdown = try String(contentsOf: session.appendingPathComponent("transcript.md"), encoding: .utf8)
             precondition(json["speaker_labels"] as? String == "diarized_v1")
-            precondition(json["speaker_name_policy"] as? String == "explicit_intro_v2")
+            precondition(json["speaker_name_policy"] as? String == "explicit_intro_v3")
             let log = try String(contentsOf: session.appendingPathComponent("transcribe.log"), encoding: .utf8)
             precondition(log.contains("speakers mic: ") && log.contains("synthetic_counts; words=3"),
                          "Speaker diagnostics were not saved with the track")
@@ -723,13 +725,15 @@ struct TranscriptionLeaseChecks {
             let segments = json["segments"] as! [[String: Any]]
             let status = json["speaker_identification"] as! [String: Any]
             precondition(map["unknown"] == nil)
-            if suffix == "speakers-v2" {
+            if ["speakers-v2", "speakers-v3"].contains(suffix) {
                 precondition(status["status"] as? String == "completed")
                 precondition(map["mic_speaker_1"]?["name"] as? String == "Alex")
                 precondition(map["mic_speaker_1"]?["evidence"] as? [Int] == [0, 1])
                 precondition(map["system_speaker_1"]?["name"] as? String == "Max")
                 precondition(map["system_speaker_1"]?["evidence"] as? [Int] == [2])
-                precondition(segments.count == 3 && segments[0]["text"] as? String == "My name is",
+                let introduction = suffix == "speakers-v3"
+                    ? "I know it doesn't say my name here, but yeah, my name is" : "My name is"
+                precondition(segments.count == 3 && segments[0]["text"] as? String == introduction,
                              "Joining name evidence must not rewrite the canonical segments")
                 precondition(markdown.contains("] Alex:**") && markdown.contains("] Max:**"))
                 continue

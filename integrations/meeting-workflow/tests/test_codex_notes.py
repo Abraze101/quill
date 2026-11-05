@@ -11,12 +11,29 @@ from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from quill_workflow.codex_notes import SECTIONS, output_schema, run, validate_result
+from quill_workflow.codex_notes import SECTIONS, output_schema, run, validate_result, _prompt_transcript
 from quill_workflow.pipeline import WorkflowError, atomic_json
+from quill_workflow.transcript_sources import transcript_digest
 from test_transcript_sources import diarized_transcript
 
 
 class CodexNotesTests(unittest.TestCase):
+    def test_prompt_indexes_large_transcript_without_mutating_source_or_digest(self):
+        transcript = {"segments": [{"start_ms": index * 1000, "speaker": "me", "text": "Synthetic speech."}
+                                    for index in range(1255)]}
+        original = json.dumps(transcript, sort_keys=True)
+        digest = transcript_digest(transcript)
+        prompt = _prompt_transcript(transcript)
+        self.assertEqual([segment["segment_index"] for segment in prompt["segments"]], list(range(1255)))
+        self.assertEqual(prompt["segments"][0]["segment_index"], 0)
+        self.assertEqual(prompt["segments"][-1]["segment_index"], 1254)
+        self.assertIn("explicit segment_index", prompt["segment_index_instruction"])
+        self.assertEqual([{key: value for key, value in segment.items() if key != "segment_index"}
+                          for segment in prompt["segments"]], transcript["segments"])
+        prompt["segments"][0]["text"] = "Changed prompt copy."
+        self.assertEqual(json.dumps(transcript, sort_keys=True), original)
+        self.assertEqual(transcript_digest(transcript), digest)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -76,7 +93,9 @@ class CodexNotesTests(unittest.TestCase):
         self.assertNotEqual(call["cwd"], str(self.root))
         self.assertFalse(Path(call["cwd"]).exists())
         self.assertFalse(call["api_key_inherited"])
-        self.assertEqual(call["payload"]["transcript"], json.loads(self.transcript.read_text()))
+        original = json.loads(self.transcript.read_text())
+        self.assertEqual(call["payload"]["transcript"], _prompt_transcript(original))
+        self.assertNotIn("segment_index", original["segments"][0])
         self.assertNotIn(str(self.transcript), call["argv"])
         for flag in ("--ignore-user-config", "--ignore-rules", "--ephemeral", "--strict-config"):
             self.assertIn(flag, call["argv"])
@@ -111,7 +130,7 @@ class CodexNotesTests(unittest.TestCase):
         for call in calls:
             payload = call["payload"]
             self.assertEqual(payload["capture_quality"], {"status": "incomplete", "affected_sources": ["mic", "system"]})
-            self.assertEqual(payload["transcript"]["segments"], transcript["segments"])
+            self.assertEqual(payload["transcript"]["segments"], _prompt_transcript(transcript)["segments"])
             self.assertIn("never infer or invent missing speech", payload["capture_quality_instruction"])
         self.assertIn("exporter adds it once", calls[1]["payload"]["validation_error"])
         self.assertEqual(json.loads(self.output.read_text()), self.notes)
@@ -360,7 +379,7 @@ class CodexNotesTests(unittest.TestCase):
         payload = json.loads(capture.read_text())[0]["payload"]
         self.assertEqual(payload["validated_speaker_names"]["system_speaker_1"]["name"], "Jamie")
         self.assertEqual(payload["validated_speaker_names"]["system_speaker_1"]["evidence"], [1])
-        self.assertEqual(payload["transcript"], transcript)
+        self.assertEqual(payload["transcript"], _prompt_transcript(transcript))
         self.assertEqual(json.loads(self.transcript.read_text()), transcript)
 
     def test_forged_speaker_name_is_rejected_before_model_invocation(self):
@@ -386,7 +405,7 @@ class CodexNotesTests(unittest.TestCase):
         self.assertEqual(len(saved["speaker_review"]["transcript_sha256"]), 64)
         payload = json.loads(calls.read_text())[0]["payload"]
         self.assertEqual(payload["meeting_context"], meeting_context)
-        self.assertEqual(payload["transcript"], transcript)
+        self.assertEqual(payload["transcript"], _prompt_transcript(transcript))
         self.assertEqual(json.loads(self.transcript.read_text()), transcript)
         self.assertEqual(saved["speaker_review"]["assignments"][1]["status"], "suggested")
 
