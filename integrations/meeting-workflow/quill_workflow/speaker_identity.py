@@ -7,6 +7,20 @@ this envelope only after it has checked the model's strict output schema.
 import copy
 import re
 
+MAX_BUNDLE_BYTES = 10_000_000
+
+
+def prompt_bundle(bundle):
+    """Keep the full source-bound timeline local; send only reviewed conclusions."""
+    if bundle is None:
+        return None
+    result = copy.deepcopy({key: value for key, value in bundle.items() if key != "context"})
+    result["context"] = copy.deepcopy({key: value for key, value in bundle["context"].items() if key != "timeline"})
+    if bundle["context"]["schema_version"] == 2:
+        result["local_participants"] = [dict(person) for person in bundle["context"]["timeline"]["participants"]
+                                        if person["self"]]
+    return result
+
 
 def validate_corrections(value, transcript):
     from .transcript_sources import speaker_attributions, transcript_digest
@@ -60,7 +74,7 @@ def apply_bundle(people, transcript, bundle):
             person.update(email=item["email"], review_status="confirmed")
             continue
         person.pop("suggested_name", None)
-        key = "name" if item["status"] == "confirmed" else "suggested_name"
+        key = "name" if item["status"] in ("confirmed", "matched") else "suggested_name"
         person.update({key: item["name"], "evidence": item["evidence"], "email": item["email"],
                        "review_status": item["status"]})
     for identity, item in bundle["corrections"]["assignments"].items():

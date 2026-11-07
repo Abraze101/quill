@@ -117,6 +117,38 @@ function participantEvidence(value) {
   return people;
 }
 
+function activityEvidence(value, provider, documentID, now = Date.now()) {
+  // A content-script document ID is not authoritative. Bind observations to
+  // Chrome's current sender document after the normal navigation checks.
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).some(key => !["schema_version", "source", "document_id", "participants", "samples"].includes(key))
+      || value.schema_version !== 1 || value.source !== provider + "-dom-v1"
+      || !/^[A-Za-z0-9-]{1,64}$/.test(documentID || "")
+      || !Array.isArray(value.participants) || value.participants.length > 20
+      || !Array.isArray(value.samples) || value.samples.length < 1 || value.samples.length > 32) return;
+  const participants = [], ids = new Set();
+  for (const person of value.participants) {
+    if (!person || Object.keys(person).sort().join(",") !== "id,name,self"
+        || typeof person.id !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(person.id) || ids.has(person.id)
+        || participantEvidence([{ name: person.name, self: person.self }]).length !== 1) return;
+    ids.add(person.id);
+    participants.push({ id: person.id, name: person.name, self: person.self });
+  }
+  let previous = -Infinity;
+  const samples = [];
+  for (const sample of value.samples) {
+    if (!sample || Object.keys(sample).sort().join(",") !== "active,at_ms"
+        || !Number.isSafeInteger(sample.at_ms) || sample.at_ms <= 0 || sample.at_ms <= previous
+        || sample.at_ms < now - 20000 || sample.at_ms > now + 1000
+        || !Array.isArray(sample.active) || sample.active.length > 4
+        || new Set(sample.active).size !== sample.active.length
+        || sample.active.some(id => !ids.has(id))) return;
+    previous = sample.at_ms;
+    samples.push({ at_ms: sample.at_ms, active: [...sample.active] });
+  }
+  return { schema_version: 1, source: value.source, document_id: documentID, participants, samples };
+}
+
 function zoomMeeting(url) {
   try {
     const parsed = new URL(url);
@@ -185,6 +217,7 @@ function queue(event) {
   if (outbox[key]?.state === "left" && event.state === "left") return;
   outbox[key] = { ...event, requestID: crypto.randomUUID(), queuedAt: Date.now() };
   if (event.state === "left") delete outbox[key].browserWindow;
+  if (event.state !== "joined") delete outbox[key].speakerActivity;
 }
 
 async function save() {
@@ -277,6 +310,7 @@ async function pump() {
         // A same-document navigation may change the actual meeting link.
         // Omit old participant context rather than attach it to the new call.
         delete candidate.meetingContext;
+        delete candidate.speakerActivity;
       }
     }
     event = candidate;
@@ -292,9 +326,12 @@ async function pump() {
     ackTimer = setTimeout(() => serial(async () => {
       if (connection === port && inFlight?.requestID === event.requestID) await failed(port);
     }), ACK_TIMEOUT);
+    const activity = event.state === "joined" && event.meetingContext
+      ? activityEvidence(event.speakerActivity, event.provider, event.documentID) : undefined;
     port.postMessage({ source: event.source, meeting: event.meeting,
       provider: event.provider, state: event.state, requestID: event.requestID,
       ...(event.state === "joined" && event.meetingContext ? { meetingContext: event.meetingContext } : {}),
+      ...(activity ? { speakerActivity: activity } : {}),
       ...(event.state !== "left" && event.browserWindow ? { browserWindow: event.browserWindow } : {}) });
   } catch (error) {
     reportError("Native connection failed", error);
@@ -367,6 +404,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         provider: message.provider, key: current.meetingKey,
         participants: participantEvidence(message.participants), coverage: "visible_only" } } : {}),
       ...(browserWindow ? { browserWindow } : {}) };
+    if (event.meetingContext) {
+      const activity = activityEvidence(message.speakerActivity, message.provider, sender.documentId);
+      if (activity) event.speakerActivity = activity;
+    }
     const previous = documents[tab];
     if (previous && !sameDocument(previous, event) && previous.state !== "left") {
       queue({ ...previous, state: "left" });
@@ -398,6 +439,7 @@ async function refreshWindowSignal(tabID, unavailable = false) {
   // joined. Preserve leave detection and let the next DOM heartbeat restore
   // joined evidence. Unknown must never end the audio recording.
   const event = { ...previous, state: "unknown" };
+  delete event.speakerActivity;
   delete event.browserWindow;
   delete event.windowUnavailable;
   if (browserWindow) event.browserWindow = browserWindow;

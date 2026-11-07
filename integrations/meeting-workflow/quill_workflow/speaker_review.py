@@ -33,7 +33,8 @@ SOURCES = ("visible", "calendar", "confirmed_correction")
 REPORT_KEYS = {"schema_version", "speakers"}
 BINDING_KEYS = {"transcript_sha256", "context_sha256"}
 ENTRY_KEYS = {"speaker_id", "status", "name", "email", "evidence", "candidate_indices", "reason"}
-MAX_CONTEXT_BYTES = 100_000
+MAX_CONTEXT_BYTES = 5_100_000
+MAX_CONTEXT_FILE_BYTES = 10_000_000  # Allows indented storage; semantic limits remain below.
 
 
 def _email(value):
@@ -56,8 +57,10 @@ def validate_context(value):
     """Keep candidate identities bounded and distinct from voice assignments."""
     if value is None:
         return {"schema_version": 1, "candidates": []}
-    if (not isinstance(value, dict) or set(value) != {"schema_version", "candidates"}
-            or type(value.get("schema_version")) is not int or value["schema_version"] != 1
+    version = value.get("schema_version") if isinstance(value, dict) else None
+    keys = {"schema_version", "candidates"} | ({"timeline"} if version == 2 else set())
+    if (not isinstance(value, dict) or set(value) != keys
+            or type(version) is not int or version not in (1, 2)
             or not isinstance(value.get("candidates"), list) or len(value["candidates"]) > 100):
         raise ValueError("Invalid speaker evidence context")
     result = []
@@ -81,10 +84,29 @@ def validate_context(value):
         if candidate["source"] == "visible" and email is not None:
             raise ValueError("Visible names do not establish email addresses")
         result.append({"name": name, "email": email, "source": candidate["source"], "aliases": aliases})
-    normalized = {"schema_version": 1, "candidates": result}
+    normalized = {"schema_version": version, "candidates": result}
+    if len(json.dumps(normalized, ensure_ascii=False).encode()) > 100_000:
+        raise ValueError("Speaker evidence context is too large")
+    if version == 2:
+        from .speaker_timeline import validate_timeline
+        normalized["timeline"] = validate_timeline(value["timeline"])
     if len(json.dumps(normalized, ensure_ascii=False).encode()) > MAX_CONTEXT_BYTES:
         raise ValueError("Speaker evidence context is too large")
     return normalized
+
+
+def platform_evidence(transcript, context):
+    if context.get("schema_version") != 2:
+        return {"matches": {}, "suggestions": {}, "local_participants": []}
+    from .speaker_timeline import match_timeline
+    return match_timeline(transcript, context["timeline"])
+
+
+def prompt_context(context):
+    """The model needs bounded conclusions, not thousands of raw observations."""
+    return {"schema_version": context["schema_version"],
+            "candidates": [dict(candidate, candidate_index=index)
+                           for index, candidate in enumerate(context["candidates"])]}
 
 
 def _candidate_names(candidate):
@@ -132,13 +154,14 @@ def validate_report(report, transcript, context=None, *, bound=True):
         raise ValueError("Speaker review does not match its source transcript or evidence context")
     segments, candidates = transcript["segments"], context["candidates"]
     introductions = _introductions(transcript)
+    platform = platform_evidence(transcript, context)
     seen = set()
     for entry in report["speakers"]:
         if not isinstance(entry, dict) or set(entry) != ENTRY_KEYS:
             raise ValueError("Invalid speaker review entry")
         identity, status, name = entry["speaker_id"], entry["status"], entry["name"]
         if (not isinstance(identity, str) or identity not in people or identity in seen
-                or status not in ("confirmed", "suggested", "unresolved")):
+                or status not in ("confirmed", "matched", "suggested", "unresolved")):
             raise ValueError("Speaker review needs one result per existing separated voice")
         seen.add(identity)
         def invalid(message):
@@ -158,6 +181,8 @@ def validate_report(report, transcript, context=None, *, bound=True):
                 raise invalid("An unresolved voice cannot carry a name, email or candidate_indices")
             if people[identity].get("name"):
                 raise invalid("Speaker review cannot remove an established introduction")
+            if identity in platform["matches"]:
+                raise invalid("Preserve the validated meeting participant match")
             continue
         try:
             _name(name)
@@ -168,7 +193,14 @@ def validate_report(report, transcript, context=None, *, bound=True):
         existing = people[identity].get("name")
         if existing is not None and (name != existing or status != "confirmed"):
             raise invalid("Speaker review conflicts with an established introduction; preserve its name and confirmed status")
-        if status == "confirmed":
+        expected_match = platform["matches"].get(identity)
+        if expected_match and (status != "matched" or name != expected_match["name"]
+                               or refs != expected_match["evidence"]):
+            raise invalid("Preserve the exact name and evidence from the validated meeting participant match")
+        if status == "matched":
+            if expected_match is None or name != expected_match["name"] or refs != expected_match["evidence"]:
+                raise invalid("Automatic name requires an exact independently validated meeting participant match")
+        elif status == "confirmed":
             matches = introductions.get(identity, {})
             if set(matches) != {name}:
                 raise invalid("Confirmed speaker review requires exact self-introduction evidence; name must match the sole reliable_introductions entry for this voice")
@@ -180,7 +212,9 @@ def validate_report(report, transcript, context=None, *, bound=True):
                 raise invalid("Confirmed name occurs on multiple voices; review the grouping")
         elif not (any(_name_in_speech(name, segments[index]["text"]) for index in refs)
                   or any(name in _candidate_names(candidates[index])
-                         for index in candidate_refs)):
+                         for index in candidate_refs)
+                  or (platform["suggestions"].get(identity, {}).get("name") == name
+                      and refs == platform["suggestions"][identity]["evidence"])):
             raise invalid("Suggested speaker name needs exact transcript or candidate evidence; cite a segment_index containing the name or a candidate_index with that name/alias")
         email = entry["email"]
         if email is not None:
@@ -220,13 +254,37 @@ def bind_report(report, transcript, context=None):
     return result
 
 
+def apply_platform_matches(report, transcript, context):
+    """Use caller-owned timing proof even when the model stays unnecessarily unsure.
+
+    This runs only on a fresh draft. Saved reports still undergo strict independent
+    validation, and a contradictory proposed name remains a validation error.
+    """
+    result = copy.deepcopy(report)
+    if not isinstance(result, dict) or not isinstance(result.get("speakers"), list):
+        return result
+    matches = platform_evidence(transcript, context)["matches"]
+    for item in result["speakers"]:
+        if not isinstance(item, dict) or set(item) != ENTRY_KEYS or not isinstance(item.get("speaker_id"), str):
+            continue
+        match = matches.get(item["speaker_id"])
+        if match is None:
+            continue
+        unresolved = (item["status"] == "unresolved" and item["name"] is None
+                      and item["email"] is None and item["candidate_indices"] == [])
+        suggested = item["status"] == "suggested" and item["name"] == match["name"]
+        if unresolved or suggested:
+            item.update(status="matched", name=match["name"], evidence=match["evidence"], reason=match["reason"])
+    return result
+
+
 def output_schema():
     indices = {"type": "array", "maxItems": 100,
                "items": {"type": "integer", "minimum": 0}}
     entry = {"type": "object", "additionalProperties": False,
              "required": sorted(ENTRY_KEYS), "properties": {
                  "speaker_id": {"type": "string", "minLength": 1, "maxLength": 80},
-                 "status": {"type": "string", "enum": ["confirmed", "suggested", "unresolved"]},
+                 "status": {"type": "string", "enum": ["confirmed", "matched", "suggested", "unresolved"]},
                  "name": {"type": ["string", "null"], "maxLength": 60},
                  "email": {"type": ["string", "null"], "maxLength": 254},
                  "evidence": {**indices, "description": "Copy explicit segment_index values from cited transcript segments."},
@@ -248,6 +306,10 @@ Do not invent, merge, split, or change IDs, words, timestamps or sources. Never 
 Review the whole conversation: introductions, direct address followed by replies, third-person references,
 who asks whom a question, and repeated exchanges. Microphone and system labels identify sources, not people.
 A microphone may be shared. Two invited people or a browser self badge do not prove who spoke.
+validated_platform_matches contains deterministic matches from timed platform activity. Preserve each
+exact name and evidence list using status matched; do not invent another matched entry. These labels
+identify meeting participants/devices, not independently verified people. platform_suggestions and
+local_participants may provide supporting context, but cannot establish a confirmed or matched voice.
 Candidate identities come from a partial visible list, matched invitations, or user-confirmed name/email
 corrections. Prior corrections help spelling and aliases only; they do not identify a voice in this call.
 Calendar invitees may be absent and uninvited guests may be present. Never infer a name from an email's local part.
@@ -282,7 +344,7 @@ def run(input_path, output_path, executable="codex", model=None, timeout=900, co
             raise ValueError("Speaker review needs separated voices; this transcript has audio-source labels only")
         if len(people) > 100:
             raise ValueError("Speaker review has too many separated voices")
-        context = validate_context(read_json(Path(context_path), limit=MAX_CONTEXT_BYTES) if context_path else None)
+        context = validate_context(read_json(Path(context_path), limit=MAX_CONTEXT_FILE_BYTES) if context_path else None)
         introductions = _introductions(transcript)
     except ValueError as error:
         raise WorkflowError(str(error)) from error
@@ -291,12 +353,16 @@ def run(input_path, output_path, executable="codex", model=None, timeout=900, co
         raise WorkflowError("Codex CLI is not installed; choose its executable path")
     payload = {"task": "Review every separated voice using this conversation and candidate evidence. Do not use tools.",
                "transcript": _prompt_transcript(transcript),
-               "evidence_context": dict(context, candidates=[dict(candidate, candidate_index=index)
-                   for index, candidate in enumerate(context["candidates"])]),
+               "evidence_context": prompt_context(context),
                "validated_speaker_names": {key: value for key, value in people.items() if "name" in value},
                "reliable_introductions": {key: names for key, names in introductions.items()
                     if len(names) == 1 and not any(set(names) & set(other_names)
                         for other, other_names in introductions.items() if other != key)}}
+    if context["schema_version"] == 2:
+        platform = platform_evidence(transcript, context)
+        payload.update(validated_platform_matches=platform["matches"],
+                       platform_suggestions=platform["suggestions"],
+                       local_participants=platform["local_participants"])
     deadline = time.monotonic() + timeout
 
     def remaining_time():
@@ -332,7 +398,7 @@ def run(input_path, output_path, executable="codex", model=None, timeout=900, co
             remaining_time()
             raw = read_candidate(directory / "answer.json")
             try:
-                report = bind_report(json.loads(raw), transcript, context)
+                report = bind_report(apply_platform_matches(json.loads(raw), transcript, context), transcript, context)
             except ValueError as error:
                 diagnostic = " ".join(str(error).split())[:500]
                 if attempt == 1:
@@ -344,7 +410,7 @@ def run(input_path, output_path, executable="codex", model=None, timeout=900, co
             remaining_time()
             if transcript_digest(read_json(input_path)) != report["transcript_sha256"]:
                 raise WorkflowError("Transcript changed during speaker review; no output was accepted")
-            if context_path and transcript_digest(validate_context(read_json(Path(context_path), limit=MAX_CONTEXT_BYTES))) != report["context_sha256"]:
+            if context_path and transcript_digest(validate_context(read_json(Path(context_path), limit=MAX_CONTEXT_FILE_BYTES))) != report["context_sha256"]:
                 raise WorkflowError("Evidence changed during speaker review; no output was accepted")
             if output_path.exists() or output_path.is_symlink():
                 raise WorkflowError("Speaker review output already exists; use a new revision path")

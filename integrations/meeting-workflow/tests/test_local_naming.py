@@ -48,7 +48,7 @@ class LocalNamingTests(unittest.TestCase):
         (self.session / "transcribe.log").write_text("Synthetic completed transcription.\n")
         self.config = {"recordings_root": str(self.recordings), "local_naming": {"enabled": True}}
         self.queue = Queue(self.root / "state")
-        self.title = "Portal dashboard review - Alex"
+        self.title = "Alex - Portal dashboard review"
 
     def tearDown(self):
         self.queue.close()

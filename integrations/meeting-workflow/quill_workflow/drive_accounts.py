@@ -191,7 +191,7 @@ def select_account(config_path, state, link_id, revision, *, expected_profile_id
         verifier = DriveUploader(state, transport.invoke, root, account_link_id=link_id)
         try:
             root_item = verifier._metadata(root)
-            owner = verifier._private(root_item, owner=profile["email"], mime=FOLDER_MIME)
+            owner = verifier._verify_access(root_item, owner=profile["email"], mime=FOLDER_MIME)
             if root not in verifier._find("root", root_item["title"], True):
                 raise UploadNeedsReview("The configured Meetings root is unavailable")
         except (DriveOperationError, UploadNeedsReview):
@@ -200,16 +200,13 @@ def select_account(config_path, state, link_id, revision, *, expected_profile_id
         if not isinstance(route, dict):
             raise NeedsConfiguration("The company folder configuration needs review.")
         if route.get("companies") is not None:
-            from .routing import validate_companies
+            from .routing import validate_companies, _route
             for company in validate_companies(route["companies"]):
-                verifier._private(verifier._metadata(company["drive_folder_id"]), owner=owner,
-                                  parent=root, name=company["name"], mime=FOLDER_MIME)
-                if company["drive_folder_id"] not in verifier._find(root, company["name"], True):
-                    raise NeedsConfiguration("A configured company folder is unavailable. Review the folder configuration.")
+                verifier.verify_destination(_route([company], company["id"]), owner)
         publish = stages.get("publish", {})
         template_id = publish.get("template_document_id")
         if template_id is not None:
-            verifier._private(verifier._metadata(template_id), owner=owner, mime=DOCUMENT_MIME)
+            verifier._verify_access(verifier._metadata(template_id), owner=owner, mime=DOCUMENT_MIME)
         archive = stages.get("archive", {})
         if archive.get("large_files") is not None:
             if not large_files_configured(archive, "archive"):

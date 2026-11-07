@@ -27,6 +27,7 @@ enum Fixture {
     static var registered: [URL] = []
     static var notices: [String] = []
     static var transcriptionEnabled = true
+    static var speakerIdentificationEnabled = false
     static var retryGate = Gate(open: true)
     static var retryCalls = 0
     static var retryResult = TranscriptionCoordinator.RetryResult.queued(1)
@@ -34,6 +35,8 @@ enum Fixture {
     static var informationAlerts: [String] = []
     static var micCaptureOrigin: Double?
     static var systemCaptureOrigin: Double?
+    static var micHasFirstBuffer = true
+    static var systemHasFirstBuffer = true
 
     static func reset(root: URL) {
         self.root = root
@@ -47,8 +50,10 @@ enum Fixture {
         systemStopRequests = 0; systemRecorders = []
         enqueued = []; registered = []; notices = []
         transcriptionEnabled = true; retryGate = Gate(open: true); retryCalls = 0
+        speakerIdentificationEnabled = false
         retryResult = .queued(1); allowInformationAlerts = false; informationAlerts = []
         micCaptureOrigin = nil; systemCaptureOrigin = nil
+        micHasFirstBuffer = true; systemHasFirstBuffer = true
     }
 }
 
@@ -79,7 +84,12 @@ final class MicRecorder {
         if let origin = Fixture.micCaptureOrigin { report["capture_start_offset_seconds"] = origin }
         return report
     }
-    func start(writingTo: URL) throws { Fixture.micStarts += 1 }
+    func start(writingTo: URL) throws {
+        Fixture.micStarts += 1
+        if Fixture.micHasFirstBuffer, let origin = Fixture.micCaptureOrigin, let captureTimeline {
+            firstBufferAt = Date().addingTimeInterval(captureTimeline.startedAt + origin - RecordingCaptureTimeline.now)
+        }
+    }
     func stop() { Fixture.micStops += 1 }
 }
 
@@ -91,7 +101,7 @@ final class SystemAudioRecorder {
     var hasCapturedAudio = true
     var coverageComplete = true
     private(set) var stopRequested = false
-    var firstBufferAt: Date? { nil }
+    private(set) var firstBufferAt: Date?
     var captureReport: [String: Any] {
         var report: [String: Any] = ["received_audio": hasCapturedAudio, "coverage_complete": coverageComplete]
         if let origin = Fixture.systemCaptureOrigin { report["capture_start_offset_seconds"] = origin }
@@ -112,6 +122,9 @@ final class SystemAudioRecorder {
     func start(writingTo: URL) async throws {
         Fixture.systemStarts += 1
         await Fixture.startGate.wait()
+        if Fixture.systemHasFirstBuffer, let origin = Fixture.systemCaptureOrigin, let captureTimeline {
+            firstBufferAt = Date().addingTimeInterval(captureTimeline.startedAt + origin - RecordingCaptureTimeline.now)
+        }
     }
     func requestStop() {
         guard !stopRequested else { return }
@@ -156,7 +169,8 @@ enum NSWorkspace {
     @MainActor final class Workspace {
         var notificationCenter: NotificationCenter { Fixture.center }
         func activateFileViewerSelecting(_ files: [URL]) { preconditionFailure("Unexpected Finder request") }
-        func open(_ url: URL) { preconditionFailure("Unexpected URL open") }
+        @discardableResult
+        func open(_ url: URL) -> Bool { preconditionFailure("Unexpected URL open") }
     }
 }
 
@@ -314,7 +328,7 @@ enum Config {
     static func screenVideoEnabled() -> Bool { Fixture.screenEnabled }
     static func meetingAutomationEnabled() -> Bool { Fixture.automationEnabled }
     static func transcriptionEnabled() -> Bool { Fixture.transcriptionEnabled }
-    static func speakerIdentificationEnabled() -> Bool { false }
+    static func speakerIdentificationEnabled() -> Bool { Fixture.speakerIdentificationEnabled }
     static func showInDock() -> Bool { false }
     static func recordingCheckInHours() -> Int { 2 }
     static func onStop() -> String? { "test-only-spy-never-executed" }

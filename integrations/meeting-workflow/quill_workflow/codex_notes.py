@@ -269,12 +269,12 @@ def run(input_path, output_path, skill_path, executable="codex", model=None, tim
     started = time.monotonic()
     identity = None
     if identity_path:
-        from quill_workflow.speaker_identity import validate_bundle
-        identity = validate_bundle(read_json(Path(identity_path), limit=500_000), transcript)
+        from quill_workflow.speaker_identity import MAX_BUNDLE_BYTES, validate_bundle
+        identity = validate_bundle(read_json(Path(identity_path), limit=MAX_BUNDLE_BYTES), transcript)
     elif speaker_context_path and transcript.get("speaker_labels") == "diarized_v1":
-        from quill_workflow.speaker_review import run as review_speakers, validate_context
+        from quill_workflow.speaker_review import MAX_CONTEXT_FILE_BYTES, run as review_speakers, validate_context
         from quill_workflow.speaker_identity import empty_bundle
-        identity_context = validate_context(read_json(Path(speaker_context_path), limit=100_000))
+        identity_context = validate_context(read_json(Path(speaker_context_path), limit=MAX_CONTEXT_FILE_BYTES))
         identity = empty_bundle(transcript, identity_context)
         with tempfile.TemporaryDirectory(prefix="quill-speakers-") as temporary:
             report_path = Path(temporary) / "review.json"
@@ -285,13 +285,14 @@ def run(input_path, output_path, skill_path, executable="codex", model=None, tim
             or skill_path.stat().st_size > 100_000):
         raise WorkflowError("Expected a bounded, regular Call Summary skill file")
     skill = skill_path.read_text(encoding="utf-8")
+    from quill_workflow.speaker_identity import prompt_bundle
     # Source is passed as data over stdin, never interpolated into a shell or argv.
     prompt = json.dumps({"task": "Summarize this one completed transcript according to the skill. "
                         "Return only the required JSON. Use empty arrays for irrelevant sections "
                         "and null for an unnecessary follow-up draft. Do not use tools.",
                         "call_summary_skill": skill, "transcript": _prompt_transcript(transcript),
                         "meeting_context": context,
-                        "focused_speaker_review": identity,
+                        "focused_speaker_review": prompt_bundle(identity),
                         **_speaker_context(transcript, identity), **_quality_context(transcript)},
                         ensure_ascii=False, allow_nan=False)
     output_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -321,9 +322,10 @@ def run(input_path, output_path, skill_path, executable="codex", model=None, tim
             "other speaker, participant, speaker numbers, or another anonymous label in "
             "owner; use null when a person's identity is unverified. For a named owner, "
             "cite segments that contain the exact name as well as the commitment. With "
-            "diarized_v1 only, validated_speaker_names contains validated self-introductions: "
+            "diarized_v1 only, validated_speaker_names contains validated introductions, "
+            "deterministic meeting-participant matches, or explicit user corrections: "
             "an action can cite a later commitment from that same separated speaker ID and "
-            "use its exact supported name. This is an introduction, not a verified legal identity. "
+            "use its exact supported name. These are meeting labels, not verified legal identities. "
             "Never transfer a name between IDs, use a numbered speaker as a person's name, "
             "or assign unknown-source speech to a named speaker. "
             "An introduction on a mixed audio track does not identify the person speaking "
@@ -335,10 +337,15 @@ def run(input_path, output_path, skill_path, executable="codex", model=None, tim
             "Supply meeting_title with a concise, neutral topic in text (at most 120 characters), "
             "its supporting evidence, and participants as names with their own evidence. "
             "Do not put participant names, a date, a company folder, or an opaque identifier in "
-            "the topic text: the caller adds names and the recording date. Include names only "
+            "the topic text: the caller puts participant names first, followed by the topic "
+            "and recording date. Include names only "
             "when the conversation establishes they are on this call, such as an introduction "
             "or direct address. A name mentioned while discussing someone else does not establish "
-            "attendance. Use the exact name spelling found in the cited transcript segments; "
+            "attendance. Use the exact name spelling found in the cited transcript segments, "
+            "or an exact supported name from validated_speaker_names with evidence citing "
+            "speech by that same separated speaker ID. A validated name need not be spoken "
+            "again in the cited segment. Suggested matches and calendar attendance alone "
+            "cannot supply title participants; "
             "never infer surnames, identities from me/them, or names from other meetings. "
             "If attendance or name spelling is uncertain, omit that person. An empty participants "
             "array is valid. For a meeting with no clear topic, use a modest description supported "
@@ -382,7 +389,7 @@ def run(input_path, output_path, skill_path, executable="codex", model=None, tim
             "Do not invent details.\n")
         if identity:
             instructions += (
-                "A caller-validated focused_speaker_review is supplied. Use its confirmed names and user corrections "
+                "A caller-validated focused_speaker_review is supplied. Use its confirmed or matched names and user corrections "
                 "for exactly the indicated voice IDs; its suggestions remain tentative. Do not redo or contradict "
                 "this review. Return an empty speaker_review.assignments array; the caller attaches the validated "
                 "focused review separately. Confirmed user spellings may be used with evidence from that voice "
@@ -447,7 +454,7 @@ def run(input_path, output_path, skill_path, executable="codex", model=None, tim
                 prompt = correction_prompt(skill, transcript, raw, diagnostic, context)
                 if identity:
                     payload = json.loads(prompt)
-                    payload.update(focused_speaker_review=identity, **_speaker_context(transcript, identity))
+                    payload.update(focused_speaker_review=prompt_bundle(identity), **_speaker_context(transcript, identity))
                     prompt = json.dumps(payload, ensure_ascii=False, allow_nan=False)
                 continue
             remaining_time()

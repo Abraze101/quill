@@ -78,8 +78,9 @@ public struct MeetingSignal: Codable, Equatable, Sendable {
     public let timestamp: TimeInterval
     public let browserWindow: BrowserWindow?
     public let meetingContext: MeetingContext?
+    public let speakerActivity: MeetingSpeakerActivity?
 
-    public init(source: String, meeting: String, provider: String, state: State, timestamp: TimeInterval, browserWindow: BrowserWindow? = nil, meetingContext: MeetingContext? = nil) {
+    public init(source: String, meeting: String, provider: String, state: State, timestamp: TimeInterval, browserWindow: BrowserWindow? = nil, meetingContext: MeetingContext? = nil, speakerActivity: MeetingSpeakerActivity? = nil) {
         self.source = source
         self.meeting = meeting
         self.provider = provider
@@ -87,6 +88,25 @@ public struct MeetingSignal: Codable, Equatable, Sendable {
         self.timestamp = timestamp
         self.browserWindow = browserWindow
         self.meetingContext = meetingContext?.provider == provider ? meetingContext?.validated() : nil
+        self.speakerActivity = state == .joined ? speakerActivity?.validated(provider: provider, receivedAt: timestamp) : nil
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case source, meeting, provider, state, timestamp, browserWindow, meetingContext, speakerActivity
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        // Optional naming evidence must never disable join/leave detection if
+        // a newer/older browser sends an unavailable or malformed activity field.
+        self.init(source: try values.decode(String.self, forKey: .source),
+                  meeting: try values.decode(String.self, forKey: .meeting),
+                  provider: try values.decode(String.self, forKey: .provider),
+                  state: try values.decode(State.self, forKey: .state),
+                  timestamp: try values.decode(TimeInterval.self, forKey: .timestamp),
+                  browserWindow: try values.decodeIfPresent(BrowserWindow.self, forKey: .browserWindow),
+                  meetingContext: try values.decodeIfPresent(MeetingContext.self, forKey: .meetingContext),
+                  speakerActivity: try? values.decodeIfPresent(MeetingSpeakerActivity.self, forKey: .speakerActivity))
     }
 }
 

@@ -107,6 +107,39 @@ class CodexNotesTests(unittest.TestCase):
             i = call["argv"].index(feature)
             self.assertEqual(call["argv"][i-1], "--disable")
 
+    def test_platform_matched_owner_and_title_survive_notes_with_compact_identity_prompt(self):
+        from test_speaker_timeline import fixture, context as activity_context, draft as activity_draft
+        from quill_workflow.speaker_identity import empty_bundle
+        from quill_workflow.speaker_review import bind_report
+        transcript, timeline = fixture()
+        timeline["intervals"].extend({"start_ms": point, "end_ms": point + 500, "active": []}
+                                    for point in range(12000, 5_012_000, 500))
+        atomic_json(self.transcript, transcript)
+        bundle = empty_bundle(transcript, activity_context(timeline))
+        bundle["report"] = bind_report(activity_draft(), transcript, bundle["context"])
+        identity = self.root / "identity.json"
+        atomic_json(identity, bundle)
+        self.assertGreater(identity.stat().st_size, 500_000)
+        self.notes["actions"] = [{"text": "Complete the next step", "owner": "Jamie Taylor",
+                                  "due": None, "evidence": [4]}]
+        self.notes["meeting_title"]["participants"] = [{"name": "Jamie Taylor", "evidence": [4]}]
+        self.notes["speaker_review"] = {"schema_version": 1, "assignments": []}
+        executable, capture = self.sequence(["not valid json", json.dumps(self.notes)])
+        self.invoke(executable, identity_path=identity)
+        calls = json.loads(capture.read_text())
+        self.assertEqual(len(calls), 2)
+        for call in calls:
+            prompt = call["payload"]
+            self.assertNotIn("intervals", json.dumps(prompt))
+            self.assertEqual(prompt["validated_speaker_names"]["system_speaker_1"]["name"], "Jamie Taylor")
+            self.assertEqual(prompt["focused_speaker_review"]["local_participants"][0]["name"], "Casey Rivera")
+        saved = json.loads(self.output.read_text())
+        self.assertEqual(saved["actions"][0]["owner"], "Jamie Taylor")
+        self.assertEqual(saved["_speaker_identity"], bundle)
+        from quill_workflow.meeting_title import meeting_title
+        self.assertNotIn("Jamie Taylor", transcript["segments"][4]["text"])
+        self.assertEqual(meeting_title(saved, transcript), "Jamie Taylor - Agenda planning")
+
     def test_invalid_json_and_evidence_never_publish_output(self):
         bad_ref = dict(self.notes, summary=[{"text": "Invented", "evidence": [99]}])
         for payload in ("not json", json.dumps(bad_ref), json.dumps({"schema_version": 1})):

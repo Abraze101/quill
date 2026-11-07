@@ -4,6 +4,8 @@ This module performs no network or file operations. Source evidence is checked
 before rendering but remains in the source JSON, rather than reader-facing notes.
 """
 from datetime import datetime, timezone as utc_timezone
+import hashlib
+import json
 import re
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -70,7 +72,7 @@ def note_sections(notes):
     }
 
 
-def build_payload(notes, transcript, metadata, route, timezone="UTC"):
+def build_payload(notes, transcript, metadata, route, timezone="UTC", *, participants_first=True):
     """Map every validated note section and the exact transcript into native slots."""
     from .pipeline import render_notes
     render_notes(notes, transcript)
@@ -99,7 +101,7 @@ def build_payload(notes, transcript, metadata, route, timezone="UTC"):
     company = _text(route.get("company_name"))
     if not company.strip():
         raise ValueError("Document needs an approved company name")
-    heading = meeting_title(notes, transcript) or "Meeting notes and transcript"
+    heading = meeting_title(notes, transcript, participants_first=participants_first) or "Meeting notes and transcript"
     short_date = f"{started.month}/{started.day}/{started.year % 100:02d}"
     participants = notes.get("meeting_title", {}).get("participants", [])
     transcript_lines = []
@@ -141,6 +143,27 @@ def build_payload(notes, transcript, metadata, route, timezone="UTC"):
                      "source_timestamp": started.astimezone(utc_timezone.utc).isoformat().replace("+00:00", "Z"),
                      "timezone": timezone},
             "company_name": company, "transcript_segments": len(transcript_lines)}
+
+
+def build_bound_payload(notes, transcript, metadata, route, timezone, identity):
+    """Rebuild the exact title order of a frozen native upload.
+
+    Callers must still verify the full identity, including account, destination,
+    template and receipt. Matching an old title alone never adopts changed notes.
+    """
+    if not isinstance(identity, dict):
+        raise ValueError("The saved native document identity needs review")
+    for participants_first in (True, False):
+        payload = build_payload(notes, transcript, metadata, route, timezone,
+                                participants_first=participants_first)
+        digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                                           ensure_ascii=False, allow_nan=False).encode()).hexdigest()
+        if (identity.get("text_format") == FORMAT
+                and identity.get("document_title") == payload["title"]
+                and identity.get("files") == [{"name": "native-template",
+                    "mime_type": "application/vnd.google-apps.document", "payload_sha256": digest}]):
+            return payload
+    raise ValueError("Native document inputs or destination changed; create an explicit revision")
 
 
 def _document(document):

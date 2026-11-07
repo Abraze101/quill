@@ -11,6 +11,11 @@
   let heartbeat = null;
   let warningTimer = null;
   let warning = null;
+  let activityTimer = null;
+  const activity = globalThis.QuillSpeakerActivity?.createCollector();
+  let lastActivityAt = -Infinity;
+  let lastActivity = null;
+  let activitySession = null;
   if (globalThis.QuillRecordingWarning) {
     const render = QuillRecordingWarning.createBanner(document, () => warning.dismiss());
     warning = QuillRecordingWarning.createMonitor({ render,
@@ -23,8 +28,13 @@
     stopped = true;
     observer.disconnect();
     if (heartbeat !== null) clearInterval(heartbeat);
+    if (activityTimer !== null) clearInterval(activityTimer);
     if (pendingScan !== null) clearTimeout(pendingScan);
     heartbeat = null;
+    activityTimer = null;
+    activity?.reset();
+    lastActivity = null;
+    activitySession = null;
     pendingScan = null;
     if (!warning) window.removeEventListener("pagehide", onPageHide);
     warning?.connectionLost();
@@ -42,10 +52,11 @@
     const style = getComputedStyle(element);
     return style.display !== "none" && style.visibility !== "hidden" && element.getClientRects().length > 0;
   }
-  function send(state, participants) {
+  function send(state, participants, speakerActivity) {
     if (stopped || !meeting || !provider) return;
     const message = { type: "quill-meeting", documentID, meeting, provider, state,
-      ...(state === "joined" ? { participants: participants || [] } : {}) };
+      ...(state === "joined" ? { participants: participants || [] } : {}),
+      ...(state === "joined" && speakerActivity ? { speakerActivity } : {}) };
     try {
       Promise.resolve(chrome.runtime.sendMessage(message)).catch(sendFailed);
     } catch (error) {
@@ -83,11 +94,40 @@
       // Hidden controls, reconnecting, or an unreadable state cannot prove leave.
       last = "unknown";
     }
+    let speakerActivity;
+    if (result.state === "joined" && activity) speakerActivity = sampleActivity(true);
+    else { activity?.reset(); lastActivity = null; activitySession = null; lastActivityAt = -Infinity; }
     if (last) send(last, result.state === "joined"
-      ? QuillMeetingDetector.visibleParticipants(document, provider, visible) : undefined);
+      ? QuillMeetingDetector.visibleParticipants(document, provider, visible) : undefined, speakerActivity);
     warning?.observe(QuillMeetingDetector.warningEvidence(snapshot), result.state === "joined" ? meeting : null);
   }
+  function sampleActivity(allowSessionChange = false) {
+    if (!activity || stopped || last !== "joined") return;
+    try {
+      const now = Date.now();
+      const route = new URL(location.href).pathname.replace(/^\/meet\//, "/").replace(/\/$/, "");
+      const activityKey = meeting + "|" + provider + "|" + route;
+      if (activityKey !== activitySession) {
+        activity.reset(); lastActivity = null; lastActivityAt = -Infinity;
+        // A timer must not carry evidence into a new meeting before the normal
+        // detector has confirmed that route is joined.
+        if (!allowSessionChange) { activitySession = null; return; }
+        activitySession = activityKey;
+      }
+      if (now - lastActivityAt >= 400 || now < lastActivityAt) {
+        lastActivityAt = now;
+        lastActivity = activity.observe(activityKey,
+          QuillSpeakerActivity.read(document, provider, visible, activityKey));
+      }
+      return lastActivity;
+    } catch { activity.reset(); lastActivity = null; }
+  }
   function onPageHide() {
+    activity?.reset();
+    lastActivity = null;
+    activitySession = null;
+    if (activityTimer !== null) clearInterval(activityTimer);
+    activityTimer = null;
     if (!stopped && meeting) send("left");
     warning?.clear();
     if (warningTimer !== null) clearInterval(warningTimer);
@@ -107,6 +147,9 @@
   // If a browser suspends delivery, Quill shows signal loss and requires a
   // manual stop instead of treating a missing heartbeat as a leave event.
   heartbeat = setInterval(scan, 5000);
+  // Sample activity independently; retain the existing detection and health
+  // cadence. Batches travel with the next normal joined heartbeat/DOM scan.
+  if (activity) activityTimer = setInterval(() => sampleActivity(), 500);
   window.addEventListener("pagehide", onPageHide);
   scan();
 })();

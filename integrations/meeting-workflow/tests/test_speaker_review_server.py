@@ -98,6 +98,7 @@ class SpeakerReviewServerTests(unittest.TestCase):
         self.assertNotIn("system_speaker_1", document.text)
         self.assertIn("2 speech segments", document.text)
         self.assertIn("Existing Drive documents stay unchanged", document.text)
+
         self.assertEqual([node.attributes["value"] for node in document.find("input", name="speaker_id")],
                          ["mic_speaker_1", "mic_speaker_1", "mic_speaker_1", "system_speaker_1"])
         for checkbox in document.find("input", name="remember"):
@@ -106,6 +107,15 @@ class SpeakerReviewServerTests(unittest.TestCase):
         self.assertIn("default-src 'none'", headers["Content-Security-Policy"])
         self.assertFalse(document.find("script"))
         self.assertEqual(self.calls, [])
+
+    def test_platform_match_and_local_identity_are_distinct(self):
+        self.options["speakers"][1]["status"] = "matched"
+        self.options["local_participants"] = [{"id": "local", "name": "Alex Owner", "self": True}]
+        status, _, body = self.detail()
+        self.assertEqual(status, 200)
+        self.assertIn("Matched in meeting", body)
+        self.assertIn("Your meeting identity: Alex Owner", body)
+        self.assertIn("Correct a name only if needed", body)
 
     def test_tab_is_optional_and_has_no_action_without_both_callbacks(self):
         for key in ("speaker_options", "on_speaker"):

@@ -17,6 +17,7 @@ STATUS_MAX_BYTES = 16384
 STATUS_FRESHNESS = 8
 STATUS_FUTURE_TOLERANCE = 2
 SIGNAL_IDENTITY = re.compile(r"[A-Za-z0-9-]{1,128}")
+NATIVE_MESSAGE_MAX_BYTES = 65536
 
 
 def meeting_context(value, *, max_participants=20):
@@ -144,6 +145,39 @@ def browser_window(value):
     return result
 
 
+def speaker_activity(value, provider, now):
+    """Optional, bounded live interface evidence. It cannot authorize capture."""
+    if (not isinstance(value, dict)
+            or set(value) != {"schema_version", "source", "document_id", "participants", "samples"}
+            or type(value.get("schema_version")) is not int or value["schema_version"] != 1
+            or value.get("source") != provider + "-dom-v1"
+            or not isinstance(value.get("document_id"), str)
+            or re.fullmatch(r"[A-Za-z0-9-]{1,64}", value["document_id"]) is None
+            or not isinstance(value.get("participants"), list) or len(value["participants"]) > 20
+            or not isinstance(value.get("samples"), list) or not 1 <= len(value["samples"]) <= 32):
+        raise ValueError("Invalid speaker activity")
+    ids = set()
+    for person in value["participants"]:
+        if (not isinstance(person, dict) or set(person) != {"id", "name", "self"}
+                or not isinstance(person.get("id"), str)
+                or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", person["id"]) is None or person["id"] in ids):
+            raise ValueError("Invalid speaker activity participant")
+        meeting_context({"provider": provider, "key": "abc-defg-hij" if provider == "google-meet" else "123456789",
+                         "coverage": "visible_only", "participants": [{"name": person["name"], "self": person["self"]}]})
+        ids.add(person["id"])
+    previous = -1
+    for sample in value["samples"]:
+        if (not isinstance(sample, dict) or set(sample) != {"at_ms", "active"}
+                or type(sample.get("at_ms")) is not int or not 0 < sample["at_ms"] <= 9007199254740991
+                or sample["at_ms"] <= previous or not now * 1000 - 20000 <= sample["at_ms"] <= now * 1000 + 1000
+                or not isinstance(sample.get("active"), list) or len(sample["active"]) > 4
+                or any(not isinstance(identity, str) or identity not in ids for identity in sample["active"])
+                or len(set(sample["active"])) != len(sample["active"])):
+            raise ValueError("Invalid speaker activity samples")
+        previous = sample["at_ms"]
+    return value
+
+
 def accept(message, directory, now=None):
     if not isinstance(message, dict):
         raise ValueError("Expected an object")
@@ -178,6 +212,13 @@ def accept(message, directory, now=None):
         if event["state"] != "left":
             event["browserWindow"] = geometry
     event["timestamp"] = time.time() if now is None else now
+    if event["state"] == "joined" and "meetingContext" in event and "speakerActivity" in message:
+        try:
+            event["speakerActivity"] = speaker_activity(message["speakerActivity"], event["provider"], event["timestamp"])
+        except (ValueError, TypeError, KeyError):
+            # Telemetry loss must never prevent the joined/left signal from
+            # reaching Quill or change ownership of a manual recording.
+            pass
     atomic_json(Path(directory) / (event["source"] + "-" + event["meeting"] + ".json"), event)
     # Acknowledgment follows the atomic signal write. The browser retains each
     # terminal event until this exact delivery identity is acknowledged.
@@ -205,7 +246,7 @@ def serve(source, target, directory):
         if len(header) != 4:
             raise ValueError("Truncated native message header")
         length = struct.unpack("=I", header)[0]
-        if not 0 < length <= 4096:
+        if not 0 < length <= NATIVE_MESSAGE_MAX_BYTES:
             raise ValueError("Native message too large")
         body = read_exact(source, length)
         if len(body) != length:

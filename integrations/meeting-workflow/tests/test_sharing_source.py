@@ -76,8 +76,9 @@ class SharingSourceTests(unittest.TestCase):
             self.queue.db.execute('INSERT INTO jobs VALUES (?,?,?)', (self.job, str(self.original), 1))
         self.publish_fixture()
 
-    def publish_fixture(self):
-        payload = build_payload(self.notes, self.transcript, self.metadata, self.route, 'Asia/Singapore')
+    def publish_fixture(self, *, participants_first=True):
+        payload = build_payload(self.notes, self.transcript, self.metadata, self.route, 'Asia/Singapore',
+                                participants_first=participants_first)
         self.identity = {'job': self.job, 'stage': 'publish', 'idempotency_key': self.job + ':publish',
                          'meetings_root_id': 'meetings_root_123', 'route': self.route,
                          'started': self.metadata['started'], 'files': [{'name': 'native-template',
@@ -151,7 +152,7 @@ class SharingSourceTests(unittest.TestCase):
         for hidden in ('PRIVATE TRANSCRIPT SENTINEL', 'INTERNAL INTELLIGENCE SENTINEL', 'INTERNAL ASSESSMENT SENTINEL',
                        'PRIVATE PRIORITIES SENTINEL', 'PRIVATE OBJECTION SENTINEL', 'INTERNAL DRAFT SUBJECT', 'INTERNAL DRAFT BODY'):
             self.assertNotIn(hidden, text)
-        self.assertEqual(snapshot['title'], 'Dashboard review - Max - 10/9/26 - Shared notes')
+        self.assertEqual(snapshot['title'], 'Max - Dashboard review - 10/9/26 - Shared notes')
         self.assertEqual(snapshot['destination_folder_id'], 'notes_folder_123')
         self.assertEqual(snapshot['private_document_id'], 'private_document_123')
         self.assertEqual(snapshot['notes_payload']['replacements']['{{QUILL_TRANSCRIPT}}'], 'Not included.')
@@ -166,6 +167,40 @@ class SharingSourceTests(unittest.TestCase):
             self.queue.db.execute('INSERT INTO tasks (job,stage,status,settings) VALUES (?,?,?,?)',
                                   (self.job, 'archive', 'failed', '{}'))
         self.assertEqual(self.snapshot()['job'], self.job)
+
+    def test_shared_filing_uses_private_company_parent_for_attendee_draft(self):
+        company = self.config['route']['companies'][0]
+        category = {'id': 'sales', 'name': 'Example / Sales', 'drive_folder_id': 'sales_folder_123',
+                    'drive_folder_path': [{'name': company['name'], 'drive_folder_id': company['drive_folder_id']},
+                                          {'name': 'Sales', 'drive_folder_id': 'sales_folder_123'}],
+                    'drive_reader_emails': ['reviewer@example.test']}
+        self.config['route']['companies'].append(category)
+        atomic_json(self.config_path, self.config)
+        review = self.reviews.propose(self.job, self.transcript_bytes, self.config['route']['companies'],
+            {'schema_version': 1, 'company_id': 'sales', 'confidence': 'high', 'reason': 'Synthetic sales meeting',
+             'ambiguous': False, 'evidence': [0]})
+        self.reviews.approve(self.job, 'sales', review['revision'])
+        self.route = self.reviews.route(self.job, self.transcript_bytes, self.config['route']['companies'])
+        self.publish_fixture()
+        snapshot = self.snapshot()
+        self.assertEqual(snapshot['destination_folder_id'], company['drive_folder_id'])
+        self.assertEqual(snapshot['filed_access'], {
+            'folders': ['sales_folder_123', 'meeting_folder_123', 'notes_folder_123'],
+            'readers': ['reviewer@example.test']})
+        self.assertNotIn('PRIVATE TRANSCRIPT SENTINEL', json.dumps(snapshot))
+
+    def test_filed_topic_first_document_remains_shareable_without_rewriting_its_identity(self):
+        self.publish_fixture(participants_first=False)
+        original = (self.result / 'drive-publish.json').read_bytes()
+        snapshot = self.snapshot()
+        self.assertEqual(snapshot['title'], 'Dashboard review - Max - 10/9/26 - Shared notes')
+        self.assertEqual(snapshot['private_document_id'], 'private_document_123')
+        self.assertNotIn('PRIVATE TRANSCRIPT SENTINEL', json.dumps(snapshot))
+        self.assertEqual((self.result / 'drive-publish.json').read_bytes(), original)
+        self.notes['summary'][0]['text'] = 'A later unpublished summary.'
+        atomic_json(self.result / 'notes/notes.json', self.notes)
+        with self.assertRaises(SharingSourceError):
+            self.snapshot()
 
     def test_frozen_account_survives_current_default_change(self):
         self.config['publish']['account_link_id'] = 'link_filed_account'
@@ -225,7 +260,7 @@ class SharingSourceTests(unittest.TestCase):
     def test_updated_notes_fail_closed_even_with_valid_evidence(self):
         self.notes['summary'][0]['text'] = 'A later unfiled note.'
         atomic_json(self.result / 'notes/notes.json', self.notes)
-        with self.assertRaisesRegex(SharingSourceError, 'notes changed after Drive filing'):
+        with self.assertRaisesRegex(SharingSourceError, 'document inputs or destination changed'):
             self.snapshot()
 
     def test_hidden_invalid_evidence_fails_before_filtering(self):

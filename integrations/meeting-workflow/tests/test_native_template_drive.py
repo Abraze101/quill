@@ -11,7 +11,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from quill_workflow.drive_upload import (DriveUploader, UploadNeedsReview, NATIVE_TEMPLATE_FORMAT,
-                                         DOCUMENT_MIME, native_template_sha256, inventory)
+                                         DOCUMENT_MIME, FOLDER_MIME, native_template_sha256, inventory)
 from quill_workflow.pipeline import atomic_json
 from test_drive_upload import FakeDrive, SimulatedTransportFailure
 
@@ -127,6 +127,36 @@ class NativeTemplateDriveTests(unittest.TestCase):
         self.assertEqual(self.journal()['operations']['file:native-template']['fill']['state'], 'verified')
         self.assertEqual([tool for tool, _ in self.drive.writes].count('import_document'), 0)
         self.assertEqual([tool for tool, _ in self.drive.writes].count('upload_file'), 0)
+
+    def test_sales_template_stays_private_and_copy_must_match_approved_viewers_before_filling(self):
+        leaf = self.drive.add("sales_folder_123", "Sales", self.drive.COMPANY, FOLDER_MIME)
+        self.route.update(company_name="Acme / Sales", drive_folder_id=leaf, drive_folder_path=[
+            {"name": "Acme", "drive_folder_id": self.drive.COMPANY}, {"name": "Sales", "drive_folder_id": leaf}],
+            drive_reader_emails=["sales@example.test"])
+        reader = {"type": "user", "role": "reader", "emailAddress": "sales@example.test"}
+        for identity in (leaf, self.drive.TEMPLATE):
+            self.drive.items[identity]["permissions"].append(reader)
+            self.drive.items[identity]["shared"] = True
+        with self.assertRaisesRegex(UploadNeedsReview, "owner-only"):
+            self.publish()
+        self.assertEqual(self.drive.native_writes, [])
+        template = self.drive.items[self.drive.TEMPLATE]
+        template["permissions"].remove(reader)
+        template["shared"] = False
+
+        def add_unapproved_access(document):
+            copied_item = self.drive.items[document["documentId"]]
+            copied_item["permissions"].append({"type": "anyone", "role": "reader"})
+        self.drive.after_copy = add_unapproved_access
+        with self.assertRaisesRegex(UploadNeedsReview, "approved viewers"):
+            self.publish()
+        self.assertEqual([tool for tool, _ in self.drive.native_writes], ["copy_file"])
+
+        copy_id = self.journal()["operations"]["file:native-template"]["id"]
+        self.drive.items[copy_id]["permissions"].pop()
+        receipt = self.publish()
+        self.assertEqual(receipt["files"][0]["id"], copy_id)
+        self.assertEqual([tool for tool, _ in self.drive.native_writes], ["copy_file", "batch_update_document"])
 
     def test_lost_copy_response_holds_without_adopting_or_copying_again(self):
         self.drive.fail_copy = True

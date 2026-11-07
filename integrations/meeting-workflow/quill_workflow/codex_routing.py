@@ -40,6 +40,12 @@ description, require explicit organizational ownership in the transcript, such
 as a clearly attributed statement that this meeting concerns that company's own
 work. Generic industry words alone are insufficient.
 
+Some supplied destinations are company subfolders, shown as Company / Subfolder.
+Select the most specific supplied destination only when the transcript establishes
+both company ownership and that meeting purpose. A generic company mention does
+not establish a sales or internal meeting. If the company is clear but the subtype
+is not, prefer its supplied parent-company destination. Never invent subfolders.
+
 If and only if the supplied list contains ID general, you may suggest it for a
 substantive personal, learning, networking, or general planning meeting whose
 purpose does not belong to one specific supplied company, including a discussion

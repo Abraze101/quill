@@ -2,15 +2,40 @@
 import time
 
 
-def build_context(job, metadata, transcript, *, config=None, learned=(), invoke=None, guard=None):
+def build_context(job, metadata, transcript, *, config=None, learned=(), invoke=None, guard=None, timeline=None):
     from .meeting_context import meeting_context, participant_name
     from .recipient_suggestions import suggest_recipients, _recipients
     from .transcript_sources import transcript_digest
     from .speaker_review import validate_context, _name
     visible = meeting_context(metadata["meeting_context"]) if metadata.get("meeting_context") else None
     people = visible["participants"] if visible else []
+    from .speaker_timeline import validate_timeline
+    try:
+        timeline = validate_timeline(timeline) if timeline is not None else None
+        if timeline and (not visible or any(timeline[key] != visible[key] for key in ("provider", "key"))):
+            timeline = None
+    except ValueError:
+        timeline = None
+    # Preserve the platform's explicit "You" identity separately from voices.
+    # A calendar organizer or connected Drive account is not this evidence.
+    local = [person for person in people if person["self"]]
+    if local and timeline is None:
+        timeline = {"schema_version": 1, "provider": visible["provider"], "key": visible["key"],
+                    "participants": [], "intervals": [], "truncated": False}
+    if local and not any(person["self"] for person in timeline["participants"]):
+        known_ids = {person["id"] for person in timeline["participants"]}
+        for index, person in enumerate(local):
+            identity = "visible-self-" + str(index)
+            if identity not in known_ids and len(timeline["participants"]) < 100:
+                timeline["participants"].append(dict(person, id=identity))
     candidates = []
     for person in people:
+        try:
+            name = _name(person["name"])
+        except ValueError:
+            continue
+        candidates.append({"name": name, "email": None, "source": "visible", "aliases": []})
+    for person in timeline["participants"] if timeline else []:
         try:
             name = _name(person["name"])
         except ValueError:
@@ -97,4 +122,7 @@ def build_context(job, metadata, transcript, *, config=None, learned=(), invoke=
     for candidate in candidates:
         if candidate not in unique:
             unique.append(candidate)
-    return validate_context({"schema_version": 1, "candidates": unique[:100]}), status
+    context = {"schema_version": 2 if timeline is not None else 1, "candidates": unique[:100]}
+    if timeline is not None:
+        context["timeline"] = timeline
+    return validate_context(context), status

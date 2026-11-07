@@ -845,3 +845,60 @@ test('health reports only the allowed state and remains usable when recording ou
   const answer = await h.health('document-A');
   assert.deepEqual(clone(answer), {recordingStatus: {state: 'paused'}});
 });
+
+function activityFixture(at = 1700000000000) {
+  return { schema_version: 1, source: 'google-meet-dom-v1', document_id: 'page-forged',
+    participants: [{ id: 'p1', name: 'Casey Rivera', self: false }],
+    samples: [{ at_ms: at - 500, active: ['p1'] }, { at_ms: at, active: ['p1'] }] };
+}
+
+test('speaker activity is bound to the current browser document and requires joined context', async () => {
+  const h = harness(); h.frame('doc-A');
+  await h.message('doc-A', 'call-A', 'joined', 42, { speakerActivity: activityFixture() });
+  assert.equal(h.sent.at(-1).speakerActivity.document_id, 'doc-A');
+  assert.ok(!JSON.stringify(h.sent).includes('page-forged'));
+  await h.message('doc-A', 'call-A', 'unknown', 42, { speakerActivity: activityFixture() });
+  assert.ok(!h.sent.at(-1).speakerActivity);
+  await h.message('doc-A', 'call-A', 'left', 42, { speakerActivity: activityFixture() });
+  assert.ok(!h.sent.at(-1).speakerActivity);
+});
+
+test('bad, stale, future, oversized and unknown activity is omitted without losing meeting detection', async () => {
+  const h = harness(); h.frame('doc-A');
+  const original = activityFixture();
+  const cases = [null, {}, { ...original, source: 'zoom-web-dom-v1' },
+    { ...original, participants: [...original.participants, ...original.participants] },
+    { ...original, participants: [{ id: 'p1', name: 'Casey', self: 'false' }] },
+    { ...original, samples: [{ at_ms: 1700000000000, active: ['absent'] }] },
+    { ...original, samples: [{ at_ms: 1700000001001, active: ['p1'] }] },
+    { ...original, samples: [{ at_ms: 1699999979999, active: ['p1'] }] },
+    { ...original, samples: Array(33).fill(original.samples[0]) }];
+  for (const speakerActivity of cases) {
+    await h.message('doc-A', 'call-A', 'joined', 42, { speakerActivity });
+    assert.equal(h.sent.at(-1).state, 'joined');
+    assert.ok(!h.sent.at(-1).speakerActivity);
+  }
+});
+
+test('queued activity expires instead of being replayed with a new native timestamp', async () => {
+  const h = harness({ autoAck: false }); h.frame('doc-A');
+  await h.message('doc-A', 'call-A');
+  await h.message('doc-A', 'call-A', 'joined', 42, { speakerActivity: activityFixture(1699999995000) });
+  await h.advance(9000);
+  h.ports[0].ack({ accepted: true, requestID: h.sent[0].requestID }); await h.flush();
+  assert.ok(h.sent.at(-1).speakerActivity);
+  await h.message('doc-A', 'call-A', 'joined', 42, { speakerActivity: activityFixture(1699999990000) });
+  await h.advance(2000);
+  h.ports[0].ack({ accepted: true, requestID: h.sent[1].requestID }); await h.flush();
+  assert.ok(!h.sent.at(-1).speakerActivity);
+});
+
+test('navigation retires speaker activity even when the former page keeps sending', async () => {
+  const h = harness(); h.frame('doc-A');
+  await h.message('doc-A', 'call-A', 'joined', 42, { speakerActivity: activityFixture() });
+  h.frame('doc-B');
+  await h.message('doc-A', 'call-A', 'joined', 42, { speakerActivity: activityFixture() });
+  assert.equal(h.sent.length, 1);
+  await h.message('doc-B', 'call-B');
+  assert.ok(h.sent.slice(1).every(event => !event.speakerActivity));
+});

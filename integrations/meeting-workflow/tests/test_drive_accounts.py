@@ -40,8 +40,13 @@ class FakeTransport:
         if tool == "search":
             if self.fixture.unavailable_folder:
                 return {"results": []}
-            identity = "meetings_root_123" if "'root' in parents" in arguments["special_filter_query_str"] else "category_folder_123"
-            return {"results": [{"id": identity}]}
+            query = arguments["special_filter_query_str"]
+            if "'root' in parents" in query:
+                return {"results": [{"id": "meetings_root_123"}]}
+            return {"results": [{"id": identity} for identity, item in self.fixture.metadata.items()
+                                if "name = '" + item["title"] + "'" in query
+                                and "'" + item["parent_ids"][0] + "' in parents" in query
+                                and item["mime_type"] == FOLDER_MIME]}
         raise AssertionError("Account setup must only read profiles and known metadata")
 
 
@@ -217,6 +222,44 @@ class DriveAccountTests(unittest.TestCase):
         self.metadata["category_folder_123"]["parent_ids"] = ["meetings_root_123"]
         self.metadata["template_doc_123"]["permissions"].append({"type": "anyone", "role": "reader"})
         self.rejected("owner-only", UploadNeedsReview)
+
+    def add_nested_category(self):
+        leaf = "nested_sales_folder_123"
+        self.metadata[leaf] = self.item(leaf, FOLDER_MIME, "category_folder_123")
+        self.metadata[leaf]["title"] = "Sales Meetings"
+        self.config["route"]["companies"].append({"id": "example-sales", "name": "Example / Sales Meetings",
+            "drive_folder_id": leaf, "drive_folder_path": [
+                {"name": "Example", "drive_folder_id": "category_folder_123"},
+                {"name": "Sales Meetings", "drive_folder_id": leaf}]})
+        self.write()
+        return leaf
+
+    def test_account_selection_verifies_the_entire_nested_folder_path(self):
+        leaf = self.add_nested_category()
+        original = copy.deepcopy(self.config)
+        self.select()
+        saved = json.loads(self.config_path.read_bytes())
+        self.assertEqual(saved["route"], original["route"])
+        self.assertIn(leaf, {arguments["fileId"] for _link, tool, arguments in self.calls if tool == "get_file_metadata"})
+        self.assert_unchanged_state()
+
+    def test_account_verification_allows_only_the_approved_sales_viewers(self):
+        leaf = self.add_nested_category()
+        self.config["route"]["companies"][-1]["drive_reader_emails"] = ["sales@example.test"]
+        self.metadata[leaf]["permissions"].append({"type": "user", "role": "reader", "emailAddress": "Sales@example.test"})
+        self.metadata[leaf]["shared"] = True
+        self.write()
+        self.select()
+        self.metadata[leaf]["permissions"][-1]["role"] = "writer"
+        self.rejected("approved viewers", UploadNeedsReview)
+
+    def test_nested_leaf_must_be_private_and_under_its_configured_company(self):
+        leaf = self.add_nested_category()
+        self.metadata[leaf]["shared"] = True
+        self.rejected("owner-only", UploadNeedsReview)
+        self.metadata[leaf]["shared"] = False
+        self.metadata[leaf]["parent_ids"] = ["unapproved_company_123"]
+        self.rejected("outside its approved parent", UploadNeedsReview)
 
     def test_unavailable_root_or_renamed_category_cannot_be_verified(self):
         self.unavailable_folder = True

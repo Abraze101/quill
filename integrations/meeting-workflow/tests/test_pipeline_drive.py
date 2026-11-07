@@ -13,6 +13,10 @@ sys.path.insert(0, str(ROOT))
 from quill_workflow.pipeline import (ConnectorRunner, NeedsConfiguration, Queue, RecoverableUploadError,
                                      WorkflowError, atomic_json, configured)
 from quill_workflow.routing import RoutingReviews
+from quill_workflow import drive_upload as real_drive_upload
+from quill_workflow.codex_drive_transport import DriveTimeoutError
+from test_native_template_drive import NativeDrive, expected_text, plan_requests, verify_document
+from test_drive_upload import SimulatedTransportFailure
 
 
 class FakeNeedsReview(Exception):
@@ -61,6 +65,7 @@ class PipelineDriveTests(unittest.TestCase):
         upload_module.UploadRetryable = FakeRetryable
         transport_module = types.ModuleType("quill_workflow.codex_drive_transport")
         transport_module.CodexDriveTransport = self.transport_factory
+        transport_module.DriveTimeoutError = DriveTimeoutError
         self.modules = patch.dict(sys.modules, {upload_module.__name__: upload_module,
                                                 transport_module.__name__: transport_module})
         self.modules.start()
@@ -134,6 +139,45 @@ class PipelineDriveTests(unittest.TestCase):
             self.runner("archive", job, settings)
         self.transport_factory.assert_not_called()
         self.uploader.upload.assert_not_called()
+
+    def test_shared_filing_guard_rechecks_live_destination_and_viewers_on_retry(self):
+        leaf = self.companies[0]
+        leaf.update(name="Acme / Sales", drive_folder_id="sales_folder_123",
+                    drive_folder_path=[{"name": "Acme", "drive_folder_id": "company_folder_123"},
+                                       {"name": "Sales", "drive_folder_id": "sales_folder_123"}],
+                    drive_reader_emails=["viewer@example.com"])
+        job, _ = self.prepare()
+        self.runner.config_path = self.root / "workflow.json"
+        atomic_json(self.runner.config_path, self.config)
+        self.uploader.upload.side_effect = FakeRetryable("Temporary outage")
+        with self.assertRaisesRegex(WorkflowError, "Temporary outage"):
+            self.runner("archive", job, self.settings)
+        guard = self.uploader_factory.call_args.kwargs["guard"]
+        guard()
+        # A routine description edit does not change the approved destination.
+        config = dict(self.config, route=dict(self.config["route"], companies=[dict(leaf, description="Updated")]))
+        atomic_json(self.runner.config_path, config)
+        guard()
+        private_leaf = dict(leaf)
+        private_leaf.pop("drive_reader_emails")
+        moved_leaf = dict(leaf, drive_folder_path=[dict(leaf["drive_folder_path"][0], drive_folder_id="other_company_123"),
+                                                   leaf["drive_folder_path"][1]])
+        for route in (dict(self.config["route"], enabled=False),
+                      dict(self.config["route"], companies=[{"id": "studio", "name": "Studio",
+                                                           "drive_folder_id": "studio_folder_123"}]),
+                      dict(self.config["route"], companies=[private_leaf]),
+                      dict(self.config["route"], companies=[moved_leaf]),
+                      dict(self.config["route"], companies=[dict(leaf, drive_reader_emails=["other@example.com"])])):
+            with self.subTest(route=route):
+                atomic_json(self.runner.config_path, dict(self.config, route=route))
+                self.transport_factory.reset_mock()
+                self.uploader.upload.reset_mock()
+                with self.assertRaisesRegex(NeedsConfiguration, "[Ss]hared"):
+                    guard()
+                with self.assertRaisesRegex(NeedsConfiguration, "[Ss]hared"):
+                    self.runner("archive", job, self.settings)
+                self.transport_factory.assert_not_called()
+                self.uploader.upload.assert_not_called()
 
     def test_release_preserves_account_binding_and_legacy_absence(self):
         legacy = dict(self.settings)
@@ -434,6 +478,65 @@ class PipelineDriveTests(unittest.TestCase):
         self.assertNotIn("document_path", options)
         self.assertFalse((self.queue.state / "results" / job / "documents/meeting.docx").exists())
         self.assertEqual(build.call_args.args[-1], "America/Los_Angeles")
+
+    def test_pending_topic_first_native_upload_recovers_without_duplicate_or_changed_content(self):
+        import importlib
+        native_template = importlib.import_module("quill_workflow.native_template")
+        drive = NativeDrive()
+        settings = dict(self.settings, text_format="native_template_google_doc_v1",
+                        template_document_id=drive.TEMPLATE,
+                        template_sha256=real_drive_upload.native_template_sha256(drive.documents[drive.TEMPLATE]))
+        config = dict(self.config, publish=settings,
+                      drive_account=dict(self.config["drive_account"], email=drive.OWNER))
+        atomic_json(self.session / "transcript.json", {"segments": [
+            {"start_ms": 0, "text": "Alex will provide the agenda for Acme."}]})
+        job, transcript = self.prepare(config)
+        notes_dir = self.titled_notes(job, transcript)
+        notes = json.loads((notes_dir / "notes.json").read_text())
+        notes["meeting_title"]["participants"] = [{"name": "Alex", "evidence": [0]}]
+        atomic_json(notes_dir / "notes.json", notes)
+        self.transport.invoke.side_effect = lambda tool, args: (
+            {"id": "profile_a", "email": drive.OWNER} if tool == "get_profile" else drive(tool, args))
+        original_builder = native_template.build_payload
+        with patch.dict(sys.modules, {"quill_workflow.drive_upload": real_drive_upload}), \
+                patch.object(native_template, "expected_text", expected_text), \
+                patch.object(native_template, "plan_requests", plan_requests), \
+                patch.object(native_template, "verify_document", verify_document):
+            # Simulate an old-version upload that filled its copied document,
+            # then lost the response. The next attempt uses the new renderer.
+            drive.fail_update = "after"
+            with patch.object(native_template, "build_payload", side_effect=lambda *args, **kwargs:
+                              original_builder(*args, **kwargs, participants_first=False)):
+                with self.assertRaises(SimulatedTransportFailure):
+                    self.runner("publish", job, settings)
+            journal_path = notes_dir.parent / "drive-publish.json"
+            pending = json.loads(journal_path.read_text())
+            copied_id = pending["operations"]["file:native-template"]["id"]
+            self.assertEqual(pending["identity"]["document_title"], "Agenda planning - Alex - 1/1/26")
+            drive.fail_update = None
+            notes["summary"][0]["text"] = "The agenda is still being prepared."
+            atomic_json(notes_dir / "notes.json", notes)
+            with self.assertRaisesRegex(NeedsConfiguration, "inputs or destination changed"):
+                self.runner("publish", job, settings)
+            self.assertEqual([tool for tool, _ in drive.native_writes], ["copy_file", "batch_update_document"])
+            notes["summary"][0]["text"] = "Agenda planning"
+            atomic_json(notes_dir / "notes.json", notes)
+            receipt = self.runner("publish", job, settings)
+            self.assertEqual(receipt["files"][0]["id"], copied_id)
+            self.assertEqual([tool for tool, _ in drive.native_writes], ["copy_file", "batch_update_document"])
+            self.assertTrue(json.loads(journal_path.read_text())["operations"]["file:native-template"]["fill"]["reconciled"])
+
+    def test_malformed_native_journal_is_held_before_transport(self):
+        job, transcript = self.prepare()
+        notes_dir = self.titled_notes(job, transcript)
+        settings = dict(self.settings, text_format="native_template_google_doc_v1",
+                        template_document_id="template_document123", template_sha256="a" * 64)
+        for saved in ([], {"identity": []}, {"identity": None}):
+            with self.subTest(saved=saved):
+                atomic_json(notes_dir.parent / "drive-publish.json", saved)
+                with self.assertRaisesRegex(NeedsConfiguration, "needs review"):
+                    self.runner("publish", job, settings)
+                self.transport_factory.assert_not_called()
 
     def test_native_template_release_keeps_original_template_and_old_jobs_do_not_gain_one(self):
         settings = dict(self.settings, text_format="native_template_google_doc_v1",

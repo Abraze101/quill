@@ -147,6 +147,38 @@ class SharingDriveTests(unittest.TestCase):
         draft = self.prepare()
         self.assertNotIn("Transcript", native.document_text(self.drive.documents[draft["document_id"]]))
 
+    def test_folder_viewers_and_attendee_copy_have_independent_access(self):
+        viewer, attendee = "reviewer@example.test", "attendee@example.test"
+        folders = ["sales_folder_123", "meeting_folder_123", "notes_folder_123"]
+        self.snapshot["filed_access"] = {"folders": folders, "readers": [viewer]}
+        parent = FakeDrive.COMPANY
+        for folder in folders:
+            self.drive.add(folder, folder, parent, FOLDER_MIME)
+            item = self.drive.items[folder]
+            item.update(shared=True, permissions=[
+                {"role": "owner", "type": "user", "emailAddress": FakeDrive.OWNER},
+                {"role": "reader", "type": "user", "emailAddress": viewer}])
+            parent = folder
+        self.drive.items[SharingFake.PRIVATE].update(parent_ids=[parent], shared=True,
+            permissions=copy.deepcopy(self.drive.items[parent]["permissions"]))
+        draft = self.prepare()
+        copy_item = self.drive.items[draft["document_id"]]
+        self.assertEqual(copy_item["parent_ids"], [FakeDrive.COMPANY])
+        self.assertFalse(copy_item["shared"])
+        self.assertEqual(self.drive.sends, [])
+        # Removing a viewer in just one intermediate folder invalidates the source.
+        removed = self.drive.items[folders[1]]["permissions"].pop()
+        self.drive.items[folders[1]]["shared"] = False
+        with self.assertRaises(SharingNeedsReview):
+            self.share(draft, (attendee,))
+        self.assertFalse(self.drive.sends)
+        self.drive.items[folders[1]]["permissions"].append(removed)
+        self.drive.items[folders[1]]["shared"] = True
+        self.share(draft, (attendee,))
+        self.assertEqual({p["emailAddress"] for p in copy_item["permissions"]}, {FakeDrive.OWNER, attendee})
+        self.assertEqual({p["emailAddress"] for p in self.drive.items[SharingFake.PRIVATE]["permissions"]},
+                         {FakeDrive.OWNER, viewer})
+
     def test_exact_reader_grants_and_repeat_no_reinvitation(self):
         draft = self.prepare()
         receipt = self.share(draft, ("max@example.test", "second@example.test"))

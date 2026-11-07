@@ -391,6 +391,58 @@ class FocusedSpeakerRunnerTests(unittest.TestCase):
                 self.invoke(sys.executable)
         self.assertFalse(self.output.exists())
 
+    def test_timeline_is_source_bound_but_model_sees_only_derived_matches(self):
+        from test_speaker_timeline import fixture, context as activity_context, draft as activity_draft
+        transcript, timeline = fixture()
+        evidence = activity_context(timeline)
+        atomic_json(self.input, transcript)
+        atomic_json(self.context, evidence)
+        executable, capture = self.fake([json.dumps(activity_draft())])
+        self.invoke(executable)
+        payload = json.loads(capture.read_text())[0]["payload"]
+        self.assertNotIn("timeline", payload["evidence_context"])
+        self.assertNotIn("intervals", json.dumps(payload))
+        self.assertEqual(payload["validated_platform_matches"]["system_speaker_1"]["name"], "Jamie Taylor")
+        self.assertEqual(payload["local_participants"][0]["name"], "Casey Rivera")
+        report = json.loads(self.output.read_text())
+        self.assertEqual(report["context_sha256"], transcript_digest(evidence))
+        validate_report(report, transcript, evidence)
+
+    def test_caller_matches_even_when_model_leaves_a_supported_voice_unresolved(self):
+        from test_speaker_timeline import fixture, context as activity_context, draft as activity_draft
+        transcript, timeline = fixture()
+        atomic_json(self.input, transcript)
+        atomic_json(self.context, activity_context(timeline))
+        value = activity_draft()
+        value["speakers"][0].update(status="unresolved", name=None, email=None, evidence=[],
+                                    candidate_indices=[], reason="The name is not spoken.")
+        executable, capture = self.fake([json.dumps(value)])
+        self.invoke(executable)
+        self.assertEqual(len(json.loads(capture.read_text())), 1)
+        person = json.loads(self.output.read_text())["speakers"][0]
+        self.assertEqual((person["status"], person["name"], person["evidence"]),
+                         ("matched", "Jamie Taylor", [0, 2, 4]))
+        self.assertIsNone(person["email"])
+
+    def test_timeline_change_during_review_rejects_complete_looking_answer(self):
+        from test_speaker_timeline import fixture, context as activity_context, draft as activity_draft
+        transcript, timeline = fixture()
+        atomic_json(self.input, transcript)
+        atomic_json(self.context, activity_context(timeline))
+        process = Mock(returncode=0)
+
+        def start(argv, **_kwargs):
+            Path(argv[argv.index("--output-last-message") + 1]).write_text(json.dumps(activity_draft()))
+            timeline["intervals"][0]["end_ms"] -= 1
+            atomic_json(self.context, activity_context(timeline))
+            return process
+
+        with patch("quill_workflow.speaker_review.subprocess.Popen", side_effect=start), \
+                patch("quill_workflow.speaker_review.stop_process_group"):
+            with self.assertRaisesRegex(WorkflowError, "Evidence changed"):
+                self.invoke(sys.executable)
+        self.assertFalse(self.output.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

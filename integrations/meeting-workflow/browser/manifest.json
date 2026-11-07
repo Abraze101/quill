@@ -1,21 +1,47 @@
 {
   "manifest_version": 3,
   "name": "Quill meeting detector",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "minimum_chrome_version": "106",
-  "description": "Reports meeting state, meeting identifiers and visible participant names to local Quill. Does not record audio or video.",
-  "permissions": ["nativeMessaging", "storage", "alarms", "webNavigation"],
-  "host_permissions": ["https://meet.google.com/*", "https://*.zoom.us/*"],
-  "background": {"service_worker": "background.js"},
-  "content_scripts": [{
-    "matches": ["https://meet.google.com/*"],
-    "js": ["detector.js", "recording-warning.js", "content.js"],
-    "run_at": "document_idle",
-    "all_frames": false
-  }, {
-    "matches": ["https://*.zoom.us/wc/*"],
-    "js": ["detector.js", "recording-warning.js", "content.js"],
-    "run_at": "document_idle",
-    "all_frames": true
-  }]
+  "description": "Reports meeting state, visible participant names and speaking activity to local Quill. Does not record audio or video.",
+  "permissions": [
+    "nativeMessaging",
+    "storage",
+    "alarms",
+    "webNavigation"
+  ],
+  "host_permissions": [
+    "https://meet.google.com/*",
+    "https://*.zoom.us/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://meet.google.com/*"
+      ],
+      "js": [
+        "detector.js",
+        "recording-warning.js",
+        "speaker-activity.js",
+        "content.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": false
+    },
+    {
+      "matches": [
+        "https://*.zoom.us/wc/*"
+      ],
+      "js": [
+        "detector.js",
+        "recording-warning.js",
+        "content.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ]
 }

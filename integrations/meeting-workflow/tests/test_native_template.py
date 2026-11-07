@@ -170,7 +170,7 @@ class NativeTemplateTests(unittest.TestCase):
             notes[key] = [{"text": "Original " + key + " content.", "evidence": [1]}]
         notes["follow_up_draft"] = {"subject": "Portal draft", "body": "Original\nfollow-up body.", "evidence": [1]}
         payload = self.payload(notes=notes)
-        self.assertEqual(payload["title"], "Portal planning - Max - 9/14/26")
+        self.assertEqual(payload["title"], "Max - Portal planning - 9/14/26")
         self.assertEqual(payload["date"]["day"], 14)
         text = "\n".join(value for key, value in payload["replacements"].items() if key != "{{QUILL_TRANSCRIPT}}")
         for key, values in notes.items():

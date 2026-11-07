@@ -102,6 +102,22 @@ class SpeakerCorrectionsTests(unittest.TestCase):
         self.assertEqual(self.store.learned(), [])
         self.assert_originals_unchanged()
 
+    def test_local_identity_is_separate_from_existing_microphone_voice(self):
+        from test_speaker_timeline import fixture, context as activity_context
+        _, timeline = fixture()
+        timeline["intervals"] = []
+        evidence = activity_context(timeline)
+        evidence["candidates"] = context()["candidates"]
+        bundle = empty_bundle(self.transcript, evidence)
+        bundle["report"] = bind_report(draft(), self.transcript, evidence)
+        atomic_json(self.result / "speakers" / "review.json", bundle)
+        options = self.options()
+        self.assertEqual(options["local_participants"], [timeline["participants"][0]])
+        mic = next(person for person in options["speakers"] if person["id"] == "mic_speaker_1")
+        self.assertEqual(mic["name"], "Anna")
+        self.assertEqual(mic["status"], "confirmed")
+        self.assert_originals_unchanged()
+
     def test_same_person_can_be_explicitly_confirmed_for_two_separated_ids(self):
         self.decide(speaker="mic_speaker_1", name="Alex")
         self.decide(speaker="system_speaker_1", name="Alex")

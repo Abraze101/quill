@@ -19,7 +19,7 @@ public struct MeetingSignalStore: Sendable {
             guard file.pathExtension == "json",
                   let values = try? file.resourceValues(forKeys: [.isSymbolicLinkKey, .isRegularFileKey, .fileSizeKey, .contentModificationDateKey]),
                   values.isSymbolicLink != true, values.isRegularFile == true,
-                  (values.fileSize ?? Int.max) < 16384,
+                  (values.fileSize ?? Int.max) < 65536,
                   let modified = values.contentModificationDate,
                   now - modified.timeIntervalSince1970 < 120,
                   let bytes = try? Data(contentsOf: file),

@@ -229,11 +229,11 @@ class ReviewStateResolutionTests(unittest.TestCase):
         self.deletion[0]["folder"] = "/temporary/demo/meeting"
         self.assertEqual(self.entry()["local_folder"], "/temporary/demo/meeting")
         for status, label in (
-            ("available", "Not shared through Quill"),
+            ("available", "No attendee copy shared"),
             ("ready", "Private copy awaiting approval"),
             ("sharing", "Sharing started; confirmation pending"),
             ("shared", "View-only sharing confirmed"),
-            ("private", "Kept private; no sharing scheduled"),
+            ("private", "Attendee sharing skipped"),
             ("needs_attention", "Sharing result needs review"),
         ):
             with self.subTest(status=status):

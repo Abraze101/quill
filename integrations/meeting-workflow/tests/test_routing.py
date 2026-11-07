@@ -371,6 +371,134 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(revised["status"], "pending")
         self.assertIsNone(revised["automatic_basis"])
 
+    def nested_companies(self):
+        parent = {"id": "studio", "name": "Acme Studio", "drive_folder_id": "folder-studio-001"}
+        def child(identity, name):
+            folder = "folder-" + identity + "-001"
+            return {"id": identity, "name": "Acme Studio / " + name, "drive_folder_id": folder,
+                    "aliases": ["Acme Studio " + name], "drive_folder_path": [
+                        {"name": parent["name"], "drive_folder_id": parent["drive_folder_id"]},
+                        {"name": name, "drive_folder_id": folder}]}
+        return [parent, child("studio-sales", "Sales Meetings"), child("studio-internal", "Internal Meetings")]
+
+    def test_nested_destination_is_frozen_and_adding_it_preserves_old_approvals(self):
+        self.companies = self.nested_companies()
+        original = [self.companies[0]]
+        text = "This meeting is for Acme Studio."
+        source = json.dumps({"segments": [{"text": text}]}).encode()
+        record = self.reviews.propose("old", source, original,
+            self.explicit_suggestion(text, "studio"), auto_file_explicit_companies=True)
+        self.assertTrue(preserves_company_map(self.companies, original))
+        self.assertEqual(self.reviews.route("old", source, original), record["approved_route"])
+        self.assertEqual(self.reviews.get("old"), record)
+        self.assertNotIn("drive_folder_path", record["approved_route"])
+        pending = self.reviews.propose("leaf", source, self.companies,
+                                     self.explicit_suggestion(text, "studio-sales"))
+        approved = self.reviews.approve("leaf", "studio-sales", pending["revision"])
+        self.assertEqual(approved["approved_route"]["drive_folder_path"], self.companies[1]["drive_folder_path"])
+        changed = copy.deepcopy(self.companies)
+        changed[1]["drive_folder_path"][0]["drive_folder_id"] = "replacement-parent-001"
+        self.assertFalse(preserves_company_map(changed, self.companies))
+        with self.assertRaises(StaleReviewError):
+            self.reviews.route("leaf", source, changed)
+
+    def test_nested_path_validation_rejects_unbound_or_ambiguous_paths(self):
+        leaf = self.nested_companies()[1]
+        invalid_paths = [None, [], leaf["drive_folder_path"][:1], "Acme Studio/Sales Meetings",
+                         leaf["drive_folder_path"] * 5]
+        for field, value in (("drive_folder_id", "../escape"), ("name", " Sales Meetings"),
+                             ("name", "Sales/Meetings"), ("name", "Sales\nMeetings"),
+                             ("name", "Renamed"), ("drive_folder_id", "different-leaf-001")):
+            path = copy.deepcopy(leaf["drive_folder_path"])
+            path[-1][field] = value
+            invalid_paths.append(path)
+        duplicate = copy.deepcopy(leaf["drive_folder_path"])
+        duplicate[0]["drive_folder_id"] = duplicate[1]["drive_folder_id"]
+        invalid_paths.append(duplicate)
+        for path in invalid_paths:
+            with self.subTest(path=path), self.assertRaises(RoutingError):
+                validate_companies([dict(leaf, drive_folder_path=path)])
+        canonical = validate_companies([leaf])
+        self.assertEqual(validate_companies(canonical), canonical)
+
+    def test_nested_viewer_list_is_frozen_with_approval(self):
+        companies = self.nested_companies()
+        leaf = companies[1]
+        leaf["drive_reader_emails"] = ["Terry@example.com", "Alex@example.com"]
+        expected = ["alex@example.com", "terry@example.com"]
+        pending = self.reviews.propose("sales", self.transcript, companies,
+                                      dict(self.suggestion, company_id=leaf["id"]))
+        approved = self.reviews.approve("sales", leaf["id"], pending["revision"])
+        self.assertEqual(approved["approved_route"]["drive_reader_emails"], expected)
+        self.assertNotIn("drive_reader_emails", next(c for c in pending["companies"] if c["id"] == "studio"))
+        current = copy.deepcopy(companies)
+        current[1]["drive_reader_emails"] = expected
+        self.assertEqual(self.reviews.route("sales", self.transcript, current), approved["approved_route"])
+        self.assertTrue(preserves_company_map(current, companies))
+        for readers in (expected[:1], ["new@example.com"], None):
+            if readers is None:
+                current[1].pop("drive_reader_emails")
+            else:
+                current[1]["drive_reader_emails"] = readers
+            with self.subTest(readers=readers):
+                self.assertFalse(preserves_company_map(current, companies))
+                self.assertFalse(preserves_company_map(companies, current))
+                with self.assertRaises(StaleReviewError):
+                    self.reviews.route("sales", self.transcript, current)
+
+    def test_only_named_distinct_viewers_on_nested_routes(self):
+        parent, leaf, _ = self.nested_companies()
+        with self.assertRaises(RoutingError):
+            validate_companies([dict(parent, drive_reader_emails=["viewer@example.com"])])
+        for readers in ([], None, "anyone", ["*@example.com"], ["example.com"], [" A@example.com"],
+                        ["A@example.com", "a@example.com"], ["a@example.com", None],
+                        [f"a{i}@example.com" for i in range(21)]):
+            with self.subTest(readers=readers), self.assertRaises(RoutingError):
+                validate_companies([dict(leaf, drive_reader_emails=readers)])
+
+    def test_specific_subfolder_statement_resolves_parent_name_but_generic_does_not(self):
+        self.companies = self.nested_companies()
+        for index, name in enumerate(("Acme Studio / Sales Meetings", "Acme Studio Sales Meetings")):
+            text = "Please file this meeting under " + name + "."
+            record = self.propose_explicit([text], self.explicit_suggestion(text, "studio-sales", "filing_request"),
+                                          job="specific-" + str(index))
+            self.assertEqual(record["status"], "approved")
+            self.assertEqual(record["decision_source"], "automatic_explicit")
+            self.assertEqual(record["approved_route"]["company_id"], "studio-sales")
+        text = "This meeting is for Acme Studio."
+        for company in ("studio-sales", "studio-internal"):
+            record = self.propose_explicit([text], self.explicit_suggestion(text, company), job=company)
+            self.assertEqual(record["status"], "pending")
+        record = self.propose_explicit([text], self.explicit_suggestion(text, "studio"), job="parent")
+        self.assertEqual(record["approved_route"]["company_id"], "studio")
+
+    def test_subfolders_do_not_hide_shared_aliases_or_competing_destinations(self):
+        self.companies = self.nested_companies()
+        text = "Please file this meeting under Acme Studio Sales Meetings."
+        contexts = [[text, "This meeting is for Acme Studio."],
+                    [text, "Please save this meeting under Acme Studio Internal Meetings."],
+                    [text, "Acme Studio also owns this project."]]
+        for index, texts in enumerate(contexts):
+            record = self.propose_explicit(texts, self.explicit_suggestion(text, "studio-sales", "filing_request"),
+                                          job="competing-" + str(index))
+            self.assertEqual(record["status"], "pending")
+        self.companies[1]["aliases"].append("Acme Studio")
+        text = "Please file this meeting under Acme Studio."
+        record = self.propose_explicit([text], self.explicit_suggestion(text, "studio-sales", "filing_request"), job="shared")
+        self.assertEqual(record["status"], "pending")
+
+    def test_model_company_context_contains_no_folder_ids_paths_or_viewers(self):
+        from quill_workflow.codex_routing import company_context
+        companies = self.nested_companies()
+        companies[1]["drive_reader_emails"] = ["viewer@example.com"]
+        context = company_context(companies)
+        serialized = json.dumps(context)
+        self.assertIn("Acme Studio / Sales Meetings", serialized)
+        self.assertNotIn("drive_folder", serialized)
+        self.assertNotIn("folder-studio", serialized)
+        self.assertNotIn("drive_reader_emails", serialized)
+        self.assertNotIn("viewer@example.com", serialized)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -80,7 +80,7 @@ class MeetingDocumentTests(unittest.TestCase):
                              "\n" if node.tag.endswith("}br") else
                              "\t" if node.tag.endswith("}tab") else "" for node in run)
             self.assertEqual(actual, segment["text"])
-        self.assertEqual(title, "Draft planning - Max")
+        self.assertEqual(title, "Max - Draft planning")
         self.assertIn("Microphone", expected[-2])
         self.assertIn("System audio", expected[-1])
         self.assertNotIn("Max", expected[-1])
@@ -123,7 +123,7 @@ class MeetingDocumentTests(unittest.TestCase):
         # Captured from the original v1 exporter before adding layout options.
         with tempfile.TemporaryDirectory() as temporary:
             legacy = build_document(self.notes, self.transcript, self.meta, self.route,
-                                    temporary, "America/Los_Angeles")
+                                    temporary, "America/Los_Angeles", participants_first=False)
             self.assertEqual(hashlib.sha256(legacy["path"].read_bytes()).hexdigest(),
                              "46b6a624a27c45225f9fdf8e77c066871571a32ef3e3c16bedeee8c01c9c3f43")
             serialized = json.dumps(legacy["manifest"], ensure_ascii=False, sort_keys=True,
@@ -132,8 +132,43 @@ class MeetingDocumentTests(unittest.TestCase):
                              "a1e99e45bf35afeb85a20d3b9162027c678d07b775ac359959a4561763a7517f")
             self.assertNotIn("notes_layout", legacy["manifest"])
             explicit = build_document(self.notes, self.transcript, self.meta, self.route,
-                                      temporary, "America/Los_Angeles", notes_layout="sources")
+                                      temporary, "America/Los_Angeles", notes_layout="sources",
+                                      participants_first=False)
             self.assertEqual(legacy, explicit)
+            # The updated default must reuse that exact artifact on retry.
+            self.assertEqual(legacy, build_document(self.notes, self.transcript, self.meta, self.route,
+                                                   temporary, "America/Los_Angeles"))
+
+    def test_legacy_title_retry_preserves_exports_but_rejects_changed_notes(self):
+        for notes_layout in ("sources", "clean"):
+            with self.subTest(notes_layout=notes_layout), tempfile.TemporaryDirectory() as temporary:
+                legacy = build_document(self.notes, self.transcript, self.meta, self.route, temporary,
+                                        notes_layout=notes_layout, participants_first=False)
+                original_bytes = legacy["path"].read_bytes()
+                retry = build_document(self.notes, self.transcript, self.meta, self.route, temporary,
+                                       notes_layout=notes_layout)
+                self.assertEqual(retry, legacy)
+                changed = copy.deepcopy(self.notes)
+                changed["summary"][0]["text"] = "The draft will stay private."
+                with self.assertRaisesRegex(ValueError, "inputs changed"):
+                    build_document(changed, self.transcript, self.meta, self.route, temporary,
+                                   notes_layout=notes_layout)
+                self.assertEqual(legacy["path"].read_bytes(), original_bytes)
+
+    def test_legacy_title_recovers_export_written_before_manifest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            original = build_document(self.notes, self.transcript, self.meta, self.route, temporary,
+                                      participants_first=False)
+            (Path(temporary) / "manifest.json").unlink()
+            recovered = build_document(self.notes, self.transcript, self.meta, self.route, temporary)
+            self.assertEqual(recovered, original)
+
+    def test_new_export_uses_participants_first_and_keeps_order_on_retry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            result = build_document(self.notes, self.transcript, self.meta, self.route, temporary)
+            self.assertEqual(result["title"], "Max - Draft planning")
+            self.assertEqual(result, build_document(self.notes, self.transcript, self.meta,
+                                                   self.route, temporary))
 
     def test_clean_notes_keep_content_and_exact_transcript_without_inline_sources(self):
         notes = copy.deepcopy(self.notes)

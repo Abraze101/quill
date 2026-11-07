@@ -55,6 +55,18 @@ def _snapshot(snapshot):
             or any(ord(char) < 32 for char in title)):
         raise SharingNeedsReview("The notes title is invalid")
     snapshot["owner"] = recipient_email(snapshot.get("owner"))
+    if "filed_access" in snapshot:
+        access = snapshot["filed_access"]
+        if not isinstance(access, dict) or set(access) != {"folders", "readers"}:
+            raise SharingNeedsReview("The filed meeting's folder access needs review")
+        folders, readers = access["folders"], access["readers"]
+        if (not isinstance(folders, list) or len(folders) != 3
+                or len({_id(folder) for folder in folders} | {snapshot["destination_folder_id"]}) != 4):
+            raise SharingNeedsReview("The filed meeting's folder path needs review")
+        if (not isinstance(readers, list) or not 1 <= len(readers) <= 20
+                or sorted({recipient_email(email) for email in readers}) != readers
+                or snapshot["owner"] in readers):
+            raise SharingNeedsReview("The filed meeting's viewer list needs review")
     payload = snapshot.get("notes_payload")
     if not isinstance(payload, dict) or payload.get("format") != native.FORMAT:
         raise SharingNeedsReview("A validated native notes payload is required")
@@ -230,11 +242,21 @@ class SharingDrive:
         raise SharingNeedsReview("The notes destination ancestry exceeds the review limit")
 
     def _boundaries(self, snapshot, guard):
-        self._ancestors(snapshot["destination_folder_id"], snapshot["owner"], guard)
+        parent, owner = snapshot["destination_folder_id"], snapshot["owner"]
+        self._ancestors(parent, owner, guard)
+        access = snapshot.get("filed_access", {})
+        readers = set(access.get("readers", []))
+        for folder in access.get("folders", []):
+            item = self._metadata(folder, guard)
+            if (item.get("parent_ids") != [parent] or item.get("mime_type") != FOLDER_MIME
+                    or set(self._permissions(item, owner, readers)) != readers):
+                raise SharingNeedsReview("The filed meeting's folder or viewer access changed")
+            parent = folder
         original = self._metadata(snapshot["private_document_id"], guard)
-        self._permissions(original, snapshot["owner"])
-        if original.get("mime_type") != DOCUMENT_MIME or original.get("parent_ids") != [snapshot["destination_folder_id"]]:
-            raise SharingNeedsReview("The original private meeting document moved or changed type")
+        if set(self._permissions(original, owner, readers)) != readers:
+            raise SharingNeedsReview("The filed meeting document's viewer access changed")
+        if original.get("mime_type") != DOCUMENT_MIME or original.get("parent_ids") != [parent]:
+            raise SharingNeedsReview("The original meeting document moved or changed type")
 
     def _document(self, identity, guard):
         document = self._call("get_document", {"document_id": _id(identity)}, guard)

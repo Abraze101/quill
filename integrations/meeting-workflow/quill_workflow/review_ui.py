@@ -246,7 +246,7 @@ def _meeting_content(entry, path, navigation, tab):
         body += _link(label, url(key), 'tab', tab == key)
     body += '</nav>'
     if tab == "sharing":
-        body += (entry.get("sharing_body") or '<p class="muted">Sharing is unavailable until this meeting’s private notes document is ready.</p>')
+        body += (entry.get("sharing_body") or '<p class="muted">Sharing is unavailable until this meeting’s notes document is ready.</p>')
     elif tab == "speakers":
         body += entry.get("speaker_body") or '<p class="muted">Speaker corrections are unavailable for this meeting.</p>'
     elif tab == "transcript":
@@ -351,6 +351,7 @@ def workspace(entries, path, notice=None, sharing=False, preview=False, selected
         else:
             heading = 'No meetings need your attention' if view == 'attention' and not query else 'No matching meetings' if query or folder else 'No meetings yet'
             body += '<div class="empty"><h2>' + heading + '</h2><p>' + ('Try another search or folder.' if query or folder else 'New recordings and their notes will appear here.') + '</p></div>'
-    body += '<footer class="review-footer"><span>Filing keeps meetings private.</span><span>'
-    body += ('Sharing requires a separate notes-only review.' if sharing else 'Nothing is shared with participants here.')
-    return document(body + '</span></footer></div></div>')
+    body += '<footer class="review-footer"><span>Drive files inherit folder access.</span>'
+    if sharing:
+        body += '<span>Attendee sharing requires your approval.</span>'
+    return document(body + '</footer></div></div>')

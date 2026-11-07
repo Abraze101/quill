@@ -66,7 +66,8 @@ final class AppController {
     private var completionWorkerID: UUID?
     private var completionRecovery = CompletionWorkerRecovery()
     private var completionLaunchIssue: String?
-    private var reviewProcess: Process?
+    private lazy var reviewLauncher = MeetingReviewLauncher(openURL: { NSWorkspace.shared.open($0) },
+        reportError: { [weak self] message in self?.showInformation("Meeting review unavailable", message) })
     private var completionStatus: CompletionUIStatus?
     private var completionStatusChecked = Date.distantPast
     private var micStatus: MicCaptureStatus = .recording
@@ -248,6 +249,7 @@ final class AppController {
     func shouldTerminate() -> NSApplication.TerminateReply {
         if terminationAllowed { return .terminateNow }
         if phase == .idle {
+            reviewLauncher.close()
             recordingHeartbeat.invalidate()
             meetingWatchdog.reset()
             meetingReminder.update(meetingID: nil)
@@ -259,6 +261,7 @@ final class AppController {
     }
 
     private func finishShutdown() {
+        reviewLauncher.close()
         recordingHeartbeat.invalidate()
         meetingReminder.update(meetingID: nil)
         sleepController?.stopObserving()
@@ -461,8 +464,8 @@ final class AppController {
                 ?? (automaticMeeting == nil && signals.count == 1 ? signals.first : nil)
             contextMeeting = contextSignal?.meeting
             contextSource = contextSignal?.source
-            if let context = contextSignal?.meetingContext, context.provider == contextSignal?.provider {
-                newSession.observeMeetingContext(context)
+            if let contextSignal {
+                newSession.observeMeetingSignal(contextSignal)
             }
             let now = RecordingSafetyClock.now
             safetyStartedAt = now
@@ -781,8 +784,8 @@ final class AppController {
             if phase == .recording, let contextMeeting, let contextSource,
                let signal = meetingAutomation.joinedSignals().first(where: {
                    $0.meeting == contextMeeting && $0.source == contextSource
-               }), let context = signal.meetingContext, context.provider == signal.provider {
-                session?.observeMeetingContext(context)
+               }) {
+                session?.observeMeetingSignal(signal)
             }
             do { try checkpointCapture() }
             catch { stopForSafety("Recording recovery checkpoints could not be saved. Review this recording locally.") }
@@ -1474,18 +1477,7 @@ final class AppController {
             completionRecovery = CompletionWorkerRecovery()
             resumeCompletionWorker()
         }
-        if reviewProcess?.isRunning == true {
-            showInformation("Meeting review", "The review page is already open in your browser. It stays available for 30 minutes; your choices are saved locally.")
-            return
-        }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: command[0])
-        process.arguments = Array(command.dropFirst())
-        process.standardInput = FileHandle.nullDevice
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        do { try process.run(); reviewProcess = process }
-        catch { showInformation("Meeting review unavailable", "The review page could not open. Your meetings remain saved locally.") }
+        reviewLauncher.open(command)
     }
 
     var canRetryTranscriptions: Bool {

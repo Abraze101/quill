@@ -65,9 +65,9 @@ class SharingReviewServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("<h3>Share meeting notes</h3>", body)
         self.assertIn("Preparing a copy does not share it", body)
-        self.assertIn("recording and full transcript stay private", body)
+        self.assertIn("Attendee sharing uses a notes-only copy", body)
         self.assertIn("Prepare private sharing copy", body)
-        self.assertIn("Keep private", body)
+        self.assertIn("Skip attendee sharing", body)
         self.assertNotIn("Nothing is shared with participants here", body)
         self.assertNotIn('value="sharing_confirm"', body)
         self.assertIn('spellcheck="false"></textarea>', body)
@@ -134,7 +134,7 @@ class SharingReviewServerTests(unittest.TestCase):
         for state, expected in (("preparing", "Preparing your private"),
                                 ("sharing", "Sharing is in progress"),
                                 ("shared", "Shared view-only with"),
-                                ("private", "Kept private")):
+                                ("private", "Attendee sharing skipped")):
             self.items[0]["status"] = state
             status, _, body = self.request()
             self.assertEqual(status, 200)

@@ -24,8 +24,8 @@ def _clip(value, limit):
     return shortened.rstrip(" .-") + "..."
 
 
-def meeting_title(notes, transcript):
-    """Return a safe topic-and-attendee name, or None for historical notes.
+def meeting_title(notes, transcript, *, participants_first=True):
+    """Return a safe attendee-and-topic name, or None for historical notes.
 
     The model must establish participation from the conversation. Validation
     checks evidence, exact cited name spelling, and anonymous labels; it cannot
@@ -97,5 +97,8 @@ def meeting_title(notes, transcript):
         if len(candidate.encode("utf-8")) > 112:
             break
         included.append(name)
-    suffix = " - " + ", ".join(included) if included else ""
-    return _clip(topic, MAX_TITLE_BYTES - len(suffix.encode("utf-8"))) + suffix
+    names = ", ".join(included)
+    affix = (names + " - " if participants_first else " - " + names) if names else ""
+    topic = _clip(topic, MAX_TITLE_BYTES - len(affix.encode("utf-8")))
+    # The old order is used only to reconcile already-frozen export artifacts.
+    return affix + topic if participants_first else topic + affix

@@ -33,7 +33,7 @@ class NotesTemplateTests(unittest.TestCase):
         markdown = render_notes(self.notes, self.transcript)
         headings = [line for line in markdown.splitlines() if line.startswith("## ")]
         self.assertEqual(headings, ["## Summary", "## Decisions", "## Next steps", "## Details"])
-        self.assertIn("# Dashboard review - Max\n\nParticipants: Max", markdown)
+        self.assertIn("# Max - Dashboard review\n\nParticipants: Max", markdown)
         self.assertIn("**Aligned**\n\n- Review the dashboard on Friday.", markdown)
         self.assertIn("- [Max] Send the dashboard Due: Friday", markdown)
         self.assertIn("- Next step: Proposed: Ask for a usability review.", markdown)
@@ -87,6 +87,17 @@ class NotesTemplateTests(unittest.TestCase):
             notes[key][0]["evidence"] = [99]
             with self.subTest(key=key), self.assertRaisesRegex(WorkflowError, "Invalid transcript segment reference"):
                 render_notes(notes, self.transcript)
+
+    def test_topic_first_saved_notes_still_validate_without_accepting_content_edits(self):
+        from quill_workflow.pipeline import _render_historical_notes
+        for render, options in ((render_notes, {}),
+                                (_render_historical_notes, {"include_sources": False}),
+                                (_render_historical_notes, {"include_sources": True})):
+            markdown = render(self.notes, self.transcript, participants_first=False, **options)
+            self.assertTrue(markdown.startswith("# Dashboard review - Max\n"))
+            self.assertTrue(notes_markdown_matches(markdown, self.notes, self.transcript))
+            self.assertFalse(notes_markdown_matches(markdown.replace("Friday", "Monday"),
+                                                    self.notes, self.transcript))
 
 
 if __name__ == "__main__":

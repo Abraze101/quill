@@ -193,6 +193,10 @@ normalized meeting code and names visible in supported meeting tiles. These
 partial names help match calendar invitations and review speakers; they do not
 verify identity or authorize sharing. No full URLs, passcodes, captions, chat or
 media are sent. The extension's `webNavigation` permission checks meeting senders.
+Extension 0.1.8 also sends bounded Google Meet speaking-indicator samples.
+The app aligns them with recording audio for automatic speaker-name matching;
+see [speaker identification](speaker-identification.md) for evidence requirements
+and current Meet/Zoom coverage.
 
 Before relying on a new installation, use an empty test meeting and verify:
 
@@ -263,8 +267,9 @@ and do not repeat successful stages or approve held work.
 
 **Share notes…** opens a separate approval. Filing privately never grants attendee
 access. Calendar suggestions are tentative; they establish invitees, not who
-spoke. Closing the review preserves pending decisions. The temporary page binds
-to loopback and expires after thirty minutes; reopen it from Quill as needed.
+spoke. Closing the review preserves pending decisions. Choose **Review processing…**
+to reopen the page. Quill reuses the local session or starts a new one if the
+previous session has reached its thirty-minute limit.
 
 ### Cancelling a dud recording
 

@@ -87,9 +87,15 @@ def _speaker_panel(server, job):
     candidates = item.get("candidates", [])
     candidates = [candidate for candidate in candidates[:100] if isinstance(candidate, dict)] if isinstance(candidates, list) else []
     body = '<div class="speaker-review"><p class="muted">' + (
-        'Match each voice to a person. Saving confirms your correction.' if item["speakers"] else
+        'Names are matched automatically when the evidence is clear. Correct a name only if needed.' if item["speakers"] else
         'No separate voices are available to name in this transcript.') + '</p>'
-    labels = {"confirmed": "Confirmed", "suggested": "Suggested", "corrected": "Your correction", "user_confirmed": "Your correction"}
+    local = item.get("local_participants", [])
+    if isinstance(local, list):
+        names = list(dict.fromkeys(person["name"] for person in local[:100]
+                                  if isinstance(person, dict) and isinstance(person.get("name"), str)))
+        if names:
+            body += '<p class="notes-caption">Your meeting identity: ' + _escape(", ".join(names)) + '</p>'
+    labels = {"confirmed": "Confirmed", "matched": "Matched in meeting", "suggested": "Suggested", "corrected": "Your correction", "user_confirmed": "Your correction"}
     for index, speaker in enumerate(item["speakers"]):
         prefix = "speaker-" + str(index)
         name = speaker.get("name") if isinstance(speaker.get("name"), str) else ""
@@ -320,10 +326,10 @@ def _sharing_cards(server, items=None, start_index=0):
         status = item["status"]
         heading = {"available": "Share meeting notes", "ready": "Approve notes sharing",
                    "preparing": "Preparing notes copy", "sharing": "Sharing notes",
-                   "shared": "Sharing details", "private": "Notes kept private",
+                   "shared": "Sharing details", "private": "Attendee sharing skipped",
                    "needs_attention": "Sharing needs attention"}.get(status, "Notes sharing")
         body += '<div class="sharing-review"><h3>' + heading + '</h3>'
-        body += '<p class="muted">Sharing uses a separate notes-only copy. Your recording and full transcript stay private.</p>'
+        body += '<p class="muted">Attendee sharing uses a notes-only copy. Files in Drive inherit the meeting folder’s access.</p>'
         if status in ("available", "ready"):
             body += '<details open><summary>Read notes to share</summary>'
             body += notes_html(item["preview"]) + '</details>'
@@ -339,9 +345,9 @@ def _sharing_cards(server, items=None, start_index=0):
             # Keep private has its own form, so the recipient field is never
             # submitted with an action that does not accept recipients.
             body += _sharing_form(server, item, controls)
-            body += _sharing_form(server, item, '<button name="action" value="sharing_private">Keep private</button>')
+            body += _sharing_form(server, item, '<button name="action" value="sharing_private">Skip attendee sharing</button>')
         elif status in ("preparing", "sharing"):
-            message = ('Preparing your private notes-only copy. Nothing has been shared.' if status == "preparing"
+            message = ('Preparing your private notes-only copy.' if status == "preparing"
                        else 'Sharing is in progress. Wait for the result before making another choice.')
             body += '<p role="status">' + message + '</p><p><a href="' + _escape(_selected_path(server, item["job"], tab="sharing")) + '">Refresh status</a></p>'
         elif status in ("ready", "shared"):
@@ -357,7 +363,7 @@ def _sharing_cards(server, items=None, start_index=0):
                 body += '<p role="alert">The notes copy link is unavailable. Reload this review before sharing.</p>'
             if status == "ready":
                 body += '<p>Google may email these recipients an invitation. This shares only the notes shown above.</p>'
-                controls = ('<button name="action" value="sharing_private">Keep private</button>'
+                controls = ('<button name="action" value="sharing_private">Skip attendee sharing</button>'
                             if item.get("cancellable") is True else '')
                 if link and item["recipients"] and item.get("recipient_draft") is None:
                     controls = '<button name="action" value="sharing_confirm">Share view-only</button>' + controls
@@ -380,7 +386,7 @@ def _sharing_cards(server, items=None, start_index=0):
             else:
                 body += '<p>Sharing is complete. No new invitation will be sent from this review.</p>'
         elif status == "private":
-            body += '<p>Kept private. No sharing is scheduled.</p>'
+            body += '<p>No attendee invitations are scheduled.</p>'
         elif status == "needs_attention":
             body += '<p role="alert">' + _escape(item.get("error") or "Sharing needs review.") + '</p>'
             if item.get("sharing_started") is True:
@@ -397,7 +403,7 @@ def _sharing_cards(server, items=None, start_index=0):
             if item.get("refreshable") is True:
                 body += _sharing_form(server, item, '<button name="action" value="sharing_refresh">Refresh sharing review</button>')
             if item.get("cancellable") is True:
-                body += _sharing_form(server, item, '<button name="action" value="sharing_private">Keep private</button>')
+                body += _sharing_form(server, item, '<button name="action" value="sharing_private">Skip attendee sharing</button>')
         else:
             body += '<p role="alert">This sharing review is unavailable. Reload the page before making a choice.</p>'
         body += '</div>'
@@ -416,9 +422,17 @@ def _identity_form(server, record):
     return body
 
 
+def _folder_label(company):
+    viewer_count = len(company.get("drive_reader_emails", []))
+    if viewer_count:
+        noun = "viewer" if viewer_count == 1 else "viewers"
+        return f'{company["name"]} ({viewer_count} {noun})'
+    return company["name"]
+
+
 def _folder_body(server, record, index):
     suggestion = record["suggestion"]
-    suggested = next((company["name"] for company in record["companies"]
+    suggested = next((_folder_label(company) for company in record["companies"]
                       if company["id"] == suggestion["company_id"]), "Needs your choice")
     body = '<div class="suggestion"><p class="suggestion-title"><strong>Suggested folder:</strong> ' + _escape(suggested) + '</p>'
     body += '<p>' + _escape(suggestion["reason"]) + '</p></div>'
@@ -428,7 +442,7 @@ def _folder_body(server, record, index):
     body += '<label for="company-' + str(index) + '">Meeting folder</label>'
     body += '<select required name="company_id" id="company-' + str(index) + '"><option value="">Choose a folder…</option>'
     for company in record["companies"]:
-        body += '<option value="' + _escape(company["id"]) + '">' + _escape(company["name"]) + '</option>'
+        body += '<option value="' + _escape(company["id"]) + '">' + _escape(_folder_label(company)) + '</option>'
     body += '</select><div><button name="action" value="approve">Use this folder</button>'
     body += '<button name="action" value="skip" formnovalidate>Keep local</button></div></form>'
     body += '<p class="muted">Keep local saves this meeting on your Mac without filing it in Drive.</p>'
@@ -548,12 +562,12 @@ def _review_entries(server):
             entry["sharing_body"] = _sharing_cards(server, [sharing], start_index=sharing_index)
             entry["sharing_status"] = sharing["status"]
             entry["sharing_label"] = {
-                "available": "Not shared through Quill",
+                "available": "No attendee copy shared",
                 "preparing": "Preparing a private notes copy",
                 "ready": "Private copy awaiting approval",
                 "sharing": "Sharing started; confirmation pending",
                 "shared": "View-only sharing confirmed",
-                "private": "Kept private; no sharing scheduled",
+                "private": "Attendee sharing skipped",
                 "needs_attention": "Sharing result needs review",
             }.get(sharing["status"], "No sharing confirmation available")
         if deletion:
@@ -620,12 +634,12 @@ def _review_entries(server):
                          tone="red", priority=0, attention=True)
         elif sharing:
             status, detail, tone, priority, attention = {
-                "available": ("Notes ready", "Sharing is optional. Your recording and transcript stay private.", "neutral", 5, False),
+                "available": ("Notes ready", "Sharing is optional. You can review a notes-only copy for attendees.", "neutral", 5, False),
                 "ready": ("Approve sharing", "Review the prepared notes-only copy and its exact recipients.", "amber", 2, True),
-                "preparing": ("Preparing notes copy", "The separate sharing copy is being prepared. Nothing has been shared.", "neutral", 3, False),
+                "preparing": ("Preparing notes copy", "Preparing the attendee copy.", "neutral", 3, False),
                 "sharing": ("Sharing in progress", "Wait for verified access before making another sharing choice.", "neutral", 3, False),
                 "shared": ("Notes shared", "View-only access was confirmed for the recipients in Sharing details.", "neutral", 5, False),
-                "private": ("Notes kept private", "No notes sharing is scheduled.", "neutral", 5, False),
+                "private": ("Attendee sharing skipped", "No notes sharing is scheduled.", "neutral", 5, False),
                 "needs_attention": ("Sharing needs attention", sharing.get("error") or "Review the saved sharing result before continuing.", "red", 0, True),
             }.get(sharing["status"], ("Check sharing", "The sharing result needs review.", "red", 0, True))
             entry.update(status=status, detail=detail, tone=tone, priority=priority, attention=attention)
@@ -679,7 +693,7 @@ def _reviews_page(server, notice=None, selected=None, **navigation):
         entry["metadata"] = metadata + entry.get("metadata", [])
         if entry["status"] in ("On this Mac", "Notes ready"):
             if saved["storage_status"] == "saved_in_drive":
-                entry.update(status="Saved in Drive", detail="Private filing is confirmed in the saved receipts.")
+                entry.update(status="Saved in Drive", detail="Quill verified the filed items.")
             elif saved["storage_status"] == "partly_saved":
                 entry.update(status="Partly saved in Drive", detail="Some files have confirmed Drive saves. View activity for details.")
             elif saved["storage_status"] == "not_requested":

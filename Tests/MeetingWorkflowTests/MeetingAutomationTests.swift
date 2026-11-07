@@ -265,6 +265,7 @@ struct Checks {
         reportCheckProgress("START meeting workflow policy executable")
         runMeetingRecordingWatchdogChecks()
         runSpeakerIdentityNamesTests()
+        try runMeetingSpeakerActivityChecks()
         try await runRecordingSafetyChecks()
         let tests = MeetingAutomationTests()
         let checks: [(String, () -> Void)] = [

@@ -15,6 +15,7 @@ from quill_workflow.pipeline import NeedsConfiguration
 from quill_workflow.resumable_drive import CHUNK_BYTES, HTTPResponse, ResumableDriveUploader
 
 OWNER = 'owner@example.test'
+READERS = ['sales-one@example.test', 'sales-two@example.test']
 PARENT = 'parent_folder_123'
 FILE_ID = 'reserved_file_123'
 SESSION = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&upload_id=synthetic'
@@ -93,6 +94,7 @@ class FakeDrive:
             self.offset += received
             if self.offset == total:
                 self.item = {**private(FILE_ID, self.metadata['mimeType']), **self.metadata,
+                             'shared': self.parent['shared'], 'permissions': copy.deepcopy(self.parent['permissions']),
                              'md5Checksum': self.md5.hexdigest(), 'size': str(total)}
             if self.after_chunk:
                 self.after_chunk(self)
@@ -129,13 +131,57 @@ class ResumableTests(unittest.TestCase):
             raise OSError('private session URL must never escape')
         self.drive.after_chunk = stop
 
+    def set_parent_viewers(self):
+        self.drive.parent['shared'] = True
+        self.drive.parent['permissions'].extend(
+            {'type': 'user', 'role': 'reader', 'emailAddress': email} for email in READERS)
+
     def test_success_and_completed_retry_only_reads_exact_id(self):
         self.assertEqual(self.upload(), {'success': True, 'id': FILE_ID})
         self.assertTrue(self.operation['resumable']['complete'])
+        self.assertNotIn('reader_emails', self.operation['resumable']['identity'])
         self.drive.calls.clear()
         self.upload()
         self.assertTrue(all(call[0] == 'GET' for call in self.drive.calls))
         self.assertEqual(self.drive.starts, 1)
+
+    def test_approved_folder_viewers_inherit_on_upload_and_recover_lost_response(self):
+        self.set_parent_viewers()
+        self.pause_after_chunk()
+        with self.assertRaises(UploadRetryable):
+            self.upload(reader_emails=READERS)
+        self.assertEqual(self.drive.item['permissions'], self.drive.parent['permissions'])
+        self.assertNotIn('permissions', self.drive.metadata)
+        self.drive.calls.clear()
+        self.assertEqual(self.upload(reader_emails=list(reversed(READERS))), {'success': True, 'id': FILE_ID})
+        self.assertEqual(self.drive.starts, 1)
+        self.assertTrue(all(call[0] == 'GET' for call in self.drive.calls))
+        self.drive.calls.clear()
+        with self.assertRaises(UploadNeedsReview):
+            self.upload(reader_emails=READERS[:1])
+        self.assertEqual(self.drive.calls, [])
+
+    def test_changed_viewer_role_stops_sending_before_next_chunk(self):
+        self.set_parent_viewers()
+        self.drive.ack_limit = 43
+        self.drive.after_chunk = lambda drive: drive.parent['permissions'][1].update(role='writer')
+        with self.assertRaises(UploadNeedsReview):
+            self.upload(reader_emails=READERS)
+        self.assertEqual(len([c for c in self.drive.calls if c[0] == 'PUT']), 1)
+        self.assertNotIn('id', self.operation)
+
+    def test_resumable_file_with_different_reader_is_never_adopted(self):
+        self.set_parent_viewers()
+        self.drive.after_chunk = lambda drive: drive.item['permissions'][1].update(emailAddress='other@example.test')
+        with self.assertRaises(UploadNeedsReview):
+            self.upload(reader_emails=READERS)
+        self.assertNotIn('id', self.operation)
+
+    def test_private_route_cannot_use_folder_with_approved_viewers_of_other_route(self):
+        self.set_parent_viewers()
+        with self.assertRaises(UploadNeedsReview):
+            self.upload()
+        self.assertFalse(any(call[0] in ('PUT', 'POST') for call in self.drive.calls))
 
     def test_sparse_file_larger_than_connector_limit_is_bounded(self):
         with self.source.open('wb') as handle:

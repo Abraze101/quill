@@ -19,10 +19,43 @@ final class RecordingSession {
     private let recordingTimeZone: TimeZone
     private let speakerIdentificationRequested: Bool
     private var meetingContext: MeetingContext?
+    private var speakerTimeline: MeetingSpeakerTimeline?
+    private var speakerSignalOwner: (source: String, meeting: String)?
+    private let activityWallAnchor: TimeInterval
+    private let activityMonotonicAnchor: TimeInterval
+    private var activityClockReliable = true
+    private var savedSpeakerActivity = false
 
     func observeMeetingContext(_ context: MeetingContext) {
         guard endedAt == nil, let context = context.validated() else { return }
         meetingContext = meetingContext?.merging(context) ?? context
+    }
+
+    func observeMeetingSignal(_ signal: MeetingSignal, at date: Date = Date(),
+                              monotonicNow: TimeInterval = RecordingCaptureTimeline.now) {
+        guard endedAt == nil, signal.state == .joined,
+              let context = signal.meetingContext?.validated(), context.provider == signal.provider else { return }
+        if let owner = speakerSignalOwner,
+           owner.source != signal.source || owner.meeting != signal.meeting { return }
+        if let previous = meetingContext,
+           previous.provider != context.provider || previous.key != context.key { return }
+        speakerSignalOwner = (signal.source, signal.meeting)
+        observeMeetingContext(context)
+        guard speakerIdentificationRequested, activityClockReliable else { return }
+        guard let activity = signal.speakerActivity else {
+            speakerTimeline?.breakContinuity()
+            return
+        }
+        if speakerTimeline == nil { speakerTimeline = MeetingSpeakerTimeline(provider: context.provider, key: context.key) }
+        // Browser timestamps use wall time; audio uses a monotonic clock. A
+        // wall-clock jump invalidates later alignment instead of moving labels.
+        let expectedWall = activityWallAnchor + monotonicNow - activityMonotonicAnchor
+        guard monotonicNow.isFinite, abs(date.timeIntervalSince1970 - expectedWall) <= 1 else {
+            activityClockReliable = false
+            speakerTimeline?.stopCollecting()
+            return
+        }
+        speakerTimeline?.observe(activity, receivedAt: date.timeIntervalSince1970)
     }
 
     private let mic = MicRecorder()
@@ -46,6 +79,8 @@ final class RecordingSession {
          speakerIdentificationRequested: Bool = false) throws {
         self.startedAt = startedAt
         self.speakerIdentificationRequested = speakerIdentificationRequested
+        activityWallAnchor = Date().timeIntervalSince1970
+        activityMonotonicAnchor = RecordingCaptureTimeline.now
         // Freeze location at the start. Ending, processing or uploading after
         // travel must not change this meeting's calendar date.
         recordingTimeZone = TimeZone(identifier: timeZone.identifier) ?? timeZone
@@ -139,6 +174,7 @@ final class RecordingSession {
                   transcriptionRequested: Bool = false, screenRequested: Bool = false,
                   screenStarted: Bool = false) async throws {
         await stopTracks()
+        saveSpeakerActivity()
         let meta = try metadata(screen: screen, screenStartedAt: screenStartedAt, screenError: screenError,
                                 transcriptionRequested: transcriptionRequested, screenRequested: screenRequested,
                                 screenStarted: screenStarted, checkpoint: false)
@@ -209,6 +245,44 @@ final class RecordingSession {
         if let meetingContext {
             meta["meeting_context"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(meetingContext))
         }
+        if !checkpoint, savedSpeakerActivity { meta["speaker_activity_file"] = "speaker-activity.json" }
         return meta
+    }
+
+    private func saveSpeakerActivity() {
+        guard speakerIdentificationRequested, let speakerTimeline,
+              let micStart = mic.firstBufferAt, let systemStart = system.firstBufferAt else { return }
+        let origins = [mic.captureReport, system.captureReport].compactMap { report -> Double? in
+            guard let value = report["capture_start_offset_seconds"] as? Double,
+                  value.isFinite, value >= 0 else { return nil }
+            return value
+        }
+        // Metadata/transcription uses the earliest firstBufferAt date. If a
+        // track never produced a buffer it falls back to startedAt; do not
+        // attach a different clock to that incomplete transcript. Require both
+        // measured origins and map the exact same date used by metadata.
+        guard origins.count == 2 else { return }
+        let earliest = min(micStart, systemStart).timeIntervalSince1970
+        let base = activityMonotonicAnchor + earliest - activityWallAnchor
+        guard base.isFinite, abs(base - captureTimeline.startedAt - origins.min()!) <= 0.1 else { return }
+        let durationMS = Int64(max(0, (captureTimeline.startedAt + captureTimeline.activeDuration - base) * 1000).rounded(.down))
+        let saved = speakerTimeline.saved { interval in
+            let start = activityMonotonicAnchor + Double(interval.startMS) / 1000 - activityWallAnchor
+            let end = activityMonotonicAnchor + Double(interval.endMS) / 1000 - activityWallAnchor
+            return captureTimeline.activeSlices(from: start, to: end).compactMap { slice in
+                let startMS = max(0, Int64(((slice.outputStart - base) * 1000).rounded(.up)))
+                let endMS = min(durationMS, Int64(((slice.outputStart + slice.sourceEnd - slice.sourceStart - base) * 1000).rounded(.down)))
+                guard endMS > startMS else { return nil }
+                return MeetingSpeakerTimeline.Interval(startMS: startMS, endMS: endMS, active: interval.active)
+            }
+        }
+        guard let saved, let data = try? JSONEncoder().encode(saved), data.count <= 5_000_000 else { return }
+        do {
+            try data.write(to: dir.appendingPathComponent("speaker-activity.json"), options: .atomic)
+            savedSpeakerActivity = true
+        } catch {
+            // Recording outputs and completion remain usable without naming evidence.
+            savedSpeakerActivity = false
+        }
     }
 }

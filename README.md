@@ -21,8 +21,8 @@ release or a notarized app download. The original MIT license is preserved;
   warn when the app or its connection is unavailable.
 - Keeps recent native recording and processing warnings in a local history,
   so brief messages can be read after they disappear.
-- Transcribes on-device and optionally separates speakers. Names require clear
-  spoken introductions; uncertain voices keep anonymous labels.
+- Transcribes on-device and optionally separates speakers. Names use clear
+  introductions or supported meeting activity; uncertain voices keep numbered labels.
 - Retries unfinished, previously opted-in transcription from either Quill menu,
   without restarting or rewriting completed transcripts.
 - Uses a separate completion worker for optional Codex notes, destination
@@ -31,7 +31,7 @@ release or a notarized app download. The original MIT license is preserved;
 - Presents a local meeting library for reviewing notes, recordings, folder
   decisions, retries, and deletion of an entire local meeting to Trash.
 - Suggests sharing recipients from calendars. Sharing requires review and an
-  explicit approval for a notes-only copy; recordings stay private.
+  explicit approval for a notes-only copy. Recordings inherit their filing folder’s access.
 - Holds interrupted or degraded recordings for review before processing, with
   recovery checkpoints for app and source updates.
 

@@ -87,9 +87,10 @@ class ReviewLibraryTests(unittest.TestCase):
         self.task(stage, "succeeded", receipt)
         return receipt
 
-    def complete(self, stage):
+    def complete(self, stage, *, participants_first=True):
         if stage == "publish":
-            payload = build_payload(self.notes, self.transcript, self.metadata, self.route, "Asia/Singapore")
+            payload = build_payload(self.notes, self.transcript, self.metadata, self.route, "Asia/Singapore",
+                                    participants_first=participants_first)
             files = [{"name": "native-template", "mime_type": "application/vnd.google-apps.document",
                       "payload_sha256": _hash(payload)}]
             verification = "metadata_and_template_content"
@@ -236,9 +237,10 @@ class ReviewLibraryTests(unittest.TestCase):
         (self.result / (stage + "-receipt.json")).unlink(missing_ok=True)
         (self.result / ("drive-" + stage + ".json")).unlink(missing_ok=True)
 
-    def older_publish(self, text_format):
+    def older_publish(self, text_format, *, participants_first=True):
         self.settings["publish"]["text_format"] = text_format
-        (self.result / "notes/notes.md").write_text(render_notes(self.notes, self.transcript))
+        (self.result / "notes/notes.md").write_text(render_notes(
+            self.notes, self.transcript, participants_first=participants_first))
         journal = json.loads(json.dumps(self.journals["publish"]))
         identity = journal["identity"]
         for key in ("document_title", "template_document_id", "template_sha256"):
@@ -253,7 +255,7 @@ class ReviewLibraryTests(unittest.TestCase):
             verification = "metadata"
         else:
             document = build_document(self.notes, self.transcript, self.metadata, self.route,
-                                      self.result / "documents", "Asia/Singapore")
+                                      self.result / "documents", "Asia/Singapore", participants_first=participants_first)
             files = [{"name": "documents/meeting.docx", "mime_type": "application/vnd.google-apps.document",
                       "source_mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                       "size": document["path"].stat().st_size, "sha256": document["manifest"]["docx_sha256"]}]
@@ -276,7 +278,7 @@ class ReviewLibraryTests(unittest.TestCase):
 
     def test_complete_filing_has_separate_confirmed_document_and_media(self):
         result = self.view()
-        self.assertEqual(result["title"], "Dashboard review - Max")
+        self.assertEqual(result["title"], "Max - Dashboard review")
         self.assertEqual(result["folder_name"], "Example")
         self.assertEqual(result["folder_id"], "company_folder_123")
         self.assertEqual(result["storage_status"], "saved_in_drive")
@@ -422,6 +424,39 @@ class ReviewLibraryTests(unittest.TestCase):
 
     def test_route_must_match_its_frozen_company_map(self):
         self.settings["route"]["companies"][0]["drive_folder_id"] = "another_company_123"
+        self.receipt("route", route=self.route)
+        self.assertIsNone(self.view()["folder_name"])
+
+    def test_nested_route_confirms_filing_only_when_the_complete_path_matches(self):
+        path = [{"name": "Example", "drive_folder_id": "company_folder_123"},
+                {"name": "Sales Meetings", "drive_folder_id": "sales_folder_123"}]
+        self.route.update(company_id="example-sales", company_name="Example / Sales Meetings",
+                          drive_folder_id="sales_folder_123", drive_folder_path=path)
+        self.settings["route"]["companies"] = [{"id": "example-sales", "name": "Example / Sales Meetings",
+            "drive_folder_id": "sales_folder_123", "drive_folder_path": json.loads(json.dumps(path))}]
+        self.receipt("route", route=self.route)
+        self.complete("publish")
+        self.complete("archive")
+        result = self.view()
+        self.assertEqual(result["folder_name"], "Example / Sales Meetings")
+        self.assertEqual(result["folder_id"], "sales_folder_123")
+        self.assertEqual(result["storage_status"], "saved_in_drive")
+        self.assertEqual(result["storage"]["media"]["status"], "confirmed")
+        # The same folder and files must no longer confirm if the saved
+        # filing choice and receipt disagree about who can see them.
+        self.settings["route"]["companies"][0]["drive_reader_emails"] = ["viewer@example.com"]
+        self.receipt("route", route=self.route)
+        self.assertIsNone(self.view()["folder_name"])
+        self.route["drive_reader_emails"] = ["viewer@example.com"]
+        self.receipt("route", route=self.route)
+        self.complete("publish")
+        self.complete("archive")
+        self.assertEqual(self.view()["storage_status"], "saved_in_drive")
+        self.settings["route"]["companies"][0]["drive_folder_path"][0]["drive_folder_id"] = "changed_company_123"
+        self.receipt("route", route=self.route)
+        self.assertIsNone(self.view()["folder_name"])
+        self.assertEqual(self.view()["storage_status"], "upload_uncertain")
+        self.settings["route"]["companies"][0]["drive_folder_path"][0]["drive_folder_id"] = "../invalid"
         self.receipt("route", route=self.route)
         self.assertIsNone(self.view()["folder_name"])
 
@@ -589,7 +624,7 @@ class ReviewLibraryTests(unittest.TestCase):
         self.notes["meeting_title"]["text"] = "A later local title"
         atomic_json(self.result / "notes/notes.json", self.notes)
         result = self.view()
-        self.assertEqual(result["title"], "A later local title - Max")
+        self.assertEqual(result["title"], "Max - A later local title")
         self.assertEqual(result["storage"]["document"]["status"], "uncertain")
         (self.result / "notes/notes.json").write_bytes(original)
         (self.result / "notes/notes.md").write_text("A later unpublished Markdown preview.")
@@ -643,6 +678,20 @@ class ReviewLibraryTests(unittest.TestCase):
         self.assertEqual(result["storage"]["document"]["status"], "uncertain")
         self.assertEqual(result["storage_status"], "upload_uncertain")
         self.assertEqual(result["storage"]["media"]["status"], "confirmed")
+
+    def test_topic_first_native_document_and_saved_markdown_remain_confirmed(self):
+        self.complete("publish", participants_first=False)
+        path = self.result / "notes/notes.md"
+        path.write_text(render_notes(self.notes, self.transcript, participants_first=False))
+        before = path.read_bytes()
+        self.assertEqual(self.view()["storage"]["document"]["status"], "confirmed")
+        self.assertEqual(path.read_bytes(), before)
+        path.write_text(before.decode().replace("Review the proposed dashboard.", "Unpublished changes."))
+        self.assertEqual(self.view()["storage"]["document"]["status"], "uncertain")
+
+    def test_topic_first_docx_and_saved_markdown_remain_confirmed(self):
+        self.older_publish(COMBINED_TEXT_FORMAT, participants_first=False)
+        self.assertEqual(self.view()["storage"]["document"]["status"], "confirmed")
 
 
 if __name__ == "__main__":

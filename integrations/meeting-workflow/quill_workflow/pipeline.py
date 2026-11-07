@@ -12,8 +12,8 @@ import subprocess
 import tempfile
 import time
 
-from quill_workflow.routing import (RoutingError, RoutingReviews, preserves_company_map, transcript_identity,
-                                    validate_companies)
+from quill_workflow.routing import (RoutingError, RoutingReviews, _route as configured_route, preserves_company_map,
+                                    transcript_identity, validate_companies)
 from quill_workflow.meeting_title import meeting_title
 from quill_workflow.meeting_dates import recording_timezone
 from quill_workflow.recording_safety import (FILENAME, RecordingSafetyHold, ProcessingCancelled, check_cancellation,
@@ -197,6 +197,22 @@ def safe_member(directory, name):
     return path
 
 
+def optional_speaker_timeline(session, metadata):
+    """Ignore missing/invalid optional UI evidence, keeping ordinary notes usable."""
+    if metadata.get("speaker_activity_file") != "speaker-activity.json":
+        return None
+    try:
+        from .meeting_context import meeting_context
+        from .speaker_timeline import validate_timeline
+        context = meeting_context(metadata.get("meeting_context"))
+        timeline = validate_timeline(read_json(safe_member(session, "speaker-activity.json"), 10_000_000))
+        if any(timeline[key] != context[key] for key in ("provider", "key")):
+            return None
+        return timeline
+    except (ValueError, OSError, WorkflowError):
+        return None
+
+
 def snapshot_session(session, recordings_root, destination):
     """Copy only explicitly completed session files; leave originals untouched."""
     raw = Path(session).expanduser()
@@ -220,6 +236,8 @@ def snapshot_session(session, recordings_root, destination):
     for name in ("transcript.json", "transcript.md"):
         if (session / name).exists():
             names.append(name)
+    if optional_speaker_timeline(session, metadata) is not None:
+        names.append("speaker-activity.json")
     members = [safe_member(session, name) for name in dict.fromkeys(names)]
     destination.mkdir(parents=True, exist_ok=False)
     manifest = {}
@@ -737,7 +755,7 @@ class Queue:
                    for task in tasks.values())
 
 
-def _render_historical_notes(data, transcript, include_sources=False):
+def _render_historical_notes(data, transcript, include_sources=False, *, participants_first=True):
     """Validate evidence and preserve both historical Markdown formats exactly."""
     from .capture_quality import notice, validate_note_notice
     try:
@@ -751,7 +769,7 @@ def _render_historical_notes(data, transcript, include_sources=False):
     if not isinstance(segments, list) or not segments:
         raise WorkflowError("Transcript has no segments; do not generate notes from empty audio")
     try:
-        display_title = meeting_title(data, transcript)
+        display_title = meeting_title(data, transcript, participants_first=participants_first)
     except ValueError as error:
         raise WorkflowError(str(error)) from error
     # Escape Markdown punctuation in names/topics while keeping Drive names plain.
@@ -834,9 +852,10 @@ def _render_historical_notes(data, transcript, include_sources=False):
     return "\n".join(lines)
 
 
-def render_notes(data, transcript, include_sources=False):
+def render_notes(data, transcript, include_sources=False, *, participants_first=True):
     """Render the meeting template after checking all evidence, including hidden refs."""
-    historical = _render_historical_notes(data, transcript, include_sources=include_sources)
+    historical = _render_historical_notes(data, transcript, include_sources=include_sources,
+                                           participants_first=participants_first)
     if include_sources:
         return historical
     # The native document uses these same sections. Import here so this module
@@ -848,7 +867,7 @@ def render_notes(data, transcript, include_sources=False):
     def escaped(value):
         return re.sub(r"([\\`*_\[\]()#])", r"\\\1", value)
 
-    title = meeting_title(data, transcript) or "Meeting notes"
+    title = meeting_title(data, transcript, participants_first=participants_first) or "Meeting notes"
     lines = ["# " + escaped(title), ""]
     capture_notice = notice(transcript)
     if capture_notice:
@@ -881,9 +900,11 @@ def render_notes(data, transcript, include_sources=False):
 
 def notes_markdown_matches(markdown, data, transcript):
     """Accept only exact template, former clean, or legacy-source renderings."""
-    return (markdown == render_notes(data, transcript)
-            or markdown == _render_historical_notes(data, transcript, include_sources=False)
-            or markdown == _render_historical_notes(data, transcript, include_sources=True))
+    return any(markdown == render(data, transcript, participants_first=order, **options)
+               for order in (True, False)
+               for render, options in ((render_notes, {}),
+                   (_render_historical_notes, {"include_sources": False}),
+                   (_render_historical_notes, {"include_sources": True})))
 
 
 class ConnectorRunner:
@@ -997,19 +1018,33 @@ class ConnectorRunner:
             self.require_processing(job)
             if not settings.get("account_link_id"):
                 raise NeedsConfiguration("Choose and verify a Google account in Quill Settings before Drive filing")
+            if "drive_reader_emails" in route and self.config_path is None:
+                raise NeedsConfiguration("Shared-folder filing requires the current workflow configuration")
             if self.config_path is not None:
                 from quill_workflow.drive_accounts import require_verified_account
-                current_account = require_verified_account(load_config(self.config_path), settings)
+                live_config = load_config(self.config_path)
+                current_account = require_verified_account(live_config, settings)
                 if any(current_account[key] != verified_account[key] for key in ("link_id", "profile_id", "email", "meetings_root_id")):
                     raise NeedsConfiguration("Drive account changed during filing. Verify the connection before retrying.")
-            if settings.get("account_link_id") is not None and self.config_path is not None:
-                live = load_config(self.config_path).get(stage, {})
+                live = live_config.get(stage, {})
                 if live.get("account_link_id") != settings["account_link_id"]:
                     raise NeedsConfiguration("Drive account changed; the saved upload is on hold")
-            if settings.get("large_files") and self.config_path is not None:
-                live = load_config(self.config_path).get(stage, {})
-                if live.get("enabled") is not True or live.get("large_files") != settings["large_files"]:
+                if settings.get("large_files") and (live.get("enabled") is not True
+                        or live.get("large_files") != settings["large_files"]):
                     raise NeedsConfiguration("Direct Drive filing was disabled or its connection changed; the saved upload is on hold")
+                if "drive_reader_emails" in route:
+                    live_routing = live_config.get("route")
+                    if (not isinstance(live_routing, dict) or live_routing.get("enabled") is not True
+                            or live.get("enabled") is not True or live.get("type") != "codex_drive"
+                            or live.get("meetings_root_id") != settings["meetings_root_id"]):
+                        raise NeedsConfiguration("Shared-folder filing is disabled or its destination changed")
+                    try:
+                        live_route = configured_route(validate_companies(live_routing.get("companies")),
+                                                      route["company_id"])
+                    except RoutingError as error:
+                        raise NeedsConfiguration("The approved shared folder is no longer configured") from error
+                    if live_route != route:
+                        raise NeedsConfiguration("The shared destination or its approved viewers changed")
             current = self.task(job, "route")
             if (not current or current["status"] != "succeeded"
                     or current["settings"].get("enabled") is not True):
@@ -1070,10 +1105,17 @@ class ConnectorRunner:
             # result directory also holds local provenance and source snapshots.
             source = result_dir
         if native_template and stage == "publish":
-            from quill_workflow.native_template import build_payload
+            from quill_workflow.native_template import build_bound_payload, build_payload
             try:
-                payload = build_payload(notes, transcript, metadata, route,
-                                        document_zone)
+                journal_path = result_dir / "drive-publish.json"
+                if journal_path.exists() or journal_path.is_symlink():
+                    frozen = read_json(journal_path)
+                    if not isinstance(frozen, dict):
+                        raise ValueError("The saved native document journal needs review")
+                    payload = build_bound_payload(notes, transcript, metadata, route,
+                                                  document_zone, frozen.get("identity"))
+                else:
+                    payload = build_payload(notes, transcript, metadata, route, document_zone)
             except ValueError as error:
                 raise NeedsConfiguration(str(error)) from error
             source = result_dir
@@ -1199,6 +1241,8 @@ class ConnectorRunner:
                    "settings_sha256": signature}
         transcript_path = result_dir / "input/transcript.json"
         speaker_context = None
+        identity_context = None
+        timeline = None
         uses_speaker_context = stage == "notes" and any("{context}" in part for part in settings.get("command", []))
         if not transcript_path.exists():
             transcript_path = recording / "transcript.json"
@@ -1227,6 +1271,11 @@ class ConnectorRunner:
             if not isinstance(transcript, dict) or not transcript.get("segments"):
                 raise WorkflowError("Empty transcript; notes were not generated")
             receipt["input_sha256"] = hashlib.sha256(transcript_path.read_bytes()).hexdigest()
+            identity_metadata = read_json(safe_member(recording, "meta.json"), 100_000)
+            timeline = optional_speaker_timeline(recording, identity_metadata)
+            receipt["speaker_timeline_sha256"] = (hashlib.sha256(json.dumps(
+                timeline, sort_keys=True, ensure_ascii=False, allow_nan=False).encode()).hexdigest()
+                if timeline is not None else None)
             if uses_speaker_context:
                 from .meeting_context import meeting_context
                 metadata = read_json(safe_member(recording, "meta.json"), 100_000)
@@ -1243,7 +1292,7 @@ class ConnectorRunner:
                 return previous
         if stage == "notes" and (result_dir / "notes/notes.json").exists():
             provenance = read_json(result_dir / "notes/provenance.json")
-            if any(provenance.get(key) != receipt.get(key) for key in ("input_sha256", "settings_sha256", "context_sha256")):
+            if any(provenance.get(key) != receipt.get(key) for key in ("input_sha256", "settings_sha256", "context_sha256", "speaker_timeline_sha256")):
                 raise NeedsConfiguration("Existing notes use different input or settings; an explicit revision is required")
             render_notes(read_json(result_dir / "notes/notes.json"), transcript)
             atomic_json(receipt_path, receipt)
@@ -1300,9 +1349,10 @@ class ConnectorRunner:
                 from .speaker_context import build_context
                 from .speaker_corrections import SpeakerCorrections
                 identity_context, lookup_status = build_context(
-                    job, read_json(safe_member(recording, "meta.json"), 100_000), transcript,
+                    job, identity_metadata, transcript,
                     config=load_config(self.config_path), learned=SpeakerCorrections(self.state).learned(),
-                    guard=lambda: self.require_processing(job))
+                    guard=lambda: self.require_processing(job),
+                    timeline=timeline)
                 identity_path = staging / "speaker-context.json"
                 atomic_json(identity_path, identity_context)
                 argv.extend(["--speaker-context", str(identity_path)])
@@ -1313,8 +1363,17 @@ class ConnectorRunner:
             if stage == "notes":
                 if hashlib.sha256(transcript_path.read_bytes()).hexdigest() != receipt["input_sha256"]:
                     raise WorkflowError("Transcript changed during notes review")
+                current_metadata = read_json(safe_member(recording, "meta.json"), 100_000)
+                if optional_speaker_timeline(recording, current_metadata) != timeline:
+                    raise WorkflowError("Speaker timeline changed during notes review")
+                if identity_context is not None:
+                    bound_identity = returned.get("_speaker_identity") if isinstance(returned, dict) else None
+                    if (not isinstance(bound_identity, dict)
+                            or bound_identity.get("context") != identity_context):
+                        raise WorkflowError("Speaker identity review belongs to different evidence")
+                    if current_metadata.get("meeting_context") != identity_metadata.get("meeting_context"):
+                        raise WorkflowError("Meeting context changed during speaker review")
                 if uses_speaker_context:
-                    current_metadata = read_json(safe_member(recording, "meta.json"), 100_000)
                     current_context = current_metadata.get("meeting_context")
                     if current_context is not None:
                         current_context = meeting_context(current_context)

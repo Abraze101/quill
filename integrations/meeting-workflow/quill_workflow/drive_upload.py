@@ -1,4 +1,4 @@
-"""Deterministic private-Drive filing through an injected connector transport.
+"""Deterministic Google Drive filing through an injected connector transport.
 
 This module chooses paths and validates receipts. The connector transport
 receives one fixed operation at a time, including the destination and file list.
@@ -44,6 +44,36 @@ MIMES = {".caf": "audio/x-caf", ".mp4": "video/mp4", ".m4a": "audio/mp4",
 def _hash(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
                                     ensure_ascii=False, allow_nan=False).encode()).hexdigest()
+
+
+def verified_permission_owner(permissions, shared, *, owner=None, reader_emails=()):
+    """Return the owner only when the entire effective ACL matches the approval."""
+    expected = {email.casefold() for email in reader_emails}
+    privacy_error = ("Drive access differs from the approved viewers" if expected else
+                     "Drive destination privacy could not be verified as owner-only")
+    if (not isinstance(permissions, list) or len(permissions) != len(expected) + 1
+            or shared is not bool(expected)):
+        raise UploadNeedsReview(privacy_error)
+    actual_readers, actual_owner = set(), None
+    for permission in permissions:
+        if (not isinstance(permission, dict) or permission.get("type") != "user"
+                or permission.get("deleted") or permission.get("pendingOwner")):
+            raise UploadNeedsReview(privacy_error)
+        email = permission.get("emailAddress")
+        if not isinstance(email, str) or not email or email.strip() != email:
+            raise UploadNeedsReview("Drive permission email is unavailable")
+        role = permission.get("role")
+        if role == "owner" and actual_owner is None:
+            actual_owner = email
+        elif role == "reader" and email.casefold() in expected:
+            actual_readers.add(email.casefold())
+        else:
+            raise UploadNeedsReview(privacy_error)
+    if not actual_owner or owner is not None and actual_owner.casefold() != owner.casefold():
+        raise UploadNeedsReview("Drive destination owner changed or is unavailable")
+    if actual_readers != expected or actual_owner.casefold() in actual_readers:
+        raise UploadNeedsReview(privacy_error)
+    return actual_owner
 
 
 def native_template_sha256(document):
@@ -285,16 +315,11 @@ class DriveUploader:
             raise UploadNeedsReview("Drive metadata does not match the requested item")
         return result
 
-    def _private(self, item, owner=None, parent=None, name=None, mime=None):
-        permissions = item.get("permissions")
-        if (item.get("shared") is not False or item.get("current_user_can_share") is not True
-                or item.get("drive_id") or not isinstance(permissions, list) or len(permissions) != 1):
-            raise UploadNeedsReview("Drive destination privacy could not be verified as owner-only")
-        permission = permissions[0]
-        email = permission.get("emailAddress")
-        if (permission.get("role") != "owner" or permission.get("type") != "user"
-                or not isinstance(email, str) or not email or owner is not None and email.casefold() != owner.casefold()):
-            raise UploadNeedsReview("Drive destination owner changed or is unavailable")
+    def _verify_access(self, item, owner=None, parent=None, name=None, mime=None, *, reader_emails=()):
+        if item.get("current_user_can_share") is not True or item.get("drive_id"):
+            raise UploadNeedsReview("Drive destination ownership or privacy could not be verified")
+        email = verified_permission_owner(item.get("permissions"), item.get("shared"), owner=owner,
+                                          reader_emails=reader_emails)
         if parent is not None and item.get("parent_ids") != [parent]:
             raise UploadNeedsReview("Drive destination moved outside its approved parent")
         if name is not None and item.get("title") != name:
@@ -351,12 +376,33 @@ class DriveUploader:
             arguments["page_token"] = token
         raise UploadNeedsReview("Drive search exceeded its bounded page limit")
 
-    def _verify(self, identity, parent, name, owner, mime, size=None):
+    def _verify(self, identity, parent, name, owner, mime, size=None, *, reader_emails=()):
         item = self._metadata(identity)
-        self._private(item, owner, parent, name, mime)
+        self._verify_access(item, owner, parent, name, mime, reader_emails=reader_emails)
         if size is not None and str(item.get("size")) != str(size):
             raise UploadNeedsReview("Drive file size does not match the local recording")
         return item
+
+    def verify_destination(self, route, owner):
+        """Read back every approved folder from root to leaf before writing."""
+        from .routing import route_folder_path, route_reader_emails, RoutingError
+        try:
+            path = route_folder_path(route)
+            reader_emails = route_reader_emails(route)
+        except (RoutingError, AttributeError) as error:
+            raise UploadNeedsReview("The approved folder path is invalid") from error
+        if any(part["drive_folder_id"] == self.root_id for part in path):
+            raise UploadNeedsReview("The destination path cannot contain its Meetings root")
+        parent, ancestors = self.root_id, {}
+        for part in path:
+            identity, name = _id(part["drive_folder_id"]), part["name"]
+            allowed = reader_emails if identity == route["drive_folder_id"] else ()
+            self._verify(identity, parent, name, owner, FOLDER_MIME, reader_emails=allowed)
+            if identity not in self._find(parent, name, True):
+                raise UploadNeedsReview("An approved destination folder is unavailable")
+            ancestors[identity] = (parent, name, allowed)
+            parent = identity
+        return ancestors
 
     def upload(self, job, stage, source, route, started, meeting_title=None,
                text_format="legacy", document_path=None, document_title=None, document_text=None,
@@ -493,7 +539,7 @@ class DriveUploader:
 
             self.guard()
             root = self._metadata(self.root_id)
-            owner = self._private(root, meeting["owner"] or journal["owner"], mime=FOLDER_MIME)
+            owner = self._verify_access(root, meeting["owner"] or journal["owner"], mime=FOLDER_MIME)
             if self.expected_owner is not None and owner.casefold() != self.expected_owner.casefold():
                 raise UploadNeedsReview("The Meetings folder owner differs from the verified Google Drive account")
             if direct_account and direct_account["email"].casefold() != owner.casefold():
@@ -502,15 +548,14 @@ class DriveUploader:
             # Google's `trashed` field. Root was explicitly created in My Drive.
             if self.root_id not in self._find("root", root["title"], True):
                 raise UploadNeedsReview("The approved Meetings root is unavailable")
-            self._verify(company_id, self.root_id, route["company_name"], owner, FOLDER_MIME)
-            if company_id not in self._find(self.root_id, route["company_name"], True):
-                raise UploadNeedsReview("The approved company folder is unavailable")
+            ancestors = self.verify_destination(route, owner)
+            reader_emails = ancestors[company_id][2]
             journal["owner"] = owner
             save()
 
             if template:
                 template_info = self._metadata(template_document_id)
-                self._private(template_info, owner, mime=DOCUMENT_MIME)
+                self._verify_access(template_info, owner, mime=DOCUMENT_MIME)
                 template_document = self._call("get_document", {"document_id": template_document_id})
                 if (template_document.get("documentId") != template_document_id
                         or native_template_sha256(template_document) != template_sha256):
@@ -523,13 +568,11 @@ class DriveUploader:
                 except ValueError as error:
                     raise UploadNeedsReview(str(error)) from error
 
-            ancestors = {company_id: (self.root_id, route["company_name"])}
-
             def validate_ancestors():
                 self.guard()
-                self._private(self._metadata(self.root_id), owner, mime=FOLDER_MIME)
-                for identity, (parent, name) in ancestors.items():
-                    self._verify(identity, parent, name, owner, FOLDER_MIME)
+                self._verify_access(self._metadata(self.root_id), owner, mime=FOLDER_MIME)
+                for identity, (parent, name, allowed) in ancestors.items():
+                    self._verify(identity, parent, name, owner, FOLDER_MIME, reader_emails=allowed)
 
             def fill_template(known, op):
                 """A saved copy ID precedes edits; unknown edits are read back."""
@@ -566,6 +609,8 @@ class DriveUploader:
                     op["fill"] = fill
                     save()
                 validate_ancestors()
+                self._verify(known, op["parent"], op["name"], owner, DOCUMENT_MIME,
+                             reader_emails=reader_emails)
                 fill.update(state="dispatched", dispatched_at=time.time())
                 save()
                 try:
@@ -630,10 +675,12 @@ class DriveUploader:
                     if ids and ids != [reserved]:
                         raise UploadNeedsReview("A matching Drive item is not owned by this resumable upload")
                     try:
+                        validate_ancestors()
                         result = self.large_upload.upload(
                             source=source / file["name"], file=file, parent=parent,
                             name=name, mime=mime, owner=owner, operation=op,
-                            save=save, guard=self.guard)
+                            save=save, guard=self.guard,
+                            **({"reader_emails": reader_emails} if reader_emails else {}))
                     except (UploadRetryable, DriveAuthRetryable) as error:
                         saved = op.get("resumable")
                         if isinstance(saved, dict) and saved.get("file_id"):
@@ -646,7 +693,8 @@ class DriveUploader:
                         raise UploadRetryable("Resumable upload returned no verified completion")
                     known = _id(result.get("id"))
                     self._reserved_media_retry = True
-                    item = self._verify(known, parent, name, owner, mime, file["size"])
+                    item = self._verify(known, parent, name, owner, mime, file["size"],
+                                        reader_emails=reader_emails)
                     op.update(id=known, state="verified", verified_at=time.time(),
                               url=item.get("url"), verification="metadata_and_checksum")
                     save()
@@ -706,11 +754,12 @@ class DriveUploader:
                     save()
                     if file and not template and file_identity(source / file["name"]) != {key: file[key] for key in ("size", "sha256")}:
                         raise UploadNeedsReview("Local source changed during upload; its Drive copy needs review")
-                item = self._verify(known, parent, name, owner, mime, file["size"] if file and not native_doc else None)
+                item = self._verify(known, parent, name, owner, mime, file["size"] if file and not native_doc else None,
+                                    reader_emails=reader_emails)
                 verification = "metadata"
                 if native_doc and template:
                     fill_template(known, op)
-                    item = self._verify(known, parent, name, owner, mime)
+                    item = self._verify(known, parent, name, owner, mime, reader_emails=reader_emails)
                     verification = "metadata_and_template_content"
                 elif native_doc:
                     actual = native_document_text(self._call("get_document", {"document_id": known}), known)
@@ -722,10 +771,10 @@ class DriveUploader:
                 return known, item
 
             meeting_id, meeting_info = ensure("meeting", company_id, folder_name, FOLDER_MIME)
-            ancestors[meeting_id] = (company_id, folder_name)
+            ancestors[meeting_id] = (company_id, folder_name, reader_emails)
             label = "Recordings" if stage == "archive" else "Notes"
             stage_id, stage_info = ensure("stage", meeting_id, label, FOLDER_MIME)
-            ancestors[stage_id] = (meeting_id, label)
+            ancestors[stage_id] = (meeting_id, label, reader_emails)
             uploaded = []
             for file in files:
                 remote_name = document_title if file["mime_type"] == DOCUMENT_MIME else file["name"]
@@ -734,10 +783,7 @@ class DriveUploader:
                                      verification=journal["operations"]["file:" + file["name"]]["verification"],
                                      reconciled=journal["operations"]["file:" + file["name"]].get("reconciled", False)))
             self.guard()
-            self._private(self._metadata(self.root_id), owner, mime=FOLDER_MIME)
-            self._verify(company_id, self.root_id, route["company_name"], owner, FOLDER_MIME)
-            self._verify(meeting_id, company_id, folder_name, owner, FOLDER_MIME)
-            self._verify(stage_id, meeting_id, label, owner, FOLDER_MIME)
+            validate_ancestors()
             receipt = {"job": job, "stage": stage, "idempotency_key": job + ":" + stage,
                        "destination": stage_info.get("url") or stage_id, "folder_id": stage_id,
                        "meeting_folder_id": meeting_id, "meeting_folder_name": folder_name,

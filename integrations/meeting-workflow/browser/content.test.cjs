@@ -7,18 +7,20 @@ const vm = require('node:vm');
 const detectorSource = fs.readFileSync(path.join(__dirname, 'detector.js'), 'utf8');
 const contentSource = fs.readFileSync(path.join(__dirname, 'content.js'), 'utf8');
 const warningSource = fs.readFileSync(path.join(__dirname, 'recording-warning.js'), 'utf8');
+const activitySource = fs.readFileSync(path.join(__dirname, 'speaker-activity.js'), 'utf8');
 const clone = value => JSON.parse(JSON.stringify(value));
 
 // Run both shipped scripts, including the actual scan and page lifecycle,
 // against DOM-shaped controls matching the observed muted Meet toolbar.
-function harness(initialFailure = null, initialURL = 'https://meet.google.com/abc-defg-hij', withWarning = false) {
+function harness(initialFailure = null, initialURL = 'https://meet.google.com/abc-defg-hij', withWarning = false, withActivity = false) {
   let sequence = 0;
   let timerSequence = 0;
   const timers = new Map();
   const listeners = new Map();
   const attempts = [];
   const delivered = [];
-  const state = { failure: initialFailure, toolbar: true, now: 0, healthState: 'not-recording', people: [], rosterReads: 0 };
+  const state = { failure: initialFailure, toolbar: true, now: withActivity ? 1700000000000 : 0, healthState: 'not-recording', people: [], rosterReads: 0,
+    activity: { source: 'google-meet-dom-v1', participants: [{ key: 'private-key', name: 'Casey Rivera', self: false }], active: ['private-key'] } };
   const warningNodes = [];
   const mountedWarnings = [];
   const observer = { active: false, disconnects: 0, callback: null };
@@ -96,6 +98,10 @@ function harness(initialFailure = null, initialURL = 'https://meet.google.com/ab
   });
   vm.runInContext(detectorSource, context, { filename: 'detector.js' });
   if (withWarning) vm.runInContext(warningSource, context, { filename: 'recording-warning.js' });
+  if (withActivity) {
+    vm.runInContext(activitySource, context, { filename: 'speaker-activity.js' });
+    context.QuillSpeakerActivity.read = () => state.activity;
+  }
   vm.runInContext(contentSource, context, { filename: 'content.js' });
   return {
     state, observer, attempts, delivered, timers, listeners, location, warningNodes, mountedWarnings,
@@ -301,4 +307,47 @@ test('an unrecognized new call never inherits the prior meeting suppression iden
   const newHealth = h.delivered.filter(message => message.type === 'quill-recording-health').at(-1);
   assert.notEqual(newHealth.meeting, oldMeeting);
   assert.ok(!h.delivered.some(message => message.type === 'quill-meeting' && message.meeting === newHealth.meeting));
+});
+
+test('speaker sampling preserves heartbeat cadence and clears history across unknown and route changes', async () => {
+  const h = harness(null, undefined, false, true);
+  const activityTimer = [...h.timers.values()].find(timer => timer.delay === 500);
+  const heartbeat = [...h.timers.values()].find(timer => timer.delay === 5000);
+  assert.ok(activityTimer);
+  h.state.now += 500; activityTimer.callback();
+  assert.equal(h.delivered.length, 1, 'sampling does not create recording/health heartbeats');
+  heartbeat.callback();
+  assert.equal(h.delivered.at(-1).speakerActivity.samples.length, 2);
+  assert.ok(!JSON.stringify(h.delivered).includes('private-key'));
+  h.state.toolbar = false; h.state.now += 500; heartbeat.callback();
+  assert.equal(h.delivered.at(-1).state, 'unknown');
+  assert.ok(!h.delivered.at(-1).speakerActivity);
+  activityTimer.callback();
+  h.state.toolbar = true; h.state.now += 500; heartbeat.callback();
+  assert.equal(h.delivered.at(-1).speakerActivity.samples.length, 1);
+  h.location.href = 'https://meet.google.com/xyz-uvwx-rst';
+  h.state.now += 10; activityTimer.callback(); heartbeat.callback();
+  assert.equal(h.delivered.at(-1).speakerActivity.samples.length, 1);
+  h.pagehide(); await h.flush();
+  assert.ok(!h.delivered.at(-1).speakerActivity);
+  assert.ok(![...h.timers.values()].some(timer => timer.delay === 500));
+});
+
+test('speaker sampling retires with extension invalidation without issuing Stop or leave', () => {
+  const h = harness(null, undefined, false, true);
+  const heartbeat = [...h.timers.values()].find(timer => timer.delay === 5000);
+  h.state.failure = { kind: 'sync', message: 'Extension context invalidated.' };
+  h.state.now += 500; heartbeat.callback();
+  assertRetired(h);
+  assert.ok(h.attempts.every(message => message.state === 'joined'));
+});
+
+test('frequent unrelated mutations retain the latest bounded sample without duplicating timestamps', () => {
+  const h = harness(null, undefined, false, true);
+  const activityTimer = [...h.timers.values()].find(timer => timer.delay === 500);
+  const heartbeat = [...h.timers.values()].find(timer => timer.delay === 5000);
+  h.state.now += 100; activityTimer.callback(); heartbeat.callback();
+  assert.equal(h.delivered.at(-1).speakerActivity.samples.length, 1);
+  h.state.now += 400; activityTimer.callback(); heartbeat.callback();
+  assert.equal(h.delivered.at(-1).speakerActivity.samples.length, 2);
 });

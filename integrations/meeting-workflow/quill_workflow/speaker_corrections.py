@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 import time
 
-from .speaker_identity import attach, empty_bundle, validate_bundle, validate_corrections
+from .speaker_identity import MAX_BUNDLE_BYTES, attach, empty_bundle, validate_bundle, validate_corrections
 from .transcript_sources import effective_attributions, render_reviewed_transcript, transcript_digest
 
 
@@ -18,7 +18,7 @@ def _digest(value):
 
 def load_bundle(sources, job, transcript, notes=None):
     bundle = copy.deepcopy((notes or {}).get("_speaker_identity") or empty_bundle(transcript))
-    saved = sources.json(f"results/{job}/speakers/review.json", 500_000)
+    saved = sources.json(f"results/{job}/speakers/review.json", MAX_BUNDLE_BYTES)
     if saved is not None:
         validate_bundle(saved, transcript)
         bundle = saved
@@ -104,6 +104,8 @@ class SpeakerCorrections:
             return {"job": job, "revision": revision, "speakers": result,
                     "notes_status": status.get("state"), "notes_error": status.get("error"),
                     "candidates": bundle["context"]["candidates"],
+                    "local_participants": [dict(person) for person in
+                        bundle["context"].get("timeline", {}).get("participants", []) if person["self"]],
                     "unassigned_segments": sum(s["speaker"] == "unknown" for s in transcript["segments"])}
         except (OSError, ValueError):
             return None

@@ -132,7 +132,7 @@ class ReviewServerTests(unittest.TestCase):
         self.assertIn("Meeting &amp; action items", body)
         self.assertNotIn("<script>", body)
         self.assertNotIn("<img ", body)
-        self.assertIn("Nothing is shared with participants", body)
+        self.assertIn("Drive files inherit folder access.", body)
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertEqual(headers["Referrer-Policy"], "strict-origin")
         self.assertIn("frame-ancestors 'none'", headers["Content-Security-Policy"])
@@ -186,6 +186,20 @@ class ReviewServerTests(unittest.TestCase):
         self.assertEqual(self.decide(company_id="general")[0], 303)
         self.assertEqual(self.reviews.get("test-job")["approved_route"]["drive_folder_id"],
                          "folder-general-001")
+
+    def test_shared_destination_shows_viewer_count_before_filing(self):
+        sales = {"id": "sales", "name": "Agency / Sales", "drive_folder_id": "folder-sales-001",
+                 "drive_folder_path": [{"name": "Agency", "drive_folder_id": "folder-agency-001"},
+                                       {"name": "Sales", "drive_folder_id": "folder-sales-001"}],
+                 "drive_reader_emails": ["viewer1@example.com", "viewer2@example.com"]}
+        self.reviews.propose("sales-job", self.transcript, self.companies + [sales],
+                             dict(self.suggestion, company_id="sales"))
+        status, _, body = self.detail("sales-job")
+        self.assertEqual(status, 200)
+        self.assertIn("Suggested folder:</strong> Agency / Sales (2 viewers)", body)
+        self.assertIn('<option value="sales">Agency / Sales (2 viewers)</option>', body)
+        self.assertIn("Drive files inherit folder access.", body)
+        self.assertNotIn("viewer1@example.com", body)
 
     def test_post_requires_exact_host_and_origin(self):
         body = urlencode({"job": "test-job", "revision": self.record["revision"], "company_id": "health", "action": "approve"})

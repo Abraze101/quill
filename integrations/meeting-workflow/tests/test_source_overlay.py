@@ -91,6 +91,27 @@ class SourceOverlayTests(unittest.TestCase):
             overlay.export(self.repo, self.bundle)
         self.assertFalse(self.bundle.exists())
 
+    def test_checkpoint_replays_quill_plugin_and_excludes_local_plugin_data(self):
+        sources = ('.agents/plugins/marketplace.json', 'plugins/quill/.codex-plugin/plugin.json',
+                   'plugins/quill/skills/quill/SKILL.md')
+        for name in sources:
+            self.write(name, b'public source')
+        self.git('add', *sources)
+        self.commit()
+        self.write(sources[-1], b'updated public source')
+        excluded = ('.agents/plugins/local.json', 'plugins/quill-personal/README.md',
+                    'plugins/quill/.env.local', 'plugins/quill/config.json',
+                    'plugins/quill/recordings/transcript.md')
+        for name in excluded:
+            self.write(name, b'PRIVATE PLUGIN FIXTURE')
+        manifest = overlay.export(self.repo, self.bundle)
+        overlay.replay(self.bundle, self.target)
+        for name in sources:
+            self.assertEqual((self.target / name).read_bytes(), (self.repo / name).read_bytes())
+        self.assertEqual(set(manifest['excluded_untracked_paths']), set(excluded))
+        self.assertFalse(any(b'PRIVATE PLUGIN FIXTURE' in obj.read_bytes()
+                             for obj in (self.bundle / 'objects').iterdir()))
+
     def test_symlink_source_is_not_followed(self):
         external = self.base / 'external'
         external.write_text('PRIVATE FIXTURE')

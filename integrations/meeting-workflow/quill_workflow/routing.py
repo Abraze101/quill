@@ -13,6 +13,8 @@ import sqlite3
 import time
 import uuid
 
+from .recipient_suggestions import MAX_RECIPIENTS, _email
+
 
 class RoutingError(ValueError):
     pass
@@ -37,13 +39,64 @@ def _job(value):
     return value
 
 
+def validate_folder_path(path, folder, name):
+    """Validate an explicit company-to-leaf chain; the Meetings root is implicit."""
+    if not isinstance(path, list) or not 2 <= len(path) <= 8:
+        raise RoutingError("A subfolder path needs between two and eight named folders")
+    result, seen = [], set()
+    for part in path:
+        if not isinstance(part, dict) or set(part) != {"name", "drive_folder_id"}:
+            raise RoutingError("Subfolder path entries need a name and Drive folder ID")
+        identity, label = part["drive_folder_id"], part["name"]
+        if (not isinstance(identity, str) or not re.fullmatch(r"[A-Za-z0-9_-]{10,200}", identity)
+                or identity in seen):
+            raise RoutingError("Subfolder path IDs must be valid and unique")
+        if (not isinstance(label, str) or not label or label != label.strip() or len(label) > 200
+                or "/" in label or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in label)):
+            raise RoutingError("Subfolder path names must be plain bounded names")
+        seen.add(identity)
+        result.append({"name": label, "drive_folder_id": identity})
+    if result[-1]["drive_folder_id"] != folder or " / ".join(part["name"] for part in result) != name:
+        raise RoutingError("The destination must match its complete named folder path")
+    return result
+
+
+def route_folder_path(route):
+    """Resolve old direct-company routes and new explicit nested routes."""
+    folder, name = route.get("drive_folder_id"), route.get("company_name")
+    if "drive_folder_path" in route:
+        return validate_folder_path(route["drive_folder_path"], folder, name)
+    return [{"name": name, "drive_folder_id": folder}]
+
+
+def route_reader_emails(route):
+    """Return the exact named viewers approved for a nested filing destination."""
+    if "drive_reader_emails" not in route:
+        return []
+    validate_folder_path(route.get("drive_folder_path"), route.get("drive_folder_id"),
+                         route.get("company_name", route.get("name")))
+    emails = route["drive_reader_emails"]
+    if not isinstance(emails, list) or not 1 <= len(emails) <= MAX_RECIPIENTS:
+        raise RoutingError(f"Configure between one and {MAX_RECIPIENTS} named folder viewers")
+    readers = set()
+    for email in emails:
+        if not _email(email) or "*" in email:
+            raise RoutingError("Each folder viewer needs a complete individual email address")
+        normalized = email.casefold()
+        if normalized in readers:
+            raise RoutingError("Folder viewer addresses must be unique")
+        readers.add(normalized)
+    return sorted(readers)
+
+
 def validate_companies(companies):
-    """Return a canonical allowlist. Folder names and paths are never accepted."""
+    """Return a canonical allowlist bound to explicit Drive folder IDs."""
     if not isinstance(companies, list) or not 1 <= len(companies) <= 100:
         raise RoutingError("Configure between one and 100 company folders")
     normalized, ids, folders = [], set(), set()
     for company in companies:
-        if not isinstance(company, dict) or set(company) - {"id", "name", "drive_folder_id", "description", "aliases"}:
+        if not isinstance(company, dict) or set(company) - {
+                "id", "name", "drive_folder_id", "description", "aliases", "drive_folder_path", "drive_reader_emails"}:
             raise RoutingError("Company entries contain unsupported fields")
         company_id, name, folder = (company.get(key) for key in ("id", "name", "drive_folder_id"))
         description = company.get("description", "")
@@ -74,6 +127,10 @@ def validate_companies(companies):
         # existing maps. Reordering or repeating aliases does not revise a map.
         if aliases:
             entry["aliases"] = aliases
+        if "drive_folder_path" in company:
+            entry["drive_folder_path"] = validate_folder_path(company["drive_folder_path"], folder, name)
+        if "drive_reader_emails" in company:
+            entry["drive_reader_emails"] = route_reader_emails(company)
         normalized.append(entry)
     return sorted(normalized, key=lambda company: company["id"])
 
@@ -93,6 +150,8 @@ def preserves_company_map(current, frozen):
                                for key in ("id", "name", "drive_folder_id", "description")):
             return False
         if not set(company.get("aliases", [])).issubset(live.get("aliases", [])):
+            return False
+        if any(live.get(key) != company.get(key) for key in ("drive_folder_path", "drive_reader_emails")):
             return False
     return True
 
@@ -182,9 +241,17 @@ def _names(company):
 
 
 def _mentions(text, companies):
-    return {company["id"] for company in companies
-            if any(re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", text, re.I)
-                   for name in _names(company))}
+    matches = [(company, match.span()) for company in companies for name in _names(company)
+               for match in re.finditer(r"(?<!\w)" + re.escape(name) + r"(?!\w)", text, re.I)]
+    # The company name inside a specific descendant label is one destination,
+    # not competing ownership. A separate mention or identical shared alias
+    # still counts and cannot silently choose the leaf.
+    return {company["id"] for company, (start, end) in matches if not any(
+        other["id"] != company["id"] and left <= start and end <= right
+        and (left, right) != (start, end)
+        and company["drive_folder_id"] in {part["drive_folder_id"]
+            for part in other.get("drive_folder_path", [])[:-1]}
+        for other, (left, right) in matches)}
 
 
 def _explicit_statement(text, company, kind):
@@ -260,8 +327,13 @@ def explicit_filing_basis(suggestion, transcript, companies):
 def _route(companies, company_id):
     for company in companies:
         if company["id"] == company_id:
-            return {"company_id": company_id, "company_name": company["name"],
-                    "drive_folder_id": company["drive_folder_id"]}
+            route = {"company_id": company_id, "company_name": company["name"],
+                     "drive_folder_id": company["drive_folder_id"]}
+            if "drive_folder_path" in company:
+                route["drive_folder_path"] = [dict(part) for part in company["drive_folder_path"]]
+            if "drive_reader_emails" in company:
+                route["drive_reader_emails"] = list(company["drive_reader_emails"])
+            return route
     raise RoutingError("Choose a company from the frozen folder allowlist")
 
 

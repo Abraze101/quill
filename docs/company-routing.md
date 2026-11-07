@@ -5,7 +5,7 @@ optional General category. Notes generation, category suggestions and Drive fili
 start disabled until configured. Folder review is the default. The optional
 explicit-company policy below lets a new meeting file automatically when its
 transcript directly establishes the destination. [Notes sharing](notes-sharing.md)
-always requires separate approval after private filing.
+with attendees requires separate approval after filing.
 
 The completion worker can ask the authenticated Codex CLI to suggest a filing category for a completed meeting. Categories can represent companies or General. The model receives the transcript and configured category names, descriptions, and aliases. It does not receive Drive folder IDs. The worker resolves a category against a fixed folder list and saves a durable review. Quill only displays the pending count and opens the review page. Internal configuration and CLI fields retain their existing company names for compatibility.
 
@@ -43,6 +43,63 @@ For a new installation, add a `route` object to `~/.config/quill/workflow.json` 
 
 Both notes and route must be enabled for new jobs to reach a routing decision. Start with `review_required: true`. A company mentioned as a customer, competitor, or example is insufficient ownership evidence. Missing descriptions require explicit company ownership in the transcript. Unclear and multi-company meetings wait for a choice even if automatic approval is later enabled.
 
+## Company subfolders
+
+Use one private master folder, such as `Quill Recordings`, with each company and
+General directly beneath it. Set both Drive outputs' `meetings_root_id` to that
+master folder. Subfolders are optional destinations that you define per company.
+Keep the existing company entry for calls whose subtype is unclear and for jobs
+already queued against that destination.
+
+For a subfolder, add an entry such as this to `route.companies`:
+
+```json
+{
+  "id": "example-company-sales",
+  "name": "Example company / Sales Meetings",
+  "drive_folder_id": "REPLACE_WITH_SALES_FOLDER_ID",
+  "description": "Sales calls with this company's prospects or clients.",
+  "aliases": ["Example company sales meetings"],
+  "drive_folder_path": [
+    {
+      "name": "Example company",
+      "drive_folder_id": "REPLACE_WITH_COMPANY_FOLDER_ID"
+    },
+    {
+      "name": "Sales Meetings",
+      "drive_folder_id": "REPLACE_WITH_SALES_FOLDER_ID"
+    }
+  ]
+}
+```
+
+The path contains two to eight folders, starting with the company and ending at
+the destination. Omit the master folder. Names must match Drive exactly; the
+entry's name joins them with ` / `, and its folder ID matches the final path ID.
+The connected account must own each folder. Each path entry must sit directly
+under the preceding folder. Account setup and uploads verify the full chain.
+
+By default, only the owner can access filed meetings. To use an existing subfolder
+with named viewers, add `"drive_reader_emails": ["viewer@example.com"]` to that
+subfolder’s route entry. List every existing viewer. Drive gives those viewers
+read access to recordings, notes and transcripts filed there. The master folder
+and the ancestors above the shared subfolder must still be private. A change to
+the path, viewer list or access roles stops filing for review.
+
+Use aliases specific to the subfolder. A generic company mention does not establish
+whether a call belongs in Sales Meetings or Internal Meetings. Under the explicit
+filing policy below, a statement such as “Please file this meeting under Example
+company sales meetings” can establish the specific destination. Contextual guesses
+and aliases shared by multiple destinations stay in review.
+
+Adding a subfolder affects newly queued meetings. It does not move existing Drive
+files or change older jobs, choices, upload journals or receipts. The complete
+path is frozen with each new job and bound to its approval and upload identity.
+Changing a saved path requires a new review. The model receives only destination
+labels, descriptions and aliases; folder IDs remain local.
+
+## Filing policy and review
+
 To file clear company meetings automatically, set `auto_file_explicit_companies: true` and keep `review_required: true`. New Codex suggestions include a verbatim transcript segment identifying ownership or an explicit filing request. The worker requires high confidence, one allowed company, an exact full-segment quote, and affirmative wording such as “This meeting is for Example company” or “Please file this meeting under Example company.” Configured aliases resolve only to their existing category. The model never chooses a Drive folder ID.
 
 Each company can have an optional `aliases` list for spelling variants found in
@@ -57,7 +114,7 @@ in review.
 
 The worker checks the surrounding segments and competing ownership statements. Negations, hypothetical or quoted speech, customer/vendor references, model-directed instructions, ambiguous names, and unsupported phrasing stay in review. General also stays in review. A high-confidence contextual guess alone cannot bypass review in this mode. The saved decision retains the exact supporting quote and marks its source as `automatic_explicit`. This policy is intentionally conservative: a clear meeting may still need a folder choice when its transcript lacks a supported direct statement.
 
-The setting is frozen when a meeting enters the queue. Enabling it affects future jobs; it does not release existing reviews, reclassify older meetings, or change a previous choice. Schema-version-1 suggestions remain valid for review. The older `review_required: false` broad high-confidence policy remains compatible when explicit-company mode is off; enabling explicit-company mode always applies the stricter evidence check. Automatic private filing never approves attendee sharing.
+The setting is frozen when a meeting enters the queue. Enabling it affects future jobs; it does not release existing reviews, reclassify older meetings, or change a previous choice. Schema-version-1 suggestions remain valid for review. The older `review_required: false` broad high-confidence policy remains compatible when explicit-company mode is off; enabling explicit-company mode always applies the stricter evidence check. Attendee sharing still requires a separate approval.
 
 An optional entry with `id: "general"` and `name: "General"` supports personal, learning, networking and broader planning meetings that do not belong to one company. Give it its own Drive folder ID and a description of that scope. Codex requires transcript evidence for the broader purpose. It must still abstain when context is missing or ownership is unclear; General is not an automatic fallback. A company that clearly owns the work takes precedence. General uses the same meeting subfolders, notes/transcript document, recording archive and approval flow as the company folders.
 
@@ -83,7 +140,7 @@ The worker uses `~/.local/state/quill/workflow` by default. Custom state/config 
 
 A durable deletion record stops further processing, retries and sharing for every queue job tied to that recording. Existing Drive files, shared copies and permissions stay unchanged. Original task receipts, upload journals and removal receipts remain available for audit, including any cloud operation whose result was uncertain when stopped. Restoring files from Trash does not re-enable processing. If a Trash move stops partway through, the meeting shows **Removal needs attention** and offers **Retry local removal…**; the files remain recoverable and processing stays stopped. Recovery wrappers in Trash are named `Quill - Recording - …` or `Quill - Processing copies - …` and contain the original named folders.
 
-Closing the page preserves pending reviews. The page expires after 30 minutes and can be opened again. It binds only to loopback, uses an unpredictable URL, escapes meeting content, and checks form origin and review revision. Folder approval does not grant anyone access. Sharing requires approval of the exact copy, recipients and view-only access.
+Closing the page preserves pending reviews. The page expires after 30 minutes and can be opened again. It binds only to loopback, uses an unpredictable URL, escapes meeting content, and checks form origin and review revision. Filed items inherit the chosen folder’s access. Attendee sharing requires approval of the notes-only copy and its recipients.
 
 The page uses `Referrer-Policy: strict-origin` so native form submissions retain their local `Origin` while excluding the token path from referrers. The former `no-referrer` policy made Chrome send `Origin: null`, so legitimate choices were rejected. A Chrome test reproduced that rejection and verified saving after the fix. Exact Host/Origin checks still reject missing, null, foreign, or duplicate origins.
 

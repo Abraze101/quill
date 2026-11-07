@@ -234,7 +234,8 @@ class _Document:
         return _xml(self.root)
 
 
-def render_document(notes, transcript, metadata, route, timezone_name="UTC", notes_layout="sources"):
+def render_document(notes, transcript, metadata, route, timezone_name="UTC", notes_layout="sources", *,
+                    participants_first=True):
     """Return deterministic DOCX bytes, ordered expected text, and display title."""
     if notes_layout not in ("sources", "clean"):
         raise ValueError("Document notes layout must be sources or clean")
@@ -253,7 +254,7 @@ def render_document(notes, transcript, metadata, route, timezone_name="UTC", not
     ended = _date(metadata.get("ended"), zone)
     if ended < started:
         raise ValueError("Meeting end precedes its start")
-    title = meeting_title(notes, transcript) or "Meeting notes and transcript"
+    title = meeting_title(notes, transcript, participants_first=participants_first) or "Meeting notes and transcript"
     segments = transcript["segments"]
     doc = _Document()
     doc.paragraph(title, "Title")
@@ -326,10 +327,12 @@ def render_document(notes, transcript, metadata, route, timezone_name="UTC", not
     return buffer.getvalue(), doc.text, title
 
 
-def build_document(notes, transcript, metadata, route, output_dir, timezone_name="UTC", notes_layout="sources"):
+def build_document(notes, transcript, metadata, route, output_dir, timezone_name="UTC", notes_layout="sources", *,
+                   participants_first=True):
     """Save immutable export and digest manifest; retries refuse changed inputs."""
-    from .pipeline import atomic_json
-    payload, text, title = render_document(notes, transcript, metadata, route, timezone_name, notes_layout)
+    from .pipeline import atomic_json, read_json
+    payload, text, title = render_document(notes, transcript, metadata, route, timezone_name, notes_layout,
+                                         participants_first=participants_first)
     output_dir = Path(output_dir)
     if output_dir.is_symlink():
         raise ValueError("Document output must not be a symlink")
@@ -356,6 +359,19 @@ def build_document(notes, transcript, metadata, route, output_dir, timezone_name
         manifest["notes_layout"] = notes_layout
     if path.is_symlink() or manifest_path.is_symlink():
         raise ValueError("Document outputs must not be symlinks")
+    if participants_first and (path.exists() or manifest_path.exists()):
+        # Keep a pending export's original title and byte identity. Recursing
+        # through the normal checks still rejects every changed input/layout.
+        legacy_payload, _, legacy_title = render_document(
+            notes, transcript, metadata, route, timezone_name, notes_layout, participants_first=False)
+        saved_manifest = read_json(manifest_path) if manifest_path.exists() else None
+        if manifest_path.exists() and not isinstance(saved_manifest, dict):
+            raise ValueError("Combined document provenance needs review")
+        if legacy_title != title and (
+                saved_manifest is not None and saved_manifest.get("title") == legacy_title
+                or not manifest_path.exists() and path.read_bytes() == legacy_payload):
+            return build_document(notes, transcript, metadata, route, output_dir, timezone_name,
+                                  notes_layout, participants_first=False)
     if path.exists() and path.read_bytes() != payload:
         raise ValueError("Combined document inputs changed; an explicit revision is required")
     if manifest_path.exists() and json.loads(manifest_path.read_text()) != manifest:

@@ -4,7 +4,7 @@ Open Quill's menu and choose **Review meetings…**. The library has **All meeti
 **Needs attention**, folder filters and **Search meetings**. Select a meeting to
 open its **Notes**, then choose **Share notes…** when available. Completed meetings
 filed as native Google Docs have a separate **Share meeting notes** review.
-Sharing is optional; recording, transcription and private filing do not wait for it.
+Recording, transcription and filing can finish before you decide whether to share notes with attendees.
 
 **Transcript** and **Recording** remain separate tabs in the meeting detail.
 **Meetings** returns to the library. Completed or dismissed sharing reviews use
@@ -21,7 +21,7 @@ file or share a meeting.
    receive the notes. Invitees are not confirmed attendees, and names in the
    transcript never become guessed email addresses.
 2. Choose **Prepare private sharing copy**. This creates a separate notes-only
-   Google Doc in the meeting's Notes folder. Choose **Refresh status** when
+   Google Doc in the meeting’s Notes folder for a private filing. For a filing with approved folder viewers, Quill prepares the attendee copy in the private parent of that shared destination. Choose **Refresh status** when
    preparation finishes; the same meeting's sharing review stays selected.
 3. Choose **Open notes-only copy** and check its notes and listed recipients.
    **Change recipients** opens the editable addresses; **Save recipients for
@@ -32,9 +32,9 @@ The shared copy includes the meeting title, date, participants, summary,
 decisions, next steps, topics and open questions. It omits the transcript,
 recording links and internal sales-analysis sections. Review the text: a summary
 can still contain information that should remain private. The existing combined
-notes/transcript document and recordings retain their private permissions.
+notes/transcript document and recordings use the filing folder’s permissions.
 
-**Keep private** dismisses an unsent review. A prepared private copy remains in
+**Skip attendee sharing** dismisses an unsent review. A prepared private copy remains in
 Drive; dismissing a review does not delete it. After sharing starts, the review
 shows confirmed recipient access and any unfinished checks. Manage existing
 access in Google Drive if you need to revoke it.
@@ -104,7 +104,7 @@ sharing action becomes available. A source change invalidates the saved lookup.
 ## Approval and recovery
 
 Sharing has a separate local database, `sharing.sqlite3`, and a separate restricted
-Drive transport. The private filing worker cannot grant access. Sharing allows
+Drive transport. The filing worker relies on inherited folder permissions. Sharing allows
 only individual reader permissions on the saved notes-only copy. There are no
 public, company-wide or editing permissions in this workflow.
 

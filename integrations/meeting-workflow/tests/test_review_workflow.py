@@ -99,15 +99,20 @@ class ReviewWorkflowTests(unittest.TestCase):
             start.assert_not_called()
         self.assertEqual(set(self.statuses().values()), {"held"})
 
-    def approved_resume_fixture(self):
+    def approved_resume_fixture(self, *, named=False):
         transcript = self.queue.state / "recordings" / self.job / "transcript.json"
         source = {"segments": [{"start_ms": 0, "text": "Synthetic meeting for company One."}]}
+        if named:
+            source["segments"][0]["text"] = "Alex joined the synthetic meeting for company One."
         atomic_json(transcript, source)
         result = self.queue.state / "results" / self.job
         receipt = {"input_sha256": hashlib.sha256(transcript.read_bytes()).hexdigest(), "settings_sha256": "fixture"}
         atomic_json(result / "notes-receipt.json", receipt)
         atomic_json(result / "notes/provenance.json", receipt)
         notes = {"schema_version": 1, "summary": [{"text": "Synthetic meeting.", "evidence": [0]}]}
+        if named:
+            notes["meeting_title"] = {"text": "Planning", "evidence": [0],
+                                      "participants": [{"name": "Alex", "evidence": [0]}]}
         atomic_json(result / "notes/notes.json", notes)
         (result / "notes/source-transcript.json").write_bytes(transcript.read_bytes())
         (result / "notes/notes.md").write_text(render_notes(notes, source))
@@ -147,6 +152,24 @@ class ReviewWorkflowTests(unittest.TestCase):
             self.assertEqual(workflow.resume_waiting_work(record, self.config_path, self.queue.state), ["route", "archive"])
             start.assert_called_once()
         self.assertEqual(self.queue.tasks(self.job), pending)
+
+    def test_resume_accepts_exact_topic_first_notes_but_rejects_changed_body(self):
+        record = self.approved_resume_fixture(named=True)
+        directory = self.queue.state / "results" / self.job / "notes"
+        notes = json.loads((directory / "notes.json").read_text())
+        transcript = json.loads((directory / "source-transcript.json").read_text())
+        old_markdown = render_notes(notes, transcript, participants_first=False)
+        self.assertTrue(old_markdown.startswith("# Planning - Alex\n"))
+        path = directory / "notes.md"
+        path.write_text(old_markdown)
+        self.assertEqual(workflow.resumable_stages(record, self.config_path, self.queue.state),
+                         ["route", "archive", "publish"])
+        self.assertEqual(path.read_text(), old_markdown)
+        path.write_text(old_markdown.replace("Synthetic meeting.", "Unpublished changes."))
+        with self.assertRaisesRegex(WorkflowError, "source references need review"), \
+                patch.object(workflow, "start_worker") as start:
+            workflow.resume_waiting_work(record, self.config_path, self.queue.state)
+        start.assert_not_called()
 
     def test_added_category_keeps_existing_resume_choices_and_explicit_release(self):
         record = self.approved_resume_fixture()

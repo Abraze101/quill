@@ -30,19 +30,55 @@ alone do not identify a voice.
 
 For new diarized meetings using the configured Codex notes adapter, a separate
 speaker review runs before notes generation. It must account for every separated
-voice with a `confirmed`, `suggested` or `unresolved` result, supporting references
+voice with a `confirmed`, `matched`, `suggested` or `unresolved` result, supporting references
 and a short reason. It considers introductions, direct address, replies and saved
 visible participant names. A strongly matched calendar invitation can supply
 names and email candidates through the explicitly connected Google account.
 Ambiguous invitations supply no automatic identities; an unavailable calendar
 does not block the remaining evidence review.
 
+### Live Meet speaking activity
+
+The Chrome extension also collects visible Google Meet participant names and
+their speaking-indicator changes while joined. It sends bounded samples to the
+local app; it does not read captions, chat, audio, or profile photos. The app
+keeps only evidence belonging to the recording's meeting/tab and writes a
+`speaker-activity.json` sidecar. Its timestamps follow the audio's startup offset
+and pause cuts. Gaps, reloads, conflicting names, and clock jumps break continuity
+rather than extending the last speaker across missing time.
+
+The review compares this timeline with separated speech. Automatic remote naming
+requires at least three distinct turns, three seconds of supporting activity,
+80% coverage of the voice's speech, and 95% support for the same participant.
+Overlapping speech, duplicate display names, multiple voices on one device, or
+truncated evidence prevent an automatic match. The validator repeats this check;
+the model cannot claim a platform match without the saved evidence. Clear spoken
+introductions and user corrections take precedence.
+
+An explicit **You** label is retained as the local meeting identity. The Speakers
+tab shows it separately from voice names. This identifies the signed-in meeting
+participant, not every voice on a shared microphone. Being the calendar organizer
+or owning the connected Drive account does not substitute for speaking evidence.
+Self-device timing can suggest a name but does not automatically name shared-mic
+voices. Remembered corrections save contact spelling, not voiceprints.
+
+This collector supports the verified Google Meet interface. Zoom browser meetings
+keep existing participant/context and introduction-based naming; live Zoom
+speaking-indicator extraction is not enabled. Missing or changed interface
+markers contribute no timing evidence. Capturing **You** currently requires that
+Meet expose the self label in its visible People panel at least once during the
+page's lifetime. Evidence coverage may also be limited by the visible layout.
+
+Older recordings without a speaking timeline retain their existing evidence;
+uploading them to Drive cannot reconstruct missing speaker timing. Invalid or
+missing sidecars do not block notes or filing.
+
 Contextual matches remain **Jamie (suggested)**. A suggestion alone cannot become
 a definite action owner or participant. An invitation with only an email remains
 an email-only candidate: Quill does not turn the address into a name. The Speakers
 tab lets the user choose that address and confirm its association with a name.
 
-Open a meeting's **Speakers** tab to see voice IDs, suggested or confirmed names,
+Open a meeting's **Speakers** tab to see voice IDs, matched, suggested or confirmed names,
 reasons and short speech samples. **Save correction** confirms a name and optional
 email for that voice; **Clear correction** removes the manual override. The user
 can explicitly assign one person to multiple voice IDs. Unseparated `unknown`
@@ -94,6 +130,11 @@ are preserved for retry reconciliation.
 Synthetic fixtures cover the shared Swift/Python introduction policies, competing
 voices, source-bound proposals, email-only candidates, manual corrections,
 reversible identity memory, notes refresh, cancellation and legacy compatibility.
+Timeline fixtures cover pause/startup alignment, shared devices, duplicate names,
+overlap, stale observations, malformed optional payloads, queue snapshots and
+bounded input handling. The current Meet marker was checked in an empty live call
+while muted, speaking and silent. A full multi-person recording still needs a
+listening check against the resulting transcript.
 Fake model processes exercise the runner and validation boundaries without using
 real meetings. These checks do not establish diarization or naming accuracy in
 actual calls; that still needs a listening review against the recorded speech.

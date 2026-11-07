@@ -16,7 +16,8 @@ import tempfile
 
 
 SCHEMA = 'quill-source-overlay-v1'
-ROOT_FILES = {'.gitignore', 'LICENSE', 'Package.swift', 'Package.resolved', 'README.md'}
+SOURCE_FILES = {'.gitignore', 'LICENSE', 'Package.swift', 'Package.resolved', 'README.md',
+                '.agents/plugins/marketplace.json'}
 SOURCE_DIRS = {'Sources', 'Tests', 'docs', 'integrations', 'scripts', '.issues', '.github'}
 PRIVATE_NAMES = {'auth.json', 'credentials.json', 'secrets.json', 'config.json',
                  'workflow.json', 'signing.json', 'drive-folders.json'}
@@ -41,7 +42,8 @@ def source_path(value):
     path = PurePosixPath(value)
     if path.is_absolute() or str(path) != value or any(p in ('.', '..') for p in path.parts):
         return False
-    if value not in ROOT_FILES and (len(path.parts) < 2 or path.parts[0] not in SOURCE_DIRS):
+    plugin_source = len(path.parts) > 2 and path.parts[:2] == ('plugins', 'quill')
+    if value not in SOURCE_FILES and not plugin_source and (len(path.parts) < 2 or path.parts[0] not in SOURCE_DIRS):
         return False
     return (not any(part.lower() in EXCLUDED_DIRS for part in path.parts)
             and path.name.lower() not in PRIVATE_NAMES

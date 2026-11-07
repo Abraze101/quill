@@ -15,7 +15,7 @@ import stat
 
 from .drive_upload import DOCUMENT_MIME, NATIVE_TEMPLATE_FORMAT, _hash, native_template_sha256
 from .meeting_dates import recording_timezone
-from .native_template import build_payload, note_sections
+from .native_template import build_bound_payload, note_sections
 from .capture_quality import with_summary_notice
 from .pipeline import Queue, WorkflowError, load_config, render_notes, route_settings
 from .recording_safety import RecordingSafetyHold
@@ -194,9 +194,10 @@ def _snapshot(state, config_path, job):
     _require(settings.get("meeting_timezone") == recording_timezone(metadata),
              "The meeting's recorded timezone changed")
     timezone = settings.get("meeting_timezone") or settings.get("document_timezone", "UTC")
-    private_payload = build_payload(notes, transcript, metadata, route, timezone)
     journal = read(result / "drive-publish.json")
+    _require(isinstance(journal, dict), "The saved native document journal needs review")
     identity = journal.get("identity", {})
+    private_payload = build_bound_payload(notes, transcript, metadata, route, timezone, identity)
     payload_hash = _hash(private_payload)
     files = [{"name": "native-template", "mime_type": DOCUMENT_MIME, "payload_sha256": payload_hash}]
     expected_identity = {"job": job, "stage": "publish", "idempotency_key": job + ":publish",
@@ -267,6 +268,14 @@ def _snapshot(state, config_path, job):
                     "processing_approval_sha256": _hash(approval),
                     "routing_review_sha256": _hash(review), "private_payload_sha256": payload_hash,
                     "journal_sha256": _bytes_hash(reads[result / "drive-publish.json"])}}
+    if route.get("drive_reader_emails"):
+        # A draft prepared under the filed Notes folder would already have
+        # readers. Keep attendee drafts in the private parent of the filing leaf.
+        snapshot["destination_folder_id"] = route["drive_folder_path"][-2]["drive_folder_id"]
+        snapshot["filed_access"] = {
+            "folders": [route["drive_folder_id"], saved["meeting_folder_id"], destination],
+            "readers": list(route["drive_reader_emails"]),
+        }
     if account_link_id is not None:
         snapshot["account_link_id"] = account_link_id
     # Detect changes while assembling the preview, including a withdrawn

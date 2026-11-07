@@ -364,7 +364,7 @@ final class SettingsWindowController: NSWindowController {
         add(detail(recordingDetail), to: root)
         speakersButton.target = self
         speakersButton.action = #selector(speakersChanged)
-        speakersButton.toolTip = "Names require clear introductions. Other voices use speaker numbers; overlapping speech may remain unidentified."
+        speakersButton.toolTip = "Uses spoken introductions and supported meeting activity to name speakers. Uncertain voices keep speaker numbers."
         add(speakersButton, to: root)
 
         add(separator(), to: root)
@@ -423,7 +423,7 @@ final class SettingsWindowController: NSWindowController {
         driveRecordingsSwitch.toolTip = driveDocumentsSwitch.toolTip
         add(driveRecordingsSwitch, to: root)
         add(detail(driveRecordingsStatus), to: root)
-        add(detail(NSTextField(wrappingLabelWithString: "Files stay private until you approve sharing.")), to: root)
+        add(detail(NSTextField(wrappingLabelWithString: "Drive files inherit the selected folder’s access.")), to: root)
         add(separator(), to: root)
         add(heading("Startup"), to: root)
         loginSwitch.allowsMixedState = true

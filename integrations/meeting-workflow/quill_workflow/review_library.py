@@ -22,8 +22,9 @@ from .drive_upload import COMBINED_TEXT_FORMAT, NATIVE_TEMPLATE_FORMAT, _hash
 from .capture_quality import notice
 from .meeting_dates import recording_timezone
 from .meeting_title import meeting_title
-from .native_template import build_payload
+from .native_template import build_bound_payload
 from .pipeline import WorkflowError, render_notes
+from .routing import RoutingError, _route as configured_route, validate_companies
 from .transcript_sources import (effective_attributions, render_reviewed_transcript,
                                  segment_label, speaker_attributions)
 
@@ -186,16 +187,11 @@ def _route(sources, job, tasks, transcript_hash):
     companies = settings.get("companies")
     if not isinstance(route, dict) or not isinstance(companies, list):
         return None
-    for company in companies:
-        if not isinstance(company, dict):
-            continue
-        expected = {"company_id": company.get("id"), "company_name": company.get("name"),
-                    "drive_folder_id": company.get("drive_folder_id")}
-        if (route == expected and isinstance(route["company_id"], str)
-                and _text(route["company_name"]) and isinstance(route["drive_folder_id"], str)
-                and _ID.fullmatch(route["drive_folder_id"])):
-            return route
-    return None
+    try:
+        expected = configured_route(validate_companies(companies), route.get("company_id"))
+    except RoutingError:
+        return None
+    return route if route == expected else None
 
 
 def _transcript(sources, job):
@@ -300,6 +296,13 @@ def _matches_file(sources, relative, identity):
             and identity.get("sha256") == hashlib.sha256(value).hexdigest())
 
 
+def _matches_notes_markdown(markdown, notes, transcript):
+    """Accept exact saved notes in either title order, never other local edits."""
+    return isinstance(markdown, bytes) and any(
+        markdown == render_notes(notes, transcript, participants_first=order).encode("utf-8")
+        for order in (True, False))
+
+
 def _current_older_document(sources, job, text_format, files, identity, settings, metadata, route, notes, transcript):
     """Establish that an older upload represents the currently displayed notes.
 
@@ -338,7 +341,7 @@ def _current_older_document(sources, job, text_format, files, identity, settings
     # also reject a separately edited Markdown preview. Do not regenerate a
     # document to repair missing historical proof from this read-only view.
     markdown = sources.read(f"results/{job}/notes/notes.md")
-    return isinstance(markdown, bytes) and markdown == render_notes(notes, transcript).encode("utf-8")
+    return _matches_notes_markdown(markdown, notes, transcript)
 
 
 def _confirmed(sources, job, stage, tasks, transcript_hash, route, metadata, notes, transcript, journal):
@@ -380,13 +383,13 @@ def _confirmed(sources, job, stage, tasks, transcript_hash, route, metadata, not
         if notes is None:
             return None
         markdown = sources.read(f"results/{job}/notes/notes.md")
-        if markdown is not None and (not isinstance(markdown, bytes)
-                or markdown != render_notes(notes, transcript).encode("utf-8")):
+        if markdown is not None and not _matches_notes_markdown(markdown, notes, transcript):
             # Native upload binds structured notes. If the independent local
             # preview was edited, it must not inherit that saved status.
             return None
-        payload = build_payload(notes, transcript, metadata, route,
-                                settings.get("meeting_timezone") or settings.get("document_timezone", "UTC"))
+        payload = build_bound_payload(notes, transcript, metadata, route,
+                                      settings.get("meeting_timezone") or settings.get("document_timezone", "UTC"),
+                                      identity)
         expected_files = [{"name": "native-template", "mime_type": "application/vnd.google-apps.document",
                            "payload_sha256": _hash(payload)}]
         if (files != expected_files or identity.get("document_title") != payload["title"]

@@ -662,6 +662,8 @@ extension AppController {
 private struct AppSleepChecks {
     @MainActor
     static func main() async throws {
+        try await meetingReviewLauncherChecks()
+        try await speakerActivitySessionChecks()
         try await AppController.meetingContextIsBoundToRecording()
         try await AppController.ambiguousMeetingContextIsOmitted()
         try await AppController.warningHistoryDoesNotControlCapture()
@@ -698,6 +700,94 @@ private struct AppSleepChecks {
         try await AppController.transcriptionRetrySuppressesLateAlerts()
         print("App sleep/recovery/pause/reminder/retry/warning integration checks passed (35 production-coordinator scenarios; no devices, UI, user configuration, or external processing).")
     }
+}
+
+@MainActor
+private func speakerActivitySessionChecks() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("quill-speaker-timeline-\(UUID())")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    Fixture.reset(root: root)
+    Fixture.micCaptureOrigin = 0.5
+    Fixture.systemCaptureOrigin = 0.25
+    let session = try RecordingSession(root: root, speakerIdentificationRequested: true)
+    try await session.start()
+    let wall = Date()
+    let mono = RecordingCaptureTimeline.now
+    let context = MeetingContext(provider: "google-meet", key: "abc-defg-hij", participants: [
+        .init(name: "Jamie Rivera", isSelf: true)])
+    func signal(name: String = "Jamie Rivera", source: String = "tab-A", key: String = "abc-defg-hij",
+                from: Double = 0.5, to: Double = 4.0) -> MeetingSignal {
+        let points = stride(from: from, through: to, by: 0.5).map { value in
+            MeetingSpeakerActivity.Sample(atMS: Int64((wall.timeIntervalSince1970 + value) * 1000), active: ["p1"])
+        }
+        let activity = MeetingSpeakerActivity(source: "google-meet-dom-v1", documentID: "doc-A", participants: [
+            .init(id: "p1", name: name, isSelf: true)], samples: points)
+        return MeetingSignal(source: source, meeting: "call-A", provider: "google-meet", state: .joined,
+                             timestamp: wall.timeIntervalSince1970 + to,
+                             meetingContext: .init(provider: "google-meet", key: key, participants: context.participants),
+                             speakerActivity: activity)
+    }
+    // Tests use the real edit clock without devices or waiting through a pause.
+    precondition(session.captureTimeline.pause(at: mono + 1.5))
+    precondition(session.captureTimeline.resume(at: mono + 2.5))
+    session.observeMeetingSignal(signal(), at: wall.addingTimeInterval(4), monotonicNow: mono + 4)
+    session.observeMeetingSignal(signal(name: "Wrong Tab", source: "tab-B"), at: wall.addingTimeInterval(4), monotonicNow: mono + 4)
+    session.observeMeetingSignal(signal(name: "Wrong Call", key: "xyz-abcd-efg"), at: wall.addingTimeInterval(4), monotonicNow: mono + 4)
+    let checkpoint = try session.recoveryMetadata(transcriptionRequested: true, screenRequested: false, screenStarted: false)
+    precondition(checkpoint["speaker_activity_file"] == nil, "Crash checkpoint claimed a completed activity sidecar")
+    session.captureTimeline.stop(at: mono + 4.5)
+    try await session.finalize(transcriptionRequested: true)
+    let meta = try JSONSerialization.jsonObject(with: Data(contentsOf: session.dir.appendingPathComponent("meta.json"))) as! [String: Any]
+    precondition(meta["speaker_activity_file"] as? String == "speaker-activity.json")
+    precondition((meta["files"] as! [String: String])["speaker_activity"] == nil)
+    let saved = try JSONDecoder().decode(MeetingSpeakerTimeline.Saved.self,
+        from: Data(contentsOf: session.dir.appendingPathComponent("speaker-activity.json")))
+    precondition(saved.participants.map(\.name) == ["Jamie Rivera"])
+    precondition(saved.participants[0].isSelf)
+    precondition(saved.intervals.count == 2, "The paused interval was not cut from naming evidence")
+    let transcriptOffsets = meta["start_offset_ms"] as! [String: Int]
+    precondition(transcriptOffsets["system"] == 0)
+    precondition(abs(transcriptOffsets["mic"]! - 250) < 5)
+    precondition(abs(saved.intervals[0].startMS - Int64(transcriptOffsets["mic"]!)) < 5,
+                 "Browser activity at the microphone's first buffer must match the transcript's mic offset")
+    precondition(abs(saved.intervals[0].startMS - 250) < 5)
+    precondition(abs(saved.intervals[0].endMS - 1250) < 5)
+    precondition(abs(saved.intervals[1].startMS - 1250) < 5)
+    precondition(abs(saved.intervals[1].endMS - 2750) < 5,
+                 "Speaker timeline did not use the earliest audio origin and pause-edited timestamps")
+
+    for mode in ["disabled", "no-audio-origin", "no-mic-buffer", "no-system-buffer", "write-failure", "wall-clock-jump"] {
+        Fixture.reset(root: root)
+        if mode != "no-audio-origin" {
+            Fixture.systemCaptureOrigin = 0.25
+            Fixture.micCaptureOrigin = 0.5
+        }
+        Fixture.micHasFirstBuffer = mode != "no-mic-buffer"
+        Fixture.systemHasFirstBuffer = mode != "no-system-buffer"
+        let other = try RecordingSession(root: root, speakerIdentificationRequested: mode != "disabled")
+        try await other.start()
+        let now = Date()
+        let host = RecordingCaptureTimeline.now
+        let points = [0.0, 0.5].map {
+            MeetingSpeakerActivity.Sample(atMS: Int64((now.timeIntervalSince1970 + $0) * 1000), active: ["p1"])
+        }
+        let activity = MeetingSpeakerActivity(source: "google-meet-dom-v1", documentID: "doc-A", participants: [
+            .init(id: "p1", name: "Jamie Rivera", isSelf: true)], samples: points)
+        let message = MeetingSignal(source: "tab-A", meeting: "call-A", provider: "google-meet", state: .joined,
+            timestamp: now.timeIntervalSince1970 + 0.5, meetingContext: context, speakerActivity: activity)
+        other.observeMeetingSignal(message, at: now.addingTimeInterval(mode == "wall-clock-jump" ? 10 : 0.5),
+                                   monotonicNow: host + 0.5)
+        other.captureTimeline.stop(at: host + 1)
+        if mode == "write-failure" {
+            try FileManager.default.createDirectory(at: other.dir.appendingPathComponent("speaker-activity.json"), withIntermediateDirectories: false)
+        }
+        try await other.finalize(transcriptionRequested: true)
+        let metadata = try JSONSerialization.jsonObject(with: Data(contentsOf: other.dir.appendingPathComponent("meta.json"))) as! [String: Any]
+        precondition(metadata["speaker_activity_file"] == nil,
+                     "Unavailable activity should not be published for \(mode)")
+    }
+    print("Speaker activity session checks passed: audio origin, pauses, source ownership, disabled/missing evidence, clock jumps and optional write failures")
 }
 
 extension AppController {

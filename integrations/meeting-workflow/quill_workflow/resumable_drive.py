@@ -17,7 +17,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 import uuid
 
-from .drive_upload import UploadNeedsReview, UploadRetryable
+from .drive_upload import UploadNeedsReview, UploadRetryable, verified_permission_owner
 from .pipeline import NeedsConfiguration
 
 CHUNK_BYTES = 8 * 1024 * 1024
@@ -90,20 +90,16 @@ def _session_url(url):
     return url
 
 
-def _private(item, owner):
-    permissions, owners, capabilities = item.get("permissions"), item.get("owners"), item.get("capabilities")
-    if (item.get("trashed") is not False or item.get("shared") is not False or item.get("driveId")
+def _verify_access(item, owner, reader_emails):
+    owners, capabilities = item.get("owners"), item.get("capabilities")
+    if (item.get("trashed") is not False or item.get("driveId")
             or not isinstance(capabilities, dict) or capabilities.get("canShare") is not True
-            or not isinstance(permissions, list) or len(permissions) != 1
-            or not isinstance(owners, list) or len(owners) != 1):
-        return False
-    permission, user = permissions[0], owners[0]
-    return (isinstance(permission, dict) and isinstance(user, dict)
-            and permission.get("type") == "user" and permission.get("role") == "owner"
-            and permission.get("deleted") is not True and permission.get("pendingOwner") is not True
-            and str(permission.get("emailAddress", "")).casefold() == owner.casefold()
-            and str(user.get("emailAddress", "")).casefold() == owner.casefold()
-            and user.get("me") is True)
+            or not isinstance(owners, list) or len(owners) != 1 or not isinstance(owners[0], dict)
+            or owners[0].get("me") is not True
+            or str(owners[0].get("emailAddress", "")).casefold() != owner.casefold()):
+        raise UploadNeedsReview("The upload account could not verify ownership of the Drive destination")
+    verified_permission_owner(item.get("permissions"), item.get("shared"),
+                              owner=owner, reader_emails=reader_emails)
 
 
 def _stat_key(value):
@@ -149,7 +145,7 @@ class ResumableDriveUploader:
             raise UploadRetryable("Google Drive upload was interrupted; it will resume later")
         raise UploadNeedsReview("Google Drive rejected the resumable upload; review its saved state")
 
-    def upload(self, *, source, file, parent, name, mime, owner, operation, save, guard):
+    def upload(self, *, source, file, parent, name, mime, owner, operation, save, guard, reader_emails=()):
         source = Path(source).absolute()
         _id(parent)
         if (not isinstance(file, dict) or type(file.get("size")) is not int or file["size"] <= 0
@@ -158,10 +154,15 @@ class ResumableDriveUploader:
                 or not isinstance(name, str) or not name
                 or not isinstance(mime, str) or not re.fullmatch(r"[\w.+-]+/[\w.+-]+", mime)
                 or mime.startswith("application/vnd.google-apps.")
-                or not isinstance(owner, str) or not owner):
+                or not isinstance(owner, str) or not owner
+                or not isinstance(reader_emails, (list, tuple))
+                or any(not isinstance(email, str) for email in reader_emails)):
             raise UploadNeedsReview("The resumable upload identity is invalid")
         identity = {"source": str(source), "size": file["size"], "sha256": file["sha256"],
                     "parent": parent, "name": name, "mime": mime, "owner": owner.casefold()}
+        if reader_emails:
+            reader_emails = sorted(email.casefold() for email in reader_emails)
+            identity["reader_emails"] = reader_emails
         deadline = self.clock() + self.deadline_seconds
         guard()
         try:
@@ -251,13 +252,13 @@ class ResumableDriveUploader:
             def verify_parent():
                 response = call("GET", API + "/" + parent + "?" + urlencode({"fields": FIELDS}))
                 if response.status == 404:
-                    raise UploadNeedsReview("The private Drive upload folder is unavailable")
+                    raise UploadNeedsReview("The Drive upload folder is unavailable")
                 if response.status != 200:
                     self._failure(response)
                 item = _json(response)
-                if (item.get("id") != parent or item.get("mimeType") != "application/vnd.google-apps.folder"
-                        or not _private(item, owner)):
-                    raise UploadNeedsReview("The Drive upload folder is no longer private to the approved account")
+                if item.get("id") != parent or item.get("mimeType") != "application/vnd.google-apps.folder":
+                    raise UploadNeedsReview("Drive returned a different upload folder")
+                _verify_access(item, owner, reader_emails)
 
             def complete_if_present(required=False):
                 response = call("GET", metadata_url)
@@ -268,12 +269,13 @@ class ResumableDriveUploader:
                 if response.status != 200:
                     self._failure(response)
                 item = _json(response)
-                if (not _private(item, owner) or item.get("id") != reserved or item.get("name") != name
+                _verify_access(item, owner, reader_emails)
+                if (item.get("id") != reserved or item.get("name") != name
                         or item.get("parents") != [parent] or item.get("mimeType") != mime
                         or item.get("appProperties") != properties
                         or str(item.get("size")) != str(file["size"])
                         or item.get("md5Checksum") != checksum):
-                    raise UploadNeedsReview("The reserved Drive file does not match this private recording upload")
+                    raise UploadNeedsReview("The reserved Drive file does not match this recording upload")
                 verify_parent()
                 state.update(complete=True, offset=file["size"])
                 operation["id"] = reserved  # Only a verified complete file reaches the outer receipt.

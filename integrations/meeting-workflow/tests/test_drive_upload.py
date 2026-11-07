@@ -64,6 +64,10 @@ class FakeDrive:
             "permissions": [{"type": "user", "role": "owner", "emailAddress": self.OWNER}],
             "source_visibility_status": "not_shared",
         }
+        if parent in self.items:
+            # Google Drive gives new children their parent's effective access.
+            self.items[identity]["shared"] = self.items[parent]["shared"]
+            self.items[identity]["permissions"] = copy.deepcopy(self.items[parent]["permissions"])
         return identity
 
     @property
@@ -175,6 +179,162 @@ class DriveUploadTests(unittest.TestCase):
     def upload(self, stage="archive", meeting_title=None):
         return self.uploader.upload(self.job, stage, self.notes if stage == "publish" else self.source,
                                     self.route, self.started, meeting_title=meeting_title)
+
+    def use_nested_destination(self):
+        leaf = self.drive.add("sales_folder_123", "Sales Meetings", FakeDrive.COMPANY, FOLDER_MIME)
+        self.route = {"company_id": "acme-sales", "company_name": "Acme / Sales Meetings",
+                      "drive_folder_id": leaf, "drive_folder_path": [
+                          {"name": "Acme", "drive_folder_id": FakeDrive.COMPANY},
+                          {"name": "Sales Meetings", "drive_folder_id": leaf}]}
+        return leaf
+
+    def test_nested_destination_upload_and_retry_keep_one_meeting_under_the_leaf(self):
+        leaf = self.use_nested_destination()
+        first = self.upload()
+        written = list(self.drive.writes)
+        self.upload()
+        self.assertEqual(self.drive.writes, written)
+        meetings = [item for item in self.drive.items.values() if item["parent_ids"] == [leaf]]
+        self.assertEqual(len(meetings), 1)
+        self.assertEqual(meetings[0]["title"], self.folder_name)
+        journal = json.loads((self.root / "state" / "results" / self.job / "drive-archive.json").read_bytes())
+        self.assertEqual(journal["identity"]["route"], self.route)
+        self.assertEqual(first["meeting_folder_id"], meetings[0]["id"])
+        # Publish shares the same meeting folder and preserves the full path.
+        self.upload("publish")
+        self.assertEqual(len([item for item in self.drive.items.values() if item["parent_ids"] == [leaf]]), 1)
+
+    def shared_sales(self):
+        leaf = self.use_nested_destination()
+        self.route["drive_reader_emails"] = ["sales@example.test", "team@example.test"]
+        self.drive.items[leaf]["shared"] = True
+        self.drive.items[leaf]["permissions"].extend([
+            {"type": "user", "role": "reader", "emailAddress": "Team@example.test"},
+            {"type": "user", "role": "reader", "emailAddress": "Sales@example.test"}])
+        return leaf
+
+    def test_sales_files_inherit_named_readers_and_retry_reuses_upload(self):
+        leaf = self.shared_sales()
+        direct, _, sizes = self.direct_fixture()
+        with sizes:
+            recording = self.combined("archive")
+            document = self.combined()
+            writes = list(self.drive.writes)
+            self.combined("archive")
+            self.combined()
+        self.assertEqual(writes, self.drive.writes)
+        self.assertTrue(all(call.kwargs["reader_emails"] == self.route["drive_reader_emails"]
+                            for call in direct.upload.call_args_list))
+        for receipt in (recording, document):
+            for identity in [receipt["meeting_folder_id"], receipt["folder_id"],
+                             *(file["id"] for file in receipt["files"])]:
+                self.assertEqual(self.drive.items[identity]["permissions"], self.drive.items[leaf]["permissions"])
+        self.assertEqual(document["meeting_folder_id"], recording["meeting_folder_id"])
+
+    def test_sales_permission_changes_fail_before_first_write(self):
+        leaf = self.shared_sales()
+        original = copy.deepcopy(self.drive.items[leaf]["permissions"])
+        owner, first, second = original
+        cases = [[owner, first], [owner, first, first], [owner, first, second, dict(second, emailAddress="new@example.test")],
+                 [owner, first, dict(second, emailAddress="new@example.test")],
+                 [owner, first, dict(second, role="writer")], [owner, first, dict(second, role="commenter")],
+                 [owner, first, dict(second, type="group")], [owner, first, {"type": "anyone", "role": "reader"}],
+                 [owner, first, dict(second, type="domain")], [owner, first, dict(second, pendingOwner=True)],
+                 [owner, first, dict(second, deleted=True)], [dict(owner, emailAddress="new@example.test"), first, second]]
+        for acl in cases:
+            with self.subTest(acl=acl):
+                self.drive.items[leaf]["permissions"] = acl
+                with self.assertRaises(UploadNeedsReview):
+                    self.upload()
+                self.assertEqual(self.drive.writes, [])
+        self.drive.items[leaf]["permissions"] = original
+        for ancestor in (FakeDrive.COMPANY, FakeDrive.ROOT):
+            with self.subTest(ancestor=ancestor):
+                saved = copy.deepcopy(self.drive.items[ancestor])
+                self.drive.items[ancestor].update(shared=True, permissions=original)
+                with self.assertRaisesRegex(UploadNeedsReview, "owner-only"):
+                    self.upload()
+                self.assertEqual(self.drive.writes, [])
+                self.drive.items[ancestor] = saved
+
+    def test_new_sales_child_and_retry_must_match_exact_viewers(self):
+        self.shared_sales()
+        def add_access(tool, arguments, identity):
+            if tool == "create_folder":
+                self.drive.items[identity]["permissions"].append({"type": "anyone", "role": "reader"})
+        self.drive.after_write = add_access
+        with self.assertRaisesRegex(UploadNeedsReview, "approved viewers"):
+            self.upload()
+        self.assertEqual(len(self.drive.writes), 1)
+        self.assertEqual(self.drive.uploads, [])
+        self.drive.after_write = None
+        with self.assertRaisesRegex(UploadNeedsReview, "approved viewers"):
+            self.upload()
+        self.assertEqual(len(self.drive.writes), 1)
+        self.route["drive_reader_emails"].append("new@example.test")
+        with self.assertRaisesRegex(UploadNeedsReview, "destination changed"):
+            self.upload()
+
+    def test_nested_ancestor_changes_stop_before_any_drive_write(self):
+        self.use_nested_destination()
+        original = copy.deepcopy(self.drive.items[FakeDrive.COMPANY])
+        cases = [("parent_ids", ["outside_root_123"]), ("title", "Unexpected company"),
+                 ("shared", True), ("trashed", True), ("drive_id", "shared_drive_123"),
+                 ("permissions", [{"type": "user", "role": "owner", "emailAddress": "another@example.test"}]),
+                 ("permissions", original["permissions"] + [{"type": "anyone", "role": "reader"}])]
+        for field, value in cases:
+            with self.subTest(field=field, value=value):
+                self.drive.items[FakeDrive.COMPANY] = dict(original, **{field: value})
+                with self.assertRaises(UploadNeedsReview):
+                    self.upload()
+                self.assertEqual(self.drive.writes, [])
+
+    def test_nested_ancestor_is_revalidated_between_cloud_writes(self):
+        self.use_nested_destination()
+        def change_ancestor(tool, _arguments, _identity):
+            if tool == "create_folder":
+                self.drive.items[FakeDrive.COMPANY]["shared"] = True
+        self.drive.after_write = change_ancestor
+        with self.assertRaises(UploadNeedsReview):
+            self.upload()
+        self.assertEqual(len(self.drive.writes), 1)
+        self.assertEqual(self.drive.uploads, [])
+
+    def test_deeper_user_defined_subfolder_keeps_every_intermediate_parent_bound(self):
+        sales = self.use_nested_destination()
+        leaf = self.drive.add("region_folder_123", "Europe", sales, FOLDER_MIME)
+        self.route["drive_folder_path"].append({"name": "Europe", "drive_folder_id": leaf})
+        self.route.update(company_name="Acme / Sales Meetings / Europe", drive_folder_id=leaf)
+        result = self.upload()
+        self.assertEqual(self.drive.items[result["meeting_folder_id"]]["parent_ids"], [leaf])
+        written = list(self.drive.writes)
+        self.drive.items[sales]["parent_ids"] = [FakeDrive.ROOT]
+        with self.assertRaisesRegex(UploadNeedsReview, "outside its approved parent"):
+            self.upload()
+        self.assertEqual(self.drive.writes, written)
+
+    def test_nested_route_cannot_include_root_or_skip_its_actual_parent(self):
+        self.use_nested_destination()
+        self.route["drive_folder_path"][0] = {"name": "Meetings", "drive_folder_id": FakeDrive.ROOT}
+        self.route["company_name"] = "Meetings / Sales Meetings"
+        with self.assertRaisesRegex(UploadNeedsReview, "cannot contain its Meetings root"):
+            self.upload()
+        self.assertEqual(self.drive.writes, [])
+        self.route.pop("drive_folder_path")
+        self.route["company_name"] = "Sales Meetings"
+        self.job = "new-direct-route"
+        with self.assertRaisesRegex(UploadNeedsReview, "outside its approved parent"):
+            self.upload()
+        self.assertEqual(self.drive.writes, [])
+
+    def test_retry_cannot_silently_replace_the_nested_path(self):
+        self.use_nested_destination()
+        self.upload()
+        written = list(self.drive.writes)
+        self.route["drive_folder_path"][0]["drive_folder_id"] = "replacement_parent_123"
+        with self.assertRaisesRegex(UploadNeedsReview, "changed|different"):
+            self.upload()
+        self.assertEqual(self.drive.writes, written)
 
     def test_unconfigured_account_preserves_exact_legacy_journal_identities(self):
         self.upload()
