@@ -67,6 +67,27 @@ class SpeakerContextTests(unittest.TestCase):
         self.assertEqual([name for name, _ in self.calendar.calls],
                          ["list_calendars", "search_events", "read_event"])
 
+    def test_host_requires_explicit_organizer_on_strong_invitation(self):
+        context, _ = self.context()
+        self.assertNotIn("organizer", context)
+        self.calendar.event["organizer_email"] = "GUEST@example.test"
+        context, _ = self.context()
+        self.assertEqual(context["organizer"], {"name": "Casey Rivera", "email": "guest@example.test"})
+        self.calendar.event.pop("organizer_email")
+        self.calendar.event["attendees"][0]["organizer"] = True
+        context, _ = self.context()
+        self.assertEqual(context["organizer"], {"name": "Alex Owner", "email": "owner@example.test"})
+        self.calendar.event["organizer"] = {"email": "unknown@example.test"}
+        self.assertNotIn("organizer", self.context()[0])
+        self.calendar.event["hangout_link"] = "https://meet.google.com/zzz-yyyy-xxx"
+        self.assertNotIn("organizer", self.context()[0])
+
+    def test_matching_invites_with_different_organizers_do_not_establish_host(self):
+        self.calendar.event["organizer"] = {"email": "owner@example.test"}
+        self.calendar.events.append(dict(self.calendar.event, id="copy", organizer={"email": "guest@example.test"}))
+        context, _ = self.context()
+        self.assertNotIn("organizer", context)
+
     def test_connector_is_bound_to_verified_selected_account(self):
         with patch("quill_workflow.drive_accounts.require_verified_account", return_value={"email": "selected@example.test"}) as verified, \
                 patch("quill_workflow.codex_calendar_transport.CodexCalendarTransport") as factory:

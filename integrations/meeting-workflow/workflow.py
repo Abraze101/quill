@@ -468,6 +468,8 @@ def main(argv=None):
     name_local = sub.add_parser("name-local", help="Apply date and validated title to one local meeting folder")
     name_local.add_argument("job")
     name_local.add_argument("--refresh", action="store_true", help="Update an already named folder to the current date format")
+    name_local.add_argument("--display-title", help="Set a reviewed participants-first title for this local meeting")
+    name_local.add_argument("--meeting-date", help="Verified recording-local date for a reviewed title (YYYY-MM-DD)")
     args = parser.parse_args(argv)
     if args.command in ("drive-accounts", "drive-select"):
         # Account setup must not open or migrate the meeting queue. Native UI
@@ -531,7 +533,8 @@ def main(argv=None):
                 fcntl.flock(lock, fcntl.LOCK_EX)
                 with queue.db:
                     request_naming(queue, args.job, config)
-                destination = name_session(queue, args.job, refresh=args.refresh)
+                destination = name_session(queue, args.job, refresh=args.refresh,
+                                           display_title=args.display_title, meeting_date=args.meeting_date)
                 print(str(destination) if destination else "No validated title; existing dated folder kept.")
         elif args.command == "reviews":
             reviews = RoutingReviews(queue.state)

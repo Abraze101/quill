@@ -217,6 +217,33 @@ class SpeakerPipelineTests(unittest.TestCase):
         self.assertTrue(receipt["context_sha256"])
         self.assertEqual(json.loads(capture.read_text())[0]["payload"]["evidence_context"], prompt_context())
 
+    def test_non_diarized_browser_call_files_visible_guest_without_voice_review(self):
+        transcript = {"segments": [{"start_ms": 0, "speaker": "me", "text": "We covered logistics."}]}
+        candidate = notes()
+        del candidate["speaker_review"]
+        candidate["meeting_title"]["evidence"] = [0]
+        candidate["summary"][0]["evidence"] = [0]
+        executable, capture = self.fake([candidate])
+        settings = {"enabled": True, "command": [sys.executable, "-B", str(ROOT / "quill_workflow/codex_notes.py"),
+                    "--input", "{input}", "--output", "{output}", "--skill", "{skill}",
+                    "--context", "{context}", "--codex", executable, "--timeout", "30"]}
+        job, queue, runner = self.pipeline_fixture(settings, transcript)
+        metadata = queue.state / "recordings" / job / "meta.json"
+        value = json.loads(metadata.read_text())
+        value["meeting_context"] = {"provider": "google-meet", "key": "abc-defg-hij", "coverage": "visible_only",
+                                    "participants": [{"name": "Mira", "self": True}, {"name": "Lin", "self": False},
+                                                     {"name": "Ada", "self": False}]}
+        atomic_json(metadata, value)
+        context = {"schema_version": 1, "organizer": {"name": "Lin", "email": "lin@example.test"},
+                   "candidates": [{"name": "Mira", "email": "mira@example.test", "aliases": [], "source": "calendar"},
+                                  {"name": "Ada", "email": "ada@example.test", "aliases": [], "source": "calendar"}]}
+        with patch("quill_workflow.speaker_context.build_context", return_value=(context, "matched_invitation")):
+            runner("notes", job, settings)
+        self.assertEqual(len(json.loads(capture.read_text())), 1)
+        folder = queue.state / "results" / job / "notes"
+        self.assertTrue((folder / "notes.md").read_text().startswith("# Ada - Agenda planning\n"))
+        self.assertNotIn("_speaker_identity", json.loads((folder / "notes.json").read_text()))
+
     def test_custom_notes_adapter_receives_no_new_flags_or_calendar_access(self):
         script, capture = self.root / "legacy adapter.py", self.root / "legacy argv.json"
         legacy_notes = notes()

@@ -59,7 +59,7 @@ def validate_context(value):
         return {"schema_version": 1, "candidates": []}
     version = value.get("schema_version") if isinstance(value, dict) else None
     keys = {"schema_version", "candidates"} | ({"timeline"} if version == 2 else set())
-    if (not isinstance(value, dict) or set(value) != keys
+    if (not isinstance(value, dict) or set(value) - {"organizer"} != keys
             or type(version) is not int or version not in (1, 2)
             or not isinstance(value.get("candidates"), list) or len(value["candidates"]) > 100):
         raise ValueError("Invalid speaker evidence context")
@@ -85,6 +85,12 @@ def validate_context(value):
             raise ValueError("Visible names do not establish email addresses")
         result.append({"name": name, "email": email, "source": candidate["source"], "aliases": aliases})
     normalized = {"schema_version": version, "candidates": result}
+    if "organizer" in value:
+        organizer = value["organizer"]
+        if not isinstance(organizer, dict) or set(organizer) != {"name", "email"}:
+            raise ValueError("Invalid invitation organizer")
+        normalized["organizer"] = {"name": _name(organizer["name"]) if organizer["name"] is not None else None,
+                                   "email": _email(organizer["email"]).casefold()}
     if len(json.dumps(normalized, ensure_ascii=False).encode()) > 100_000:
         raise ValueError("Speaker evidence context is too large")
     if version == 2:

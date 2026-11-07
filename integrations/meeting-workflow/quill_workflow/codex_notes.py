@@ -203,7 +203,7 @@ def validate_result(data, transcript, require_title=False):
     attributions = _attributions(transcript, data)
     required = set(SECTIONS) | {"schema_version", "actions", "follow_up_draft"}
     if (not isinstance(data, dict) or not required <= set(data)
-            or set(data) - required - {"meeting_title", "speaker_review", "_speaker_identity"}
+            or set(data) - required - {"meeting_title", "speaker_review", "_speaker_identity", "_title_guests"}
             or type(data.get("schema_version")) is not int
             or require_title and "meeting_title" not in data):
         raise WorkflowError("Codex notes do not match the required output schema")
@@ -248,7 +248,7 @@ def validate_result(data, transcript, require_title=False):
             raise WorkflowError("Action owner name is absent from its cited transcript evidence; use null")
 
 
-def run(input_path, output_path, skill_path, executable="codex", model=None, timeout=900, context_path=None, speaker_context_path=None, identity_path=None, cancelled=None):
+def run(input_path, output_path, skill_path, executable="codex", model=None, timeout=900, context_path=None, speaker_context_path=None, identity_path=None, cancelled=None, owner_names=()):
     from quill_workflow.processing_lease import child_lease_fds
     if not math.isfinite(timeout) or timeout <= 0:
         raise WorkflowError("Codex timeout must be positive")
@@ -268,13 +268,17 @@ def run(input_path, output_path, skill_path, executable="codex", model=None, tim
         raise WorkflowError(str(error)) from error
     started = time.monotonic()
     identity = None
+    identity_context = None
+    if speaker_context_path:
+        from quill_workflow.speaker_review import MAX_CONTEXT_FILE_BYTES, validate_context
+        identity_context = validate_context(read_json(Path(speaker_context_path), limit=MAX_CONTEXT_FILE_BYTES))
     if identity_path:
         from quill_workflow.speaker_identity import MAX_BUNDLE_BYTES, validate_bundle
         identity = validate_bundle(read_json(Path(identity_path), limit=MAX_BUNDLE_BYTES), transcript)
-    elif speaker_context_path and transcript.get("speaker_labels") == "diarized_v1":
-        from quill_workflow.speaker_review import MAX_CONTEXT_FILE_BYTES, run as review_speakers, validate_context
+        identity_context = identity["context"]
+    elif identity_context is not None and transcript.get("speaker_labels") == "diarized_v1":
+        from quill_workflow.speaker_review import run as review_speakers
         from quill_workflow.speaker_identity import empty_bundle
-        identity_context = validate_context(read_json(Path(speaker_context_path), limit=MAX_CONTEXT_FILE_BYTES))
         identity = empty_bundle(transcript, identity_context)
         with tempfile.TemporaryDirectory(prefix="quill-speakers-") as temporary:
             report_path = Path(temporary) / "review.json"
@@ -337,7 +341,8 @@ def run(input_path, output_path, skill_path, executable="codex", model=None, tim
             "Supply meeting_title with a concise, neutral topic in text (at most 120 characters), "
             "its supporting evidence, and participants as names with their own evidence. "
             "Do not put participant names, a date, a company folder, or an opaque identifier in "
-            "the topic text: the caller puts participant names first, followed by the topic "
+            "the topic text. The caller selects supported guests from the full attendee list and "
+            "puts participant names first, followed by the topic "
             "and recording date. Include names only "
             "when the conversation establishes they are on this call, such as an introduction "
             "or direct address. A name mentioned while discussing someone else does not establish "
@@ -436,6 +441,8 @@ def run(input_path, output_path, skill_path, executable="codex", model=None, tim
                     data = json.loads(raw)
                 except ValueError as error:
                     raise WorkflowError("Codex notes are not valid JSON") from error
+                if isinstance(data, dict) and "_title_guests" in data:
+                    raise WorkflowError("Model output cannot supply trusted guest names")
                 if isinstance(data, dict) and "_speaker_identity" in data:
                     raise WorkflowError("Model output cannot supply trusted speaker corrections")
                 if (identity and isinstance(data, dict) and isinstance(data.get("speaker_review"), dict)
@@ -446,6 +453,8 @@ def run(input_path, output_path, skill_path, executable="codex", model=None, tim
                     from quill_workflow.speaker_identity import attach
                     data = attach(data, transcript, identity)
                 validate_result(data, transcript, require_title=True)
+                from quill_workflow.title_participants import bind_title_guests
+                data = bind_title_guests(data, transcript, identity_context, context, owner_names=owner_names)
             except (WorkflowError, ValueError) as error:
                 diagnostic = " ".join(str(error).split())[:500]
                 if attempt == 1:
@@ -472,6 +481,8 @@ def main(argv=None):
     parser.add_argument("--model", help="Model override; otherwise use the CLI default")
     parser.add_argument("--speaker-context", help="Invitation and confirmed identity candidates")
     parser.add_argument("--speaker-identity", help="Previously validated speaker review and corrections")
+    parser.add_argument("--title-owner-name", action="append", default=[],
+                        help="Exclude this recorder name or alias from titles (repeatable)")
     parser.add_argument("--context", help="Optional bounded meeting-name context snapshot")
     parser.add_argument("--timeout", type=float, default=900,
                         help="Seconds, shorter than the surrounding connector timeout")
@@ -482,7 +493,8 @@ def main(argv=None):
 
     previous = signal.signal(signal.SIGTERM, interrupted)
     try:
-        run(args.input, args.output, args.skill, args.codex, args.model, args.timeout, args.context, args.speaker_context, args.speaker_identity)
+        run(args.input, args.output, args.skill, args.codex, args.model, args.timeout, args.context, args.speaker_context, args.speaker_identity,
+            owner_names=args.title_owner_name)
     except (WorkflowError, OSError, ValueError) as error:
         print(str(error), file=sys.stderr)
         return 1

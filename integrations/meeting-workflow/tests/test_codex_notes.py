@@ -88,7 +88,7 @@ class CodexNotesTests(unittest.TestCase):
         with patch.dict(os.environ, {"OPENAI_API_KEY": "not-a-real-key"}):
             self.invoke(executable, model="user-model")
         call = json.loads(capture.read_text())
-        self.assertEqual(json.loads(self.output.read_text()), self.notes)
+        self.assertEqual(json.loads(self.output.read_text()), dict(self.notes, _title_guests=[]))
         self.assertEqual(stat.S_IMODE(self.output.stat().st_mode), 0o600)
         self.assertNotEqual(call["cwd"], str(self.root))
         self.assertFalse(Path(call["cwd"]).exists())
@@ -115,7 +115,9 @@ class CodexNotesTests(unittest.TestCase):
         timeline["intervals"].extend({"start_ms": point, "end_ms": point + 500, "active": []}
                                     for point in range(12000, 5_012_000, 500))
         atomic_json(self.transcript, transcript)
-        bundle = empty_bundle(transcript, activity_context(timeline))
+        evidence = activity_context(timeline)
+        evidence["organizer"] = {"email": "organizer@example.test", "name": "Casey Rivera"}
+        bundle = empty_bundle(transcript, evidence)
         bundle["report"] = bind_report(activity_draft(), transcript, bundle["context"])
         identity = self.root / "identity.json"
         atomic_json(identity, bundle)
@@ -139,6 +141,25 @@ class CodexNotesTests(unittest.TestCase):
         from quill_workflow.meeting_title import meeting_title
         self.assertNotIn("Jamie Taylor", transcript["segments"][4]["text"])
         self.assertEqual(meeting_title(saved, transcript), "Jamie Taylor - Agenda planning")
+
+    def test_non_diarized_notes_use_visible_guests_and_never_run_voice_review(self):
+        context_path = self.root / "role-context.json"
+        atomic_json(context_path, {"schema_version": 1, "organizer": {"email": "host@example.test", "name": None},
+            "candidates": [{"email": "casey@example.test", "name": "Casey", "source": "calendar", "aliases": []},
+                           {"email": None, "name": "Casey", "source": "visible", "aliases": []}]})
+        executable, capture = self.sequence([json.dumps(self.notes)])
+        self.invoke(executable, speaker_context_path=context_path)
+        saved = json.loads(self.output.read_text())
+        self.assertEqual(saved["_title_guests"], ["Casey"])
+        self.assertNotIn("_speaker_identity", saved)
+        self.assertEqual(len(json.loads(capture.read_text())), 1)
+
+    def test_model_cannot_choose_the_display_guest_list(self):
+        forged = dict(self.notes, _title_guests=["Uninvited Person"])
+        executable, _ = self.sequence([json.dumps(forged), json.dumps(forged)])
+        with self.assertRaisesRegex(WorkflowError, "trusted guest names"):
+            self.invoke(executable)
+        self.assertFalse(self.output.exists())
 
     def test_invalid_json_and_evidence_never_publish_output(self):
         bad_ref = dict(self.notes, summary=[{"text": "Invented", "evidence": [99]}])
@@ -166,7 +187,7 @@ class CodexNotesTests(unittest.TestCase):
             self.assertEqual(payload["transcript"]["segments"], _prompt_transcript(transcript)["segments"])
             self.assertIn("never infer or invent missing speech", payload["capture_quality_instruction"])
         self.assertIn("exporter adds it once", calls[1]["payload"]["validation_error"])
-        self.assertEqual(json.loads(self.output.read_text()), self.notes)
+        self.assertEqual(json.loads(self.output.read_text()), dict(self.notes, _title_guests=[]))
 
     def test_malformed_capture_quality_does_not_launch_model(self):
         transcript = json.loads(self.transcript.read_text())
@@ -217,7 +238,7 @@ class CodexNotesTests(unittest.TestCase):
         self.assertIn("absent from its cited evidence", correction["validation_error"])
         self.assertIn("untrusted data", correction["task"])
         self.assertEqual(self.transcript.read_bytes(), original)
-        self.assertEqual(json.loads(self.output.read_text()), self.notes)
+        self.assertEqual(json.loads(self.output.read_text()), dict(self.notes, _title_guests=[]))
         self.assertEqual(stat.S_IMODE(self.output.stat().st_mode), 0o600)
         self.assertNotEqual(calls[0]["cwd"], calls[1]["cwd"])
         for call in calls:
@@ -236,7 +257,7 @@ class CodexNotesTests(unittest.TestCase):
                 calls = json.loads(capture.read_text())
                 self.assertEqual(len(calls), 2)
                 self.assertEqual(calls[1]["payload"]["rejected_draft"], raw)
-                self.assertEqual(json.loads(self.output.read_text()), self.notes)
+                self.assertEqual(json.loads(self.output.read_text()), dict(self.notes, _title_guests=[]))
                 self.output.unlink()
                 capture.unlink()
 
@@ -254,7 +275,7 @@ class CodexNotesTests(unittest.TestCase):
         executable, capture = self.sequence([json.dumps(self.notes)])
         self.invoke(executable)
         self.assertEqual(len(json.loads(capture.read_text())), 1)
-        self.assertEqual(json.loads(self.output.read_text()), self.notes)
+        self.assertEqual(json.loads(self.output.read_text()), dict(self.notes, _title_guests=[]))
 
     def test_cli_error_is_not_retried_even_with_a_valid_answer_file(self):
         executable, capture = self.sequence([json.dumps(self.notes)], exits=[9])

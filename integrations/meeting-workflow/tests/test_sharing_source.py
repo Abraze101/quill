@@ -116,6 +116,16 @@ class SharingSourceTests(unittest.TestCase):
         atomic_json(self.result / 'notes/notes.json', self.notes)
         (self.result / 'notes/source-transcript.json').write_bytes(self.transcript_bytes)
 
+    def test_guest_first_shared_copy_keeps_date_last_and_preserves_attendee_roster(self):
+        for guests, prefix in ((["Max"], "Max - "), ([], "")):
+            with self.subTest(guests=guests):
+                self.notes["_title_guests"] = guests
+                self.publish_fixture()
+                snapshot = self.snapshot()
+                self.assertEqual(snapshot["title"], prefix + "Dashboard review (shared notes) - 10/9/26")
+                self.assertEqual(snapshot["notes_payload"]["title"], snapshot["title"])
+                self.assertEqual(snapshot["notes_payload"]["replacements"]["{{QUILL_PARTICIPANTS}}"], "Max")
+
     def tearDown(self):
         self.queue.close()
         self.reviews.close()

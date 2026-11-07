@@ -28,6 +28,63 @@ class MeetingTitleTests(unittest.TestCase):
         self.assertNotIn("segment", markdown)
         self.assertNotIn("00:03", markdown)
 
+    def test_guest_only_heading_preserves_attendees_and_historical_render(self):
+        from quill_workflow.title_participants import bind_title_guests
+        context = {"organizer": {"name": "Max Parker", "email": "outside@example.test"}, "candidates": [
+            {"name": "Mei Chen", "email": "owner@example.test", "source": "calendar", "aliases": []},
+            {"name": "Mia Cole", "email": "absent@example.test", "source": "calendar", "aliases": []},
+            {"name": "Ada Mills", "email": "ada@example.test", "source": "calendar", "aliases": []},
+            {"name": "Ada Mills", "email": None, "source": "visible", "aliases": []}]}
+        current = bind_title_guests(self.notes, self.transcript, context)
+        self.assertEqual(meeting_title(current, self.transcript), "Mei Chen, Ada Mills - AI voice agent review")
+        self.assertIn("Participants: Max, Mei Chen", render_notes(current, self.transcript))
+        self.assertNotIn("_title_guests", self.notes)
+        self.assertEqual(meeting_title(self.notes, self.transcript), "Max, Mei Chen - AI voice agent review")
+
+    def test_no_host_guess_from_recorder_invitation_or_first_name(self):
+        from quill_workflow.title_participants import bind_title_guests
+        context = {"organizer": {"name": "Max Parker", "email": "host@example.test"}, "candidates": [
+            {"name": "Max Morgan", "email": "guest@example.test", "source": "calendar", "aliases": []}]}
+        current = bind_title_guests(self.notes, self.transcript, context)
+        self.assertEqual(meeting_title(current, self.transcript), "AI voice agent review")
+        self.assertEqual(meeting_title(bind_title_guests(self.notes, self.transcript), self.transcript),
+                         "AI voice agent review")
+        self.transcript["segments"][0]["text"] = "Max, thanks for joining us. Today we review our voice agent."
+        self.assertEqual(meeting_title(bind_title_guests(self.notes, self.transcript), self.transcript),
+                         "Max - AI voice agent review")
+        self.assertEqual(meeting_title(bind_title_guests(self.notes, self.transcript, context), self.transcript),
+                         "AI voice agent review")
+
+    def test_configured_recorder_and_alias_are_excluded_even_as_invited_guests(self):
+        from quill_workflow.title_participants import bind_title_guests
+        context = {"organizer": {"name": "Lin", "email": "host@example.test"}, "candidates": [
+            {"name": name, "email": address, "source": "calendar", "aliases": []}
+            for name, address in (("Max", "max@example.test"), ("Mei Chen", "mei@example.test"))]}
+        current = bind_title_guests(self.notes, self.transcript, context, owner_names=["Mei Chen", "May"])
+        self.assertEqual(meeting_title(current, self.transcript), "Max - AI voice agent review")
+        self.assertEqual(current["_title_guests"], ["Max"])
+        self.transcript["segments"][1]["text"] = "Welcome, May."
+        self.notes["meeting_title"]["participants"][1]["name"] = "May"
+        current = bind_title_guests(self.notes, self.transcript, owner_names=["Mei Chen", "May"])
+        self.assertEqual(meeting_title(current, self.transcript), "AI voice agent review")
+
+    def test_platform_self_and_host_leave_other_people_on_a_shared_mic_eligible(self):
+        from quill_workflow.title_participants import bind_title_guests
+        visible = {"participants": [{"name": "Mei Chen", "self": True},
+                                    {"name": "Host", "self": False}]}
+        for segment in self.transcript["segments"]:
+            segment["speaker"] = "mic"
+        self.transcript["segments"][0]["text"] = "Our guest today is Max. Welcome, Mei Chen."
+        current = bind_title_guests(self.notes, self.transcript, meeting_context=visible)
+        self.assertEqual(current["_title_guests"], ["Max"])
+        self.assertIn("Participants: Max, Mei Chen", render_notes(current, self.transcript))
+
+    def test_explicit_host_overrides_guest_greeting_in_transcript(self):
+        from quill_workflow.title_participants import bind_title_guests
+        self.transcript["segments"][0]["text"] = "Our host today is Max. Max, thanks for joining us."
+        current = bind_title_guests(self.notes, self.transcript)
+        self.assertEqual(meeting_title(current, self.transcript), "AI voice agent review")
+
     def test_legacy_render_preserves_title_and_participant_sources(self):
         markdown = render_notes(self.notes, self.transcript, include_sources=True)
         self.assertEqual(markdown, "# Max, Mei Chen - AI voice agent review\n\n"

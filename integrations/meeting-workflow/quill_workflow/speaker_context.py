@@ -2,6 +2,35 @@
 import time
 
 
+def _invitation_organizer(event):
+    """Google may return the organizer separately or mark their attendee row."""
+    from .recipient_suggestions import _email
+    from .speaker_review import _name
+    organizer = event.get("organizer")
+    attendees = event.get("attendees")
+    attendees = attendees if isinstance(attendees, list) else []
+    rows = [row for row in attendees if isinstance(row, dict)
+            and (row.get("organizer") is True or row.get("is_organizer") is True)]
+    if isinstance(organizer, dict):
+        rows.append(organizer)
+    elif isinstance(organizer, str) or event.get("organizer_email"):
+        rows.append({"email": event.get("organizer_email") or organizer,
+                     "display_name": event.get("organizer_display_name")})
+    addresses = {email.casefold() for row in rows if (email := _email(row.get("email")))}
+    if len(addresses) != 1:
+        return None
+    address, = addresses
+    names = set()
+    for row in rows + attendees:
+        if not isinstance(row, dict) or str(row.get("email")).casefold() != address:
+            continue
+        try:
+            names.add(_name(row.get("display_name") or row.get("displayName")))
+        except ValueError:
+            continue
+    return {"email": address, "name": next(iter(names)) if len(names) == 1 else None}
+
+
 def build_context(job, metadata, transcript, *, config=None, learned=(), invoke=None, guard=None, timeline=None):
     from .meeting_context import meeting_context, participant_name
     from .recipient_suggestions import suggest_recipients, _recipients
@@ -41,6 +70,7 @@ def build_context(job, metadata, transcript, *, config=None, learned=(), invoke=
         except ValueError:
             continue
         candidates.append({"name": name, "email": None, "source": "visible", "aliases": []})
+    organizer = None
     status = "not_configured"
     config = config or {}
     transport = None
@@ -87,6 +117,7 @@ def build_context(job, metadata, transcript, *, config=None, learned=(), invoke=
         # Repeated copies of one invitation are fine. Conflicting invitations
         # sharing a link remain ambiguous and contribute no automatic identities.
         options = []
+        organizers = []
         for event in strong:
             raw = reads.get((event["calendar_id"], event["event_id"]))
             if raw:
@@ -99,9 +130,12 @@ def build_context(job, metadata, transcript, *, config=None, learned=(), invoke=
                         name = None  # Keep the address; never infer a name from its handle.
                     rows.append({"name": name, "email": person["email"], "source": "calendar", "aliases": []})
                 options.append(rows)
+                organizers.append(_invitation_organizer(raw))
         fingerprints = {tuple(sorted((p["name"] or "", p["email"].casefold()) for p in rows)) for rows in options}
         if options and len(fingerprints) == 1:
             candidates.extend(options[0])
+            if all(item == organizers[0] for item in organizers):
+                organizer = organizers[0]
             status = "matched_invitation"
         else:
             status = "ambiguous_invitation" if options else found["status"]
@@ -123,6 +157,8 @@ def build_context(job, metadata, transcript, *, config=None, learned=(), invoke=
         if candidate not in unique:
             unique.append(candidate)
     context = {"schema_version": 2 if timeline is not None else 1, "candidates": unique[:100]}
+    if organizer is not None:
+        context["organizer"] = organizer
     if timeline is not None:
         context["timeline"] = timeline
     return validate_context(context), status

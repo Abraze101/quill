@@ -48,6 +48,9 @@ CREATE TABLE IF NOT EXISTS local_names (
  destination TEXT, device INTEGER NOT NULL, inode INTEGER NOT NULL,
  status TEXT NOT NULL, error TEXT
 );
+CREATE TABLE IF NOT EXISTS local_title_labels (
+ job TEXT PRIMARY KEY REFERENCES local_names(job), title TEXT NOT NULL, meeting_date TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS local_name_aliases (
  job TEXT NOT NULL REFERENCES jobs(id), path TEXT NOT NULL,
  PRIMARY KEY(job,path)
@@ -110,6 +113,12 @@ def load_config(path):
             raise WorkflowError(stage + " settings must contain a boolean enabled value")
     if "route" in config:
         route_settings(config["route"])
+    if "title_owner_names" in config.get("notes", {}):
+        from .title_participants import validate_guest_names
+        try:
+            validate_guest_names(config["notes"]["title_owner_names"])
+        except ValueError as error:
+            raise WorkflowError("notes.title_owner_names must contain up to eight distinct person names") from error
     automatic_calendar_suggestions_since(config)
     from quill_workflow.local_naming import enabled
     enabled(config)
@@ -1345,7 +1354,7 @@ class ConnectorRunner:
             argv = [part.format_map(values) for part in settings["command"]]
             if (stage == "notes" and self.config_path is not None
                     and str(Path(__file__).with_name("codex_notes.py").resolve()) in argv
-                    and transcript.get("speaker_labels") == "diarized_v1"):
+                    and (transcript.get("speaker_labels") == "diarized_v1" or identity_metadata.get("meeting_context"))):
                 from .speaker_context import build_context
                 from .speaker_corrections import SpeakerCorrections
                 identity_context, lookup_status = build_context(
@@ -1366,13 +1375,14 @@ class ConnectorRunner:
                 current_metadata = read_json(safe_member(recording, "meta.json"), 100_000)
                 if optional_speaker_timeline(recording, current_metadata) != timeline:
                     raise WorkflowError("Speaker timeline changed during notes review")
-                if identity_context is not None:
+                if identity_context is not None and transcript.get("speaker_labels") == "diarized_v1":
                     bound_identity = returned.get("_speaker_identity") if isinstance(returned, dict) else None
                     if (not isinstance(bound_identity, dict)
                             or bound_identity.get("context") != identity_context):
                         raise WorkflowError("Speaker identity review belongs to different evidence")
-                    if current_metadata.get("meeting_context") != identity_metadata.get("meeting_context"):
-                        raise WorkflowError("Meeting context changed during speaker review")
+                if (identity_context is not None
+                        and current_metadata.get("meeting_context") != identity_metadata.get("meeting_context")):
+                    raise WorkflowError("Meeting context changed during speaker review")
                 if uses_speaker_context:
                     current_context = current_metadata.get("meeting_context")
                     if current_context is not None:
@@ -1382,6 +1392,12 @@ class ConnectorRunner:
                 review = returned.get("speaker_review") if isinstance(returned, dict) else None
                 if review is not None and (not isinstance(review, dict) or review.get("context") != speaker_context):
                     raise WorkflowError("Speaker review belongs to different meeting context")
+                # The caller owns the guest-only label even for a custom notes
+                # command. Never accept additional names asserted by an adapter.
+                if isinstance(returned, dict) and "meeting_title" in returned:
+                    from .title_participants import bind_title_guests
+                    returned = bind_title_guests(returned, transcript, identity_context, speaker_context,
+                                                 owner_names=settings.get("title_owner_names", []))
                 markdown = render_notes(returned, transcript)
                 notes = staging / "notes"
                 notes.mkdir()

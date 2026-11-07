@@ -147,6 +147,11 @@ class _Sources:
             else:
                 query = "SELECT id,session,NULL AS destination,NULL AS naming_status FROM jobs"
             jobs = [dict(row) for row in db.execute(query)]
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='local_title_labels'").fetchone():
+                labels = {row["job"]: row for row in db.execute("SELECT job,title,meeting_date FROM local_title_labels")}
+                for job in jobs:
+                    if job["naming_status"] == "succeeded" and job["id"] in labels:
+                        job["label"] = labels[job["id"]]
             tasks = {}
             for row in db.execute("SELECT job,stage,status,settings,receipt FROM tasks"):
                 value = dict(row)
@@ -477,6 +482,17 @@ def _entry(sources, row, tasks, *, include_notes=False):
     metadata = sources.json(f"recordings/{job}/meta.json", 100_000)
     display_date, recorded_at = _date(metadata)
     notes, title = _notes(sources, job, tasks, transcript, transcript_hash)
+    label = row.get("label")
+    reviewed_title = None
+    if label is not None and notes is not None and recorded_at is not None:
+        from .local_naming import _display_title, _label_date
+        try:
+            day = _label_date(datetime.fromisoformat(metadata["started"].replace("Z", "+00:00")),
+                              recording_timezone(metadata), label["meeting_date"])
+            reviewed_title = _display_title(label["title"])
+            title, display_date = reviewed_title, f"{day.month}/{day.day}/{day:%y}"
+        except (ValueError, WorkflowError):
+            pass
     if notes is not None and "speaker_review" in notes:
         people = effective_attributions(transcript, notes)
         transcript_text = render_reviewed_transcript(transcript, notes)
@@ -525,6 +541,9 @@ def _entry(sources, row, tasks, *, include_notes=False):
             result["speaker_review_error"] = "Speaker corrections need review; original text is shown."
     if include_notes:
         text = render_notes(notes, transcript) if notes is not None else None
+        if text is not None and reviewed_title is not None:
+            heading = re.sub(r"([\\`*_\[\]()#])", r"\\\1", reviewed_title)
+            text = "# " + heading + "\n" + text.partition("\n")[2]
         if text is not None and len(text) > MAX_NOTES_CHARACTERS:
             text = text[:MAX_NOTES_CHARACTERS] + "\n\n[Notes preview shortened.]"
         result["notes_text"] = text

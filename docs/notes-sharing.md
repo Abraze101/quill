@@ -28,6 +28,8 @@ file or share a meeting.
    review** saves the new list without sharing. Choose **Share view-only** only
    when the copy and addresses are correct. Google may email access invitations.
 
+New attendee copies use titles such as `Alex, Morgan - Portal planning (shared notes) - 9/14/26`. Older approvals retain the exact title reviewed.
+
 The shared copy includes the meeting title, date, participants, summary,
 decisions, next steps, topics and open questions. It omits the transcript,
 recording links and internal sales-analysis sections. Review the text: a summary

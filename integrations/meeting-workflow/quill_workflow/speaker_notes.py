@@ -150,7 +150,8 @@ def _settings(config_path):
     if not math.isfinite(timeout) or timeout <= 0:
         raise WorkflowError("The notes timeout must be positive")
     return {"skill_path": skill, "executable": options.get("--codex", "codex"),
-            "model": options.get("--model"), "timeout": min(900, timeout)}
+            "model": options.get("--model"), "timeout": min(900, timeout),
+            "owner_names": settings.get("title_owner_names", [])}
 
 
 def _visible_context(state, job, original):

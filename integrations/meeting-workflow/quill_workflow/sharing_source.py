@@ -251,7 +251,11 @@ def _snapshot(state, config_path, job):
         "{{QUILL_DATE}}", "{{QUILL_TITLE}}", "{{QUILL_PARTICIPANTS}}")}
     values.update({"{{QUILL_" + key + "}}": value for key, value in sections.items()})
     values.update({"{{QUILL_TRANSCRIPT}}": "Not included.", "{{QUILL_ATTACHMENTS}}": "Meeting notes only."})
-    title = private_payload["title"][:180].rstrip() + " - Shared notes"
+    # Older sharing approvals hash the original complete title.
+    if "_title_guests" in notes:
+        title = values["{{QUILL_TITLE}}"] + " (shared notes) - " + values["{{QUILL_DATE}}"]
+    else:
+        title = private_payload["title"][:180].rstrip() + " - Shared notes"
     payload = {"format": NATIVE_TEMPLATE_FORMAT, "title": title, "replacements": values,
                "date": copy.deepcopy(private_payload["date"]), "company_name": route["company_name"],
                "transcript_segments": 0}

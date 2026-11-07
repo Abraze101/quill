@@ -91,6 +91,9 @@ def meeting_title(notes, transcript, *, participants_first=True):
 
     # Keep complete names, never truncate a person's identity. A long attendee
     # list is shortened to the names that fit; full evidence remains in notes.
+    if "_title_guests" in notes:
+        from .title_participants import validate_guest_names
+        names = validate_guest_names(notes["_title_guests"])
     included = []
     for name in names:
         candidate = ", ".join(included + [name])

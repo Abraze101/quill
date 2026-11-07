@@ -141,7 +141,7 @@ local; enable only the connections you intend to use.
 A meeting normally begins under `~/Recordings/<yyyy.MM.dd-HHmm>/`. It contains
 separate `mic.caf` and `system.caf` tracks, optional `screen.mp4`, session metadata,
 and any generated transcript. Optional local naming changes the folder to
-`Topic - Participants - M-D-YY`. Native Drive documents combine notes and the
+`Participants - Topic - M-D-YY`. Quill omits the meeting host from new titles when it can identify them. Native Drive documents combine notes and the
 transcript; recordings are separate files.
 
 ## Development and verification

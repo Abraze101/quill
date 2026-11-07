@@ -1,14 +1,14 @@
 """Rename completed local sessions without changing their durable job identity."""
 import ctypes
-from datetime import datetime
+from datetime import date as calendar_date, datetime, timedelta, timezone
 import hashlib
 import json
 import os
 from pathlib import Path
 import sys
 
-from .meeting_title import meeting_title
-from .meeting_dates import recording_timezone
+from .meeting_title import MAX_TITLE_BYTES, _plain, meeting_title
+from .meeting_dates import meeting_zone, recording_timezone
 from .pipeline import WorkflowError, read_json, render_notes, safe_member
 
 
@@ -172,24 +172,54 @@ def _rename_exclusive(source, destination):
         raise OSError(number, os.strerror(number), str(destination))
 
 
-def name_session(queue, job, refresh=False):
+def _display_title(value):
+    if (not isinstance(value, str) or not value or value != _plain(value)
+            or len(value.encode("utf-8")) > MAX_TITLE_BYTES):
+        raise WorkflowError("Use a plain meeting title of up to 160 bytes without a date or path separators")
+    return value
+
+
+def _label_date(started, zone, supplied):
+    day = started.astimezone(meeting_zone(zone)).date() if zone is not None else started.date()
+    if supplied is None:
+        return day
+    try:
+        parsed = calendar_date.fromisoformat(supplied)
+    except (TypeError, ValueError) as error:
+        raise WorkflowError("Use YYYY-MM-DD for the recording's local start date") from error
+    utc = started.astimezone(timezone.utc)
+    if (parsed.isoformat() != supplied or zone is not None and parsed != day
+            or not (utc - timedelta(hours=12)).date() <= parsed <= (utc + timedelta(hours=14)).date()):
+        raise WorkflowError("The supplied date disagrees with the recorded start")
+    return parsed
+
+
+def name_session(queue, job, refresh=False, *, display_title=None, meeting_date=None):
     from .local_deletion import job_lock
     with job_lock(queue.state, job):
-        return _name_session(queue, job, refresh)
+        return _name_session(queue, job, refresh, display_title, meeting_date)
 
 
-def _name_session(queue, job, refresh=False):
+def _name_session(queue, job, refresh, display_title, meeting_date):
     """Save the target before moving; recover the same inode after interruption."""
     queue.require_processing(job)
     from .drive_upload import _folder_name
+    if display_title is not None:
+        _display_title(display_title)
+    elif meeting_date is not None:
+        raise WorkflowError("A meeting date requires an explicit display title")
     queue.db.execute("BEGIN IMMEDIATE")
     try:
         row = _row(queue, job)
         source = Path(row["session"])
-        if refresh and row["destination"] and row["status"] == "succeeded":
+        label = queue.db.execute("SELECT title,meeting_date FROM local_title_labels WHERE job=?", (job,)).fetchone()
+        if display_title is not None and row["destination"] and row["status"] != "succeeded":
+            if (not label or label["title"] != display_title
+                    or meeting_date is not None and label["meeting_date"] != meeting_date):
+                raise WorkflowError("Finish the pending local rename before applying a different title")
+        if (refresh or display_title is not None) and row["destination"] and row["status"] == "succeeded":
             source = session_path(queue, job)
             _directory(source, row, queue)
-            _verify_files(queue, job, source)
             queue.db.execute("INSERT OR IGNORE INTO local_name_aliases(job,path) VALUES (?,?)",
                              (job, str(source)))
             row["destination"] = None
@@ -199,6 +229,10 @@ def _name_session(queue, job, refresh=False):
                 raise WorkflowError("Saved local destination is outside its recording root")
         else:
             title = _title(queue, job)
+            if display_title is not None:
+                title = display_title
+            elif label:
+                title = _display_title(label["title"])
             if not title:
                 queue.db.execute("UPDATE local_names SET status='skipped',error=NULL WHERE job=?", (job,))
                 queue.db.commit()
@@ -212,7 +246,16 @@ def _name_session(queue, job, refresh=False):
             # Drive permits slash dates; the local filesystem treats slashes
             # as path separators. Keep the same short date with hyphens here.
             zone = json.loads(row["settings"]).get("meeting_timezone")
-            destination = source.parent / _folder_name(date, job, title, zone).replace("/", "-")
+            if display_title is not None or label:
+                supplied = meeting_date or (label["meeting_date"] if label else None)
+                day = _label_date(date, zone, supplied)
+                folder = f"{title} - {day.month}-{day.day}-{day:%y}"
+                queue.db.execute("INSERT INTO local_title_labels(job,title,meeting_date) VALUES (?,?,?) "
+                                 "ON CONFLICT(job) DO UPDATE SET title=excluded.title,meeting_date=excluded.meeting_date",
+                                 (job, title, day.isoformat()))
+            else:
+                folder = _folder_name(date, job, title, zone).replace("/", "-")
+            destination = source.parent / folder
             if destination != source and os.path.lexists(destination):
                 destination = destination.with_name(destination.name + " - " + job[:8])
             if destination != source and os.path.lexists(destination):

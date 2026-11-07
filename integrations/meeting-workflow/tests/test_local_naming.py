@@ -98,6 +98,58 @@ class LocalNamingTests(unittest.TestCase):
         self.assertEqual(destination.name, f"{self.title} - {date.month}-{date.day}-{date:%y}")
         self.assertEqual(destination.parent, self.recordings)
 
+    def test_reviewed_title_renames_once_and_keeps_historical_proofs(self):
+        from quill_workflow.review_library import meeting_detail
+        job = self.prepare()
+        original = name_session(self.queue, job)
+        sources = self.file_bytes(self.queue.state / "results" / job / "notes")
+        receipts = self.queue.tasks(job)
+        with process_timezone("Pacific/Honolulu"):
+            renamed = name_session(self.queue, job, display_title="Alex - Revised topic", meeting_date="2026-09-15")
+        self.assertEqual(renamed.name, "Alex - Revised topic - 9-15-26")
+        self.assertEqual(name_session(self.queue, job, refresh=True), renamed)
+        for path in (self.session, original, renamed):
+            self.assertEqual(self.queue.enqueue(path, self.config), job)
+        self.assertEqual(self.file_bytes(self.queue.state / "results" / job / "notes"), sources)
+        self.assertEqual(self.queue.tasks(job), receipts)
+        detail = meeting_detail(self.queue.state, job)
+        self.assertEqual(detail["title"], "Alex - Revised topic")
+        self.assertEqual(detail["display_date"], "9/15/26")
+        self.assertTrue(detail["notes_text"].startswith("# Alex - Revised topic\n"))
+
+    def test_reviewed_title_requires_a_safe_filename_and_plausible_recording_date(self):
+        job = self.prepare()
+        for title, day in (("../bad", None), ("", None), ("two\nlines", None),
+                           ("A" * 161, None), ("Good title", "2025-09-14"), (None, "2026-09-14")):
+            with self.subTest(title=title, day=day), self.assertRaises(WorkflowError):
+                name_session(self.queue, job, display_title=title, meeting_date=day)
+        self.assertIsNone(self.row(job)["destination"])
+        self.assertIsNone(self.queue.db.execute("SELECT * FROM local_title_labels").fetchone())
+        self.assertTrue(self.session.exists())
+
+    def test_reviewed_title_date_honors_recording_timezone(self):
+        metadata = json.loads((self.session / "meta.json").read_text())
+        metadata["recording_timezone"] = "Asia/Singapore"
+        atomic_json(self.session / "meta.json", metadata)
+        job = self.prepare()
+        with self.assertRaisesRegex(WorkflowError, "disagrees"):
+            name_session(self.queue, job, display_title="Reviewed topic", meeting_date="2026-09-14")
+        self.assertEqual(name_session(self.queue, job, display_title="Reviewed topic").name,
+                         "Reviewed topic - 9-15-26")
+
+    def test_interrupted_reviewed_rename_keeps_both_paths_and_first_plan(self):
+        job = self.prepare()
+        old = name_session(self.queue, job)
+        with patch.object(local_naming, "_rename_exclusive", side_effect=OSError("test interruption")):
+            with self.assertRaises(OSError):
+                name_session(self.queue, job, display_title="Reviewed topic", meeting_date="2026-09-14")
+        with self.assertRaisesRegex(WorkflowError, "pending local rename"):
+            name_session(self.queue, job, display_title="Conflicting topic")
+        destination = name_session(self.queue, job)
+        self.assertEqual(destination.name, "Reviewed topic - 9-14-26")
+        for path in (old, destination):
+            self.assertEqual(self.queue.enqueue(path, self.config), job)
+
     def test_saved_recording_date_survives_travel_before_naming_and_refresh(self):
         metadata = json.loads((self.session / "meta.json").read_text())
         metadata.update(recording_timezone="Asia/Singapore", recording_utc_offset_seconds=28800)

@@ -297,9 +297,9 @@ its deletion marker requires explicit recovery.
 ### Local meeting names
 
 Enable `local_naming.enabled` to rename future completed folders after validated
-notes supply a topic and participants. Names use `Topic - Participants - M-D-YY`
+notes supply a topic and participants. Names use `Participants - Topic - M-D-YY`
 locally and `M/D/YY` in Drive. The date comes from the timezone saved when recording
-started. Unknown participant names are omitted. Older recordings without timezone
+started. Quill omits the recorder, identified hosts and unknown participants from new titles. Older recordings without timezone
 metadata keep their saved naming plans.
 
 Only the folder name changes; file contents and internal filenames stay stable.
@@ -314,6 +314,19 @@ python3 integrations/meeting-workflow/workflow.py name-local JOB_ID
 `--refresh` updates a previously named local folder to the current format. Neither
 form transcribes, generates notes or contacts Drive. Existing Drive names remain
 fixed in their upload journals.
+
+To apply a reviewed title to an older local folder and its processing-library
+entry, pass the participants and topic without a trailing date:
+
+```sh
+python3 integrations/meeting-workflow/workflow.py name-local JOB_ID \
+  --display-title 'Alex, Morgan - Portal planning' --meeting-date 2026-09-14
+```
+
+The optional date must match the recorded timezone when available. For a
+recording without a saved timezone, supply its verified local start date.
+Quill checks the source files, stores the display title separately from the
+original notes, and keeps earlier folder paths usable for retries.
 
 ## Connector contract
 
