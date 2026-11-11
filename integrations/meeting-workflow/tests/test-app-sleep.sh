@@ -44,7 +44,7 @@ xcrun swiftc -swift-version 6 -parse-as-library -target "$(uname -m)-apple-macos
   Sources/quill/RecordingWarningHistory.swift \
   Sources/quill/MeetingReviewLauncher.swift Tests/AppSleepChecks/MeetingReviewLauncherChecks.swift \
   Sources/quill/Audio/SystemAudioCaptureState.swift \
-  Sources/quill/WorkflowPreferences.swift Sources/quill/CompletionUIStatus.swift \
+  Sources/quill/WorkflowPreferences.swift Sources/quill/CompletionUIStatus.swift Sources/quill/QuillUpdateChecker.swift \
   "$test_directory/DisplayModels.swift" Tests/AppSleepChecks/BoundaryFakes.swift \
   "$test_directory/AppControllerChecks.swift" -o "$test_directory/app-sleep-checks"
 "$test_directory/app-sleep-checks"

@@ -7,10 +7,34 @@ app, browser host or local configuration.
 
 ## Install the update shown in Quill
 
-Choose **Check for Updates…** to compare your installed version and build with
-the version on `Abraze101/quill`’s `main` branch. When an update is available,
-the source ZIP and the guide in the result both point to the exact commit Quill
-checked.
+In the Quill menu or Settings, choose **Check for Updates…**. Starting with
+0.1.18, **Update and Restart** downloads the release executable for your Mac
+and checks its digest, architecture, and embedded version. Quill signs the app
+with the certificate used by your existing installation and updates the workflow
+files in their original checkout. The previous signed app is retained.
+
+Finish any recording and active processing before restarting. If a meeting
+starts while the update is being prepared, Quill leaves the recording running.
+The installer preserves your local work and reports when it cannot update a checkout.
+
+### First update from 0.1.17 or earlier
+
+Those versions use the manual update procedure. For a release that includes
+Mac executables, download its source ZIP from [Quill releases](https://github.com/Abraze101/quill/releases)
+and extract it to a temporary folder. After recording and processing finish,
+quit Quill, open Terminal in the extracted folder, and run:
+
+```sh
+/usr/bin/python3 -I -B scripts/app-update.py bootstrap
+```
+
+The helper verifies the release executable, uses the original installation's
+checkout and signing certificate, then reopens Quill. Future updates use the
+button in the app.
+
+### Updating from source
+
+Use this path for a source-only update or a checkout with local changes.
 
 1. Finish any recording and processing, quit Quill, and close the Processing
    Center. Open Terminal in the original Quill source folder. The installed app,
@@ -83,8 +107,7 @@ backup directly in Finder is still possible, so do not launch staged copies.
 
 Review upstream changes in a separate checkout or replay candidate. Compare the
 source diff, run automated tests, and use a controlled meeting for capture and
-browser acceptance. No automatic fetch, merge, installation or deployment is
-configured by this source tree.
+browser acceptance. This procedure is also suitable for custom forks.
 
 Before promoting a candidate, save a fresh checkpoint and finish recording and
 processing. Keep the existing certificate, bundle identifier and installed app
@@ -100,14 +123,23 @@ feature or maintenance version; the first explicitly versioned release build is
 **0.1.0 (2)**. Packaging requires a numeric `major.minor.patch` version and a
 positive build number, and always compiles with `-c release`. Check the installed
 version through **About Quill…** after reopening. Version numbers do not replace
-signature, source-hash or runtime-compatibility checks, and do not enable an
-automatic updater.
+signature, source-hash or runtime-compatibility checks.
+
+### Publishing a build for Update and Restart
+
+After the commit passes the macOS checks on `main`, push a version tag
+matching `CFBundleShortVersionString` (for example, `v0.1.18`) at that commit.
+The **Publish Quill update** workflow builds the Apple Silicon and Intel
+executables on GitHub, verifies their embedded versions, then uploads both
+to a draft release. It compares the uploaded SHA-256 digests with the builds
+before publishing the release. Leave the draft unpublished while it runs.
+A new binary release needs its own version tag.
 
 The components update independently:
 
 | Component | What an update needs |
 |---|---|
-| Native Swift app | Build, sign, install while idle, then reopen. |
+| Native Swift app | Choose **Update and Restart** for a compatible prebuilt release. For source-only changes, build and sign from the original checkout. |
 | Python completion/review source | Start a new worker or review server after replacing reviewed source; an open server retains loaded code. |
 | Chrome extension | Reload the unpacked extension, then refresh meeting tabs when safe. |
 | Native browser host | Rerun its installer with the exact extension ID; changes apply on the next connection. |

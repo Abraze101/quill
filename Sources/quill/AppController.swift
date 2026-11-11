@@ -60,6 +60,8 @@ final class AppController {
     private var operationTask: Task<Void, Never>?
     private var ticker: Timer?
     private var shuttingDown = false
+    private var preparingUpdate = false
+    private var transcriptionActive = false
     private var transcriptionRetryInFlight = false
     private var transcriptionCancellationInFlight = false
     private var completionWorker: Process?
@@ -130,6 +132,13 @@ final class AppController {
             requestStop(manually: false)
         }
         meetingAutomation.onStatus = { [weak self] _ in self?.refreshUI() }
+        settings.onInstallUpdate = { [weak self] candidate in
+            guard let self else { throw CancellationError() }
+            try await installUpdate(candidate)
+        }
+        if let previous = QuillAppUpdater.takeResult() {
+            settings.showUpdateMessage(previous.message, reveal: !previous.success)
+        }
         settings.onCaptureScopeChange = { [weak self] scope in
             self?.savePreference { try Config.setScreenCaptureScope(scope == .entireScreen ? "display" : "window") }
         }
@@ -231,6 +240,41 @@ final class AppController {
             guard let self, phase == .idle, !shuttingDown else { return }
             meetingAutomation.retryFailedStart(meeting: meeting)
             refreshUI()
+        }
+    }
+
+    private var updateWaitReason: String? {
+        if phase != .idle { return "Finish the recording before updating Quill." }
+        if transcriptionActive || transcriptionRetryInFlight || transcriptionCancellationInFlight
+            || completionStatus?.hasActiveWork == true {
+            return "Wait for meeting processing to finish before updating Quill."
+        }
+        if shuttingDown || sleepController?.isSleeping == true { return "Try again when Quill is ready." }
+        return nil
+    }
+
+    private func checkUpdateIdle(transcribing: Bool) throws {
+        completionStatus = CompletionUIStatus(settingsURL: Config.workflowSettingsURL(), statusURL: Config.completionStatusURL())
+        if let reason = updateWaitReason { throw QuillAppUpdater.Failure(message: reason) }
+        if transcribing { throw QuillAppUpdater.Failure(message: "Wait for transcription to finish before updating Quill.") }
+    }
+
+    private func installUpdate(_ candidate: QuillUpdateChecker.Candidate) async throws {
+        guard !preparingUpdate else { throw QuillAppUpdater.Failure(message: "An update is already being prepared.") }
+        preparingUpdate = true
+        defer { preparingUpdate = false }
+        try checkUpdateIdle(transcribing: await transcription.hasWorkForUpdate)
+        let token = UUID()
+        do {
+            try await QuillAppUpdater.prepare(candidate, token: token)
+            // Capture stays available throughout preparation. Make the final
+            // recording check and normal shutdown in one MainActor turn.
+            try checkUpdateIdle(transcribing: await transcription.hasWorkForUpdate)
+            try QuillAppUpdater.applyAfterQuit(token)
+            shutdown()
+        } catch {
+            await QuillAppUpdater.discard(token)
+            throw error
         }
     }
 
@@ -919,6 +963,7 @@ final class AppController {
         }
         var state = QuillSettingsState()
         state.loginItem = loginItem.snapshot()
+        state.updateWaitReason = updateWaitReason
         state.includeScreenVideo = phase == .idle ? options.includeScreenVideo : requestedScreenVideo
         state.recordingStatus = options.stateOverride ?? (options.includeScreenVideo ? "Ready · audio + screen" : "Ready · audio only")
         state.recordingActionTitle = options.recordingActionTitle ?? "Start audio recording"
@@ -1558,6 +1603,10 @@ final class AppController {
     }
 
     private func showTranscription(_ status: TranscriptionCoordinator.Status) {
+        switch status {
+        case .idle, .failed: transcriptionActive = false
+        case .preparing, .transcribing, .cancelling: transcriptionActive = true
+        }
         for menu in menus {
             switch status {
             case .idle: menu.updateTranscription(nil)

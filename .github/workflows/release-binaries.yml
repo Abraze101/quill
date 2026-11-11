@@ -1,0 +1,92 @@
+name: Publish Quill update
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: quill-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref_type == 'tag'
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Check the release tag
+        run: |
+          set -euo pipefail
+          version=$(/usr/bin/plutil -extract CFBundleShortVersionString raw Sources/quill/Info.plist)
+          build=$(/usr/bin/plutil -extract CFBundleVersion raw Sources/quill/Info.plist)
+          test "$RELEASE_TAG" = "v$version"
+          echo "$version" | /usr/bin/grep -Eq '^(0|[1-9][0-9]{0,3})(\.(0|[1-9][0-9]{0,3})){2}$'
+          echo "$build" | /usr/bin/grep -Eq '^[1-9][0-9]{0,3}$'
+
+      - name: Build and verify both release executables
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/quill-release"
+          cp docs/licenses/Quill-Binary-Notices.txt "$RUNNER_TEMP/quill-release/"
+          for arch in arm64 x86_64; do
+            sh scripts/swift-local.sh build --arch "$arch" -c release --product quill --disable-automatic-resolution
+            binary_dir=$(sh scripts/swift-local.sh build --arch "$arch" -c release --show-bin-path)
+            cp "$binary_dir/quill" "$RUNNER_TEMP/quill-release/quill-macos-$arch"
+          done
+          python3 - <<'PY'
+          from pathlib import Path
+          import os, plistlib, sys
+          sys.path.insert(0, 'scripts')
+          from update_asset import verify_binary
+          info = plistlib.loads(Path('Sources/quill/Info.plist').read_bytes())
+          for arch in ('arm64', 'x86_64'):
+              binary = Path(os.environ['RUNNER_TEMP']) / 'quill-release' / ('quill-macos-' + arch)
+              verify_binary(binary, arch, info['CFBundleShortVersionString'], info['CFBundleVersion'])
+          PY
+
+      - name: Publish the verified files together
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          revision=$(git rev-parse 'HEAD^{commit}')
+          check_tag() {
+            test "$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" -H 'Accept: application/vnd.github.sha')" = "$revision"
+          }
+          check_tag
+          if ! gh release view "$RELEASE_TAG" --json tagName >/dev/null 2>&1; then
+            notes="$RUNNER_TEMP/quill-release-notes.md"
+            cat > "$notes" <<EOF
+          **Summary:** Quill $RELEASE_TAG for macOS.
+
+          **Description:** In Quill Settings, choose **Check for Updates…** and then **Update and Restart**. The app selects the executable for your Mac. For a first installation, see [Build from source](https://github.com/$GITHUB_REPOSITORY/blob/$revision/README.md#build-from-source). If your installed copy only offers a source download, follow the [update guide](https://github.com/$GITHUB_REPOSITORY/blob/$revision/docs/updating-local-source.md).
+          EOF
+            gh release create "$RELEASE_TAG" --verify-tag --draft --title "Quill ${RELEASE_TAG#v}" --notes-file "$notes"
+          fi
+          test "$(gh release view "$RELEASE_TAG" --json isPrerelease --jq .isPrerelease)" = false
+          if [ "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" != true ]; then
+            echo "This release is already public. Its published files were left in place."
+            exit 1
+          fi
+          cd "$RUNNER_TEMP/quill-release"
+          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber quill-macos-arm64 quill-macos-x86_64 Quill-Binary-Notices.txt
+          for asset in quill-macos-arm64 quill-macos-x86_64 Quill-Binary-Notices.txt; do
+            expected="sha256:$(shasum -a 256 "$asset" | cut -d' ' -f1)"
+            actual=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+              --jq ".assets[] | select(.name == \"$asset\" and .state == \"uploaded\") | .digest")
+            test "$expected" = "$actual"
+          done
+          check_tag
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false

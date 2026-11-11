@@ -48,6 +48,8 @@ actor TranscriptionCoordinator {
         delivery = CompletionDelivery(journal: journal)
     }
 
+    var hasWorkForUpdate: Bool { draining || activeSession != nil || !queue.isEmpty }
+
     func setStatusHandler(_ handler: @escaping @Sendable (Status) -> Void) {
         statusHandler = handler
     }

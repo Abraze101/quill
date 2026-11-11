@@ -28,6 +28,10 @@ enum Fixture {
     static var enqueued: [URL] = []
     static var registered: [URL] = []
     static var notices: [String] = []
+    static var updateGate = Gate(open: true)
+    static var updatePrepared: UUID?
+    static var updateDiscarded: UUID?
+    static var transcriptionBusy = false
     static var transcriptionEnabled = true
     static var speakerIdentificationEnabled = false
     static var remoteMicrophoneOwner: String?
@@ -54,6 +58,7 @@ enum Fixture {
         micStarts = 0; micStops = 0; systemStarts = 0; systemStops = 0
         systemStopRequests = 0; systemRecorders = []
         enqueued = []; registered = []; notices = []
+        updateGate = Gate(open: true); updatePrepared = nil; updateDiscarded = nil; transcriptionBusy = false
         transcriptionEnabled = true; retryGate = Gate(open: true); retryCalls = 0
         speakerIdentificationEnabled = false
         remoteMicrophoneOwner = nil
@@ -232,7 +237,25 @@ final class MenuBarController {
 }
 
 @MainActor
+enum QuillAppUpdater {
+    struct Failure: LocalizedError {
+        let message: String
+        var errorDescription: String? { message }
+    }
+    struct InstallResult { let message: String; let success: Bool }
+    static func takeResult() -> InstallResult? { nil }
+    static func prepare(_ candidate: QuillUpdateChecker.Candidate, token: UUID) async throws {
+        Fixture.updatePrepared = token
+        await Fixture.updateGate.wait()
+    }
+    static func discard(_ token: UUID) async { Fixture.updateDiscarded = token }
+    static func applyAfterQuit(_ token: UUID) throws { preconditionFailure("Unexpected restart during active work") }
+}
+
+@MainActor
 final class SettingsWindowController {
+    var onInstallUpdate: ((QuillUpdateChecker.Candidate) async throws -> Void)?
+    func showUpdateMessage(_ message: String, reveal: Bool) {}
     var onToggleRecording: (() -> Void)?
     var onStopRecording: ((String, Int?) -> Void)?
     var onPauseRecording: ((String, Int, Bool) -> Void)?
@@ -376,6 +399,7 @@ final class TranscriptionCoordinator {
         case cancelling(session: String, queued: Int, reservation: UUID), failed(session: String)
     }
     enum RetryResult { case disabled, queued(Int) }
+    var hasWorkForUpdate: Bool { get async { Fixture.transcriptionBusy } }
     func setStatusHandler(_ handler: @Sendable @escaping (Status) -> Void) async {}
     func resumePending(root: URL) async {}
     func refreshProcessingCancellations() async {}

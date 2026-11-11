@@ -38,9 +38,10 @@ meeting-note structure and limits on inferred names and actions.
 | [FluidAudio](https://github.com/FluidInference/FluidAudio) | 0.17.5 | [Apache-2.0](https://github.com/FluidInference/FluidAudio/blob/0b1f46289fe27d95b5e66ad8be46e64f5ee02ae7/LICENSE) |
 | [Swift Argument Parser](https://github.com/apple/swift-argument-parser) | 1.8.2 | [Apache-2.0 with Swift Runtime Library Exception](https://github.com/apple/swift-argument-parser/blob/6a52f3251125d74daf04fcbd5e6f08a75d074382/LICENSE.txt) |
 
-SwiftPM downloads these dependencies during a build. Their source, model weights
-and compiled app bundles are not included in this source snapshot. A binary release
-needs its own packaging review for dependency and model notices.
+SwiftPM downloads these dependencies during a build. The prebuilt executables
+ship with [binary distribution notices](licenses/Quill-Binary-Notices.txt).
+The installed app also carries a copy in `Contents/Resources`. Model weights
+are downloaded separately.
 
 FluidAudio 0.17.5 also declares the prebuilt **NemoTextProcessing 0.3.1** artifact
 from [text-processing-rs](https://github.com/FluidInference/text-processing-rs).

@@ -43,6 +43,11 @@ class PreviewPackagingTests(unittest.TestCase):
         icon = self.root / "scripts/app-icon/Quill.icns"
         icon.parent.mkdir(parents=True)
         icon.write_bytes(b"synthetic-icon-resource")
+        notices = self.root / "docs/licenses/Quill-Binary-Notices.txt"
+        notices.parent.mkdir(parents=True)
+        notices.write_text("Synthetic binary license notices.")
+        for helper in preview.UPDATE_HELPERS:
+            (self.root / "scripts" / helper).write_text("# fixture " + helper)
         self.app = self.root / ".build/Quill.app"
         executable = self.app / "Contents/MacOS/quill"
         executable.parent.mkdir(parents=True)
@@ -134,6 +139,7 @@ class PreviewPackagingTests(unittest.TestCase):
         self.assertEqual(info["CFBundleVersion"], "2")
         self.assertEqual(info["CFBundleIconFile"], "Quill.icns")
         self.assertEqual((self.app / "Contents/Resources/Quill.icns").read_bytes(), b"synthetic-icon-resource")
+        self.assertTrue((self.app / "Contents/Resources/Quill-Binary-Notices.txt").is_file())
         self.assertFalse(any(command[0] == "/usr/bin/security" for command in self.commands))
         self.assertEqual(self.debug_binary.read_bytes(), b"stale-debug-binary")
         self.assert_staging_clean()
@@ -147,6 +153,30 @@ class PreviewPackagingTests(unittest.TestCase):
         self.assertFalse(any("--sign" in command for command in self.commands))
         self.assert_previous()
         self.assert_staging_clean()
+
+    def test_prebuilt_signs_verified_copy_and_bundles_next_updater_without_compiling(self):
+        live_root = self.root / "original-checkout"
+        candidate = self.root / "update" / "Quill.app"
+        candidate.parent.mkdir()
+        result = preview.package_prebuilt(self.root, live_root, self.binary, preview.digest(self.binary),
+                                          candidate, CERTIFICATE, runner=self.runner)
+        self.assertEqual(result, candidate)
+        marker = json.loads((result / preview.MARKER).read_bytes())
+        self.assertEqual(marker["checkout"], str(live_root))
+        self.assertEqual(marker["signing_identity"], CERTIFICATE)
+        self.assertEqual((result / "Contents/MacOS/quill").read_bytes(), b"stale-binary-signed-copy")
+        self.assertFalse(any(command[0] == "sh" for command in self.commands))
+        for helper in preview.UPDATE_HELPERS:
+            self.assertEqual((result / "Contents/Resources" / helper).read_bytes(),
+                             (self.root / "scripts" / helper).read_bytes())
+
+    def test_prebuilt_digest_mismatch_stops_before_signing_or_running_any_download(self):
+        candidate = self.root / "Quill.app"
+        with self.assertRaisesRegex(preview.PackagingError, "expected release"):
+            preview.package_prebuilt(self.root, self.root, self.binary, "0" * 64,
+                                     candidate, CERTIFICATE, runner=self.runner)
+        self.assertFalse(candidate.exists())
+        self.assertFalse(any("--sign" in command or "doctor" in command for command in self.commands))
 
     def test_missing_release_never_falls_back_to_existing_debug_binary(self):
         self.failure = "missing-release"

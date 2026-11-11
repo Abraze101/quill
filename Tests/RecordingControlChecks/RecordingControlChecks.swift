@@ -308,6 +308,34 @@ struct RecordingControlChecks {
                        "An earlier download must disappear when there is no available update")
             }
         }
+        let candidate = QuillUpdateChecker.Candidate(commit: String(repeating: "a", count: 40), version: "0.1.18", build: "21")
+        let ready = SettingsWindowController(lookupUpdate: {
+            .available(installed: "0.1.17 (20)", published: "0.1.18 (21)", source: source, guide: guide, restart: candidate)
+        })
+        let updateViews = allViews(ready.window!.contentView!)
+        let updateCheck = updateViews.compactMap { $0 as? NSButton }.first { $0.title == "Check for Updates…" }!
+        let restart = updateViews.compactMap { $0 as? NSButton }.first { $0.title == "Update and Restart" }!
+        let status = updateViews.compactMap { $0 as? NSTextField }.first { $0.accessibilityIdentifier() == "quill-update-status" }!
+        var attempts = 0
+        ready.onInstallUpdate = { choice in
+            expect(choice == candidate, "Install the candidate bound to the visible check")
+            attempts += 1
+            if attempts == 1 { throw URLError(.notConnectedToInternet) }
+        }
+        ready.update(state)
+        updateCheck.performClick(nil)
+        for _ in 0..<100 where !updateCheck.isEnabled { await Task.yield() }
+        expect(!restart.isHiddenOrHasHiddenAncestor && !restart.isEnabled, "Recording must keep a published update visible and prevent restart")
+        state.isRecording = false
+        ready.update(state)
+        restart.performClick(nil)
+        for _ in 0..<100 where !restart.isEnabled { await Task.yield() }
+        expect(attempts == 1 && status.stringValue.contains("Couldn’t install") && restart.isEnabled, "A preparation failure must leave Quill open for retry")
+        restart.performClick(nil)
+        restart.performClick(nil)
+        for _ in 0..<100 where attempts < 2 { await Task.yield() }
+        expect(attempts == 2 && !restart.isEnabled && status.stringValue == "Restarting Quill…", "Hand off once after a successful retry")
+
         for layout in [MenuBarController.Layout.statusItem, .application] {
             let controller = MenuBarController(layout: layout)
             let menu = layout == .statusItem ? controller.menu : controller.menu.item(withTitle: "Quill")!.submenu!

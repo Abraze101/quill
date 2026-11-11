@@ -8,6 +8,7 @@ struct CompletionUIStatus {
     var preferences: WorkflowPreferences?
     var processingTitle: String?
     var processingDetail = ""
+    var hasActiveWork = false
     var needsAttention = false
     var attentionDetail = ""
     var alertRevision: String?
@@ -20,6 +21,7 @@ struct CompletionUIStatus {
                let state = processing["state"] as? String,
                ["idle", "queued", "running", "retrying", "waiting_for_company", "needs_attention"].contains(state),
                let title = Self.text(processing["title"], limit: 200) {
+                hasActiveWork = state == "running"
                 processingTitle = title
                 processingDetail = Self.text(processing["detail"], limit: 1000) ?? ""
                 attentionDetail = Self.text(processing["attention_detail"], limit: 1000) ?? ""

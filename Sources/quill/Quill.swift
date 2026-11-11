@@ -30,6 +30,9 @@ struct Run: ParsableCommand {
 
     @MainActor
     private func runMain() throws {
+        // The helper needs the instance lock to finish an interrupted swap.
+        // Hand off before starting recording, transcription, or workflow services.
+        if try QuillAppUpdater.handOffInterruptedUpdate(confirmRepair: confirmUpdateRepair) { return }
         let instanceLock: RunInstanceLock
         do {
             instanceLock = try RunInstanceLock()
@@ -74,6 +77,24 @@ struct Run: ParsableCommand {
             "quill up · recordings → \(root.path) · ^C to quit\n".utf8
         ))
         withExtendedLifetime((instanceLock, appDelegate)) { app.run() }
+    }
+
+    @MainActor
+    private func confirmUpdateRepair(_ message: String) -> Bool {
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Quill needs to finish its update"
+        alert.informativeText = message
+        alert.addButton(withTitle: "Retry Repair")
+        alert.addButton(withTitle: "Open Update Guide")
+        alert.addButton(withTitle: "Quit")
+        switch alert.runModal() {
+        case .alertFirstButtonReturn: return true
+        case .alertSecondButtonReturn:
+            NSWorkspace.shared.open(URL(string: "https://github.com/Abraze101/quill/blob/main/docs/updating-local-source.md")!)
+            return false
+        default: return false
+        }
     }
 }
 

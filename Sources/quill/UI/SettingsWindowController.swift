@@ -41,6 +41,7 @@ struct QuillSettingsState {
     var captureTargetDetail: String?
     var localTranscription = false
     var identifySpeakers = false
+    var updateWaitReason: String?
     var isRecording = false
     var isPaused = false
     var pauseEnabled = false
@@ -73,6 +74,7 @@ struct QuillSettingsState {
 
 @MainActor
 final class SettingsWindowController: NSWindowController {
+    var onInstallUpdate: ((QuillUpdateChecker.Candidate) async throws -> Void)?
     var onToggleRecording: (() -> Void)?
     var onStopRecording: ((String, Int?) -> Void)?
     var onPauseRecording: ((String, Int, Bool) -> Void)?
@@ -133,9 +135,13 @@ final class SettingsWindowController: NSWindowController {
     private let updateButton = NSButton(title: "Check for Updates…", target: nil, action: nil)
     private let updateStatus = NSTextField(wrappingLabelWithString: "")
     private let updateActions = NSStackView()
+    private let updateWaitLabel = NSTextField(wrappingLabelWithString: "")
+    private let restartButton = NSButton(title: "Update and Restart", target: nil, action: nil)
+    private let sourceButton = NSButton(title: "Download Source", target: nil, action: nil)
+    private var installingUpdate = false
     private let lookupUpdate: @MainActor () async throws -> QuillUpdateChecker.Result
     private let openUpdateURL: @MainActor (URL) -> Bool
-    private var availableUpdate: (source: URL, guide: URL)?
+    private var availableUpdate: (source: URL, guide: URL, restart: QuillUpdateChecker.Candidate?)?
 
     init(lookupUpdate: @escaping @MainActor () async throws -> QuillUpdateChecker.Result = { try await QuillUpdateChecker.check() },
          openUpdateURL: @escaping @MainActor (URL) -> Bool = { NSWorkspace.shared.open($0) }) {
@@ -171,6 +177,15 @@ final class SettingsWindowController: NSWindowController {
         scrollToUpdates()
     }
 
+    func showUpdateMessage(_ message: String, reveal: Bool) {
+        updateStatus.stringValue = message
+        updateStatus.isHidden = false
+        if reveal {
+            show()
+            scrollToUpdates()
+        }
+    }
+
     private func scrollToUpdates() {
         window?.contentView?.layoutSubtreeIfNeeded()
         updatesSection.scrollToVisible(updatesSection.bounds)
@@ -181,6 +196,7 @@ final class SettingsWindowController: NSWindowController {
         updateButton.isEnabled = false
         availableUpdate = nil
         updateActions.isHidden = true
+        updateWaitLabel.isHidden = true
         updateStatus.stringValue = "Checking GitHub for a newer version…"
         updateStatus.isHidden = false
         Task {
@@ -190,9 +206,13 @@ final class SettingsWindowController: NSWindowController {
                     updateStatus.stringValue = "Quill \(version) is up to date."
                 case .localNewer(let installed, let published):
                     updateStatus.stringValue = "This Mac has Quill \(installed). GitHub has \(published). Your version is newer."
-                case .available(let installed, let published, let source, let guide):
-                    availableUpdate = (source, guide)
-                    updateStatus.stringValue = "Quill \(published) is available. This Mac has \(installed). Follow the guide to build and install the update from source."
+                case .available(let installed, let published, let source, let guide, let restart):
+                    availableUpdate = (source, guide, restart)
+                    let fallback = restart == nil ? " Follow the guide to install the source update." : ""
+                    updateStatus.stringValue = "Quill \(published) is available. This Mac has \(installed).\(fallback)"
+                    restartButton.isHidden = restart == nil
+                    sourceButton.isHidden = restart != nil
+                    updateRestartAvailability()
                 }
             } catch {
                 updateStatus.stringValue = "Couldn’t check for updates. \(error.localizedDescription)"
@@ -201,6 +221,34 @@ final class SettingsWindowController: NSWindowController {
             updateActions.isHidden = availableUpdate == nil
             updateButton.isEnabled = true
             if wasVisible { scrollToUpdates() }
+        }
+    }
+
+    private func updateRestartAvailability() {
+        let reason = state.updateWaitReason ?? (state.isRecording ? "Finish the recording before updating Quill." : nil)
+        restartButton.isEnabled = !installingUpdate && reason == nil
+        updateWaitLabel.stringValue = reason ?? ""
+        updateWaitLabel.isHidden = availableUpdate?.restart == nil || installingUpdate || reason == nil
+    }
+
+    @objc private func installAndRestart() {
+        guard restartButton.isEnabled, !installingUpdate, state.updateWaitReason == nil, !state.isRecording,
+              let candidate = availableUpdate?.restart, let onInstallUpdate else { return }
+        installingUpdate = true
+        updateButton.isEnabled = false
+        updateRestartAvailability()
+        updateStatus.stringValue = "Preparing Quill \(candidate.version)…"
+        Task {
+            do {
+                try await onInstallUpdate(candidate)
+                updateStatus.stringValue = "Restarting Quill…"
+            } catch {
+                installingUpdate = false
+                updateButton.isEnabled = true
+                updateRestartAvailability()
+                sourceButton.isHidden = false
+                updateStatus.stringValue = "Couldn’t install the update. \(error.localizedDescription)"
+            }
         }
     }
 
@@ -215,6 +263,7 @@ final class SettingsWindowController: NSWindowController {
 
     func update(_ state: QuillSettingsState) {
         self.state = state
+        updateRestartAvailability()
         statusLabel.stringValue = state.recordingStatus
         statusLabel.textColor = state.recordingNeedsAttention ? .systemRed : state.isPaused ? .systemOrange : .labelColor
         issueLabel.stringValue = state.recordingIssue ?? ""
@@ -510,8 +559,16 @@ final class SettingsWindowController: NSWindowController {
         updateStatus.setAccessibilityIdentifier("quill-update-status")
         add(detail(updateStatus), to: updatesSection)
         updateStatus.isHidden = true
+        add(detail(updateWaitLabel), to: updatesSection)
+        updateWaitLabel.isHidden = true
+        restartButton.target = self
+        restartButton.action = #selector(installAndRestart)
+        restartButton.setAccessibilityIdentifier("quill-update-restart")
+        updateActions.addArrangedSubview(restartButton)
         updateActions.addArrangedSubview(NSButton(title: "Installation Guide", target: self, action: #selector(openUpdateGuide)))
-        updateActions.addArrangedSubview(NSButton(title: "Download Source", target: self, action: #selector(downloadUpdateSource)))
+        sourceButton.target = self
+        sourceButton.action = #selector(downloadUpdateSource)
+        updateActions.addArrangedSubview(sourceButton)
         updatesSection.addArrangedSubview(updateActions)
         updateActions.isHidden = true
         add(updatesSection, to: root)

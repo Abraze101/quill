@@ -184,6 +184,33 @@ extension AppController {
         }
     }
 
+    static func updateStopsForNewActivity() async throws {
+        try await withFixture { app in
+            let candidate = QuillUpdateChecker.Candidate(commit: String(repeating: "a", count: 40), version: "1.2.3", build: "9")
+            Fixture.transcriptionBusy = true
+            do {
+                try await app.installUpdate(candidate)
+                preconditionFailure("Active transcription cannot be interrupted for an update")
+            } catch { precondition(Fixture.updatePrepared == nil) }
+            Fixture.transcriptionBusy = false
+            Fixture.updateGate = Gate(open: false)
+            let update = Task { try await app.installUpdate(candidate) }
+            try await waitFor { Fixture.updatePrepared != nil }
+            app.requestStart()
+            try await waitFor { app.phase == .recording }
+            Fixture.updateGate.release()
+            do {
+                try await update.value
+                preconditionFailure("An update must yield to a meeting that started during preparation")
+            } catch {
+                precondition(app.phase == .recording && !app.shuttingDown)
+                precondition(Fixture.updateDiscarded == Fixture.updatePrepared)
+            }
+            app.requestStop(manually: true)
+            try await waitFor { app.phase == .idle }
+        }
+    }
+
     static func chosenDisplayFollowsManualAndAutomaticStarts() async throws {
         try await withFixture { app in
             let builtIn = UUID(), external = UUID()
@@ -705,6 +732,7 @@ private struct AppSleepChecks {
         try await AppController.ambiguousMeetingContextIsOmitted()
         try await AppController.contextFreeRemoteMicrophoneOwner()
         try await AppController.chosenDisplayFollowsManualAndAutomaticStarts()
+        try await AppController.updateStopsForNewActivity()
         try await AppController.warningHistoryDoesNotControlCapture()
         try await AppController.warningHistoryIncludesFailedStartup()
         try await AppController.crashCheckpointAndRestartReview()

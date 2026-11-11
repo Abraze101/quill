@@ -141,6 +141,17 @@ def existing_destination(destination, root, identity, runner):
     return fingerprint(destination)
 
 
+def exchange_directories(first, second):
+    """Darwin RENAME_SWAP keeps both names valid during an in-app upgrade."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    rename = libc.renamex_np
+    rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+    rename.restype = ctypes.c_int
+    if rename(os.fsencode(first), os.fsencode(second), 0x00000002) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), str(second))
+
+
 def sync_directory(path):
     descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
@@ -211,7 +222,7 @@ def retain_previous(destination, source, root, identity, before_destination, bef
 
 
 def install(root, destination=DEFAULT_DESTINATION, *, source_app=None, runner=run,
-            idle_check=require_idle, report=print, consistency_check=lambda: None):
+            idle_check=require_idle, report=print, consistency_check=lambda: None, atomic_swap=False):
     root = Path(root).resolve(strict=True)
     source = Path(os.path.abspath(source_app)) if source_app is not None else root / ".build/Quill.app"
     destination = Path(os.path.abspath(destination))
@@ -257,15 +268,20 @@ def install(root, destination=DEFAULT_DESTINATION, *, source_app=None, runner=ru
                 raise InstallError("The installed app changed before replacement; retry installation")
             if fingerprint(source) != before_source:
                 raise InstallError("The preview app changed before replacement; retry installation")
-            previous = staging / "previous.app"
+            previous = staged if atomic_swap else staging / "previous.app"
             published = False
             try:
                 # A caller restoring compatible software can recheck live
                 # dependencies here after the potentially lengthy copy.
                 consistency_check()
-                if before_destination is not None:
-                    destination.rename(previous)
-                staged.rename(destination)
+                if atomic_swap:
+                    if before_destination is None:
+                        raise InstallError("An in-app update needs the existing installation")
+                    exchange_directories(staged, destination)
+                else:
+                    if before_destination is not None:
+                        destination.rename(previous)
+                    staged.rename(destination)
                 published = True
                 if validate_app(destination, root, runner) != identity or fingerprint(destination) != before_source:
                     raise InstallError("Installed app validation did not match the signed source")
@@ -286,8 +302,11 @@ def install(root, destination=DEFAULT_DESTINATION, *, source_app=None, runner=ru
                         idle_check(destination)
                         if fingerprint(destination) != before_source:
                             raise InstallError("Installed app changed during rollback")
-                        destination.rename(staging / "failed.app")
-                    if previous.exists():
+                        if atomic_swap:
+                            exchange_directories(previous, destination)
+                        else:
+                            destination.rename(staging / "failed.app")
+                    if not atomic_swap and previous.exists():
                         previous.rename(destination)
                 except BaseException as error:
                     preserve_recovery = True

@@ -22,6 +22,7 @@ from xml.parsers.expat import ExpatError
 SCHEMA = "quill-local-preview-v1"
 MARKER = Path("Contents/Resources/quill-local-preview.json")
 CONFIGURATION = "release"
+UPDATE_HELPERS = ("app-update.py", "update_asset.py", "build-preview-app.py", "install-app.py")
 
 
 class PackagingError(Exception):
@@ -160,6 +161,64 @@ def check_source_info(root, expected):
         raise PackagingError("Source Info.plist changed during packaging; rebuild from stable source metadata")
 
 
+def write_signed_bundle(app, source_root, checkout, binary, source_hash, info, identity, runner):
+    info.update({
+        "CFBundleExecutable": "quill",
+        "CFBundlePackageType": "APPL",
+        "CFBundleDisplayName": "Quill",
+        "CFBundleIconFile": "Quill.icns",
+        "CFBundleInfoDictionaryVersion": "6.0",
+        "LSUIElement": True,
+        "LSMinimumSystemVersion": "15.0",
+    })
+    executable = app / "Contents/MacOS/quill"
+    executable.parent.mkdir(parents=True)
+    shutil.copy2(binary, executable)
+    if digest(executable) != source_hash:
+        raise PackagingError("The copied executable differs from the expected release")
+    executable.chmod(0o755)
+    (app / "Contents/Info.plist").write_bytes(plistlib.dumps(info))
+    marker = app / MARKER
+    marker.parent.mkdir()
+    # Bundle artwork before signing so every install carries the icon
+    # and the signature seals it alongside the other app resources.
+    shutil.copy2(source_root / "scripts/app-icon/Quill.icns", marker.parent / "Quill.icns")
+    shutil.copyfile(source_root / "docs/licenses/Quill-Binary-Notices.txt", marker.parent / "Quill-Binary-Notices.txt")
+    for helper in UPDATE_HELPERS:
+        source = source_root / "scripts" / helper
+        if source.is_symlink() or not source.is_file():
+            raise PackagingError(f"Missing update helper: {helper}")
+        shutil.copyfile(source, marker.parent / helper)
+    marker.write_text(json.dumps({
+        "schema": SCHEMA, "checkout": str(checkout),
+        "source_binary_sha256": source_hash, "signing_identity": identity,
+        "build_configuration": CONFIGURATION,
+        "version": info["CFBundleShortVersionString"], "build_number": info["CFBundleVersion"],
+        "packaged_at": datetime.now(timezone.utc).isoformat(),
+    }, indent=2) + "\n")
+    # Sign only the independent copy, sealing its external plist/resources.
+    runner(["/usr/bin/codesign", "--force", "--sign", identity, "--timestamp=none", str(app)])
+    validate_app(app, runner)
+
+
+def package_prebuilt(source_root, checkout, binary, sha256, destination, identity, *, runner=run):
+    """Sign a verified release for an existing installation inside private update staging."""
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", identity):
+        raise PackagingError("Updates require the installed app's signing certificate")
+    if not re.fullmatch(r"[0-9a-f]{64}", sha256) or binary.is_symlink() or not binary.is_file():
+        raise PackagingError("The release executable or its expected digest is invalid")
+    if destination.is_symlink() or destination.exists():
+        raise PackagingError("The staged application path is already in use")
+    info, source_plist = source_info(source_root)
+    signer = signing_identity(identity, runner)
+    with tempfile.TemporaryDirectory(prefix=".quill-sign-", dir=destination.parent) as directory:
+        staged = Path(directory) / "Quill.app"
+        write_signed_bundle(staged, source_root, checkout, binary, sha256, info, signer, runner)
+        check_source_info(source_root, source_plist)
+        staged.rename(destination)
+    return destination
+
+
 def package(root, identity=None, *, runner=run, idle_check=require_idle):
     root = Path(root).resolve()
     build = root / ".build"
@@ -190,38 +249,11 @@ def package(root, identity=None, *, runner=run, idle_check=require_idle):
         # A failed or missing release is an error, even if a debug build exists.
         binary = (build / CONFIGURATION / "quill").resolve(strict=True)
         source_hash = digest(binary)
-        info.update({
-            "CFBundleExecutable": "quill",
-            "CFBundlePackageType": "APPL",
-            "CFBundleDisplayName": "Quill",
-            "CFBundleIconFile": "Quill.icns",
-            "CFBundleInfoDictionaryVersion": "6.0",
-            "LSUIElement": True,
-            "LSMinimumSystemVersion": "15.0",
-        })
         staging = Path(tempfile.mkdtemp(prefix=".quill-preview-", dir=build))
         preserve_recovery = False
         try:
             app = staging / "Quill.app"
-            executable = app / "Contents/MacOS/quill"
-            executable.parent.mkdir(parents=True)
-            shutil.copy2(binary, executable)
-            (app / "Contents/Info.plist").write_bytes(plistlib.dumps(info))
-            marker = app / MARKER
-            marker.parent.mkdir()
-            # Bundle artwork before signing so every install carries the icon
-            # and the signature seals it alongside the other app resources.
-            shutil.copy2(root / "scripts/app-icon/Quill.icns", marker.parent / "Quill.icns")
-            marker.write_text(json.dumps({
-                "schema": SCHEMA, "checkout": str(root),
-                "source_binary_sha256": source_hash, "signing_identity": identity,
-                "build_configuration": CONFIGURATION,
-                "version": info["CFBundleShortVersionString"], "build_number": info["CFBundleVersion"],
-                "packaged_at": datetime.now(timezone.utc).isoformat(),
-            }, indent=2) + "\n")
-            # Sign only the independent copy, sealing its external plist/resources.
-            runner(["/usr/bin/codesign", "--force", "--sign", identity, "--timestamp=none", str(app)])
-            validate_app(app, runner)
+            write_signed_bundle(app, root, root, binary, source_hash, info, identity, runner)
             if digest(binary) != source_hash:
                 raise PackagingError("Source binary changed during packaging; rerun after the build finishes")
 

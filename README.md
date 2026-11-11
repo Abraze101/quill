@@ -88,9 +88,10 @@ The script retains its existing name but always builds and packages the release
 configuration. **About Quill…** in the feather menu shows the custom app's version
 and build number from `Sources/quill/Info.plist`.
 
-Choose **Check for Updates…** in Quill to compare your installed build with this
-repository. When a newer build is available, you can download its source and
-open its [installation instructions](docs/updating-local-source.md#install-the-update-shown-in-quill).
+Choose **Check for Updates…** in Quill. When a newer release includes a build
+for your Mac, choose **Update and Restart**. Quill downloads the executable,
+keeps your existing signing identity and workflow settings, and reopens after
+installation. [Updating an existing installation](docs/updating-local-source.md#install-the-update-shown-in-quill)
 
 See the [setup guide](docs/meeting-workflow.md) for signing, installation,
 permissions, and the Chrome extension. The installer rejects ad hoc signatures
@@ -188,6 +189,5 @@ The October 23 review found upstream at
 including a multi-platform directory reorganization. That reorganization has not
 been merged here; this version remains macOS-only.
 
-Updates are reviewed in a separate candidate and tested before installation.
-There is no automatic merge, app update, or GitHub deployment. This source
-release preserves upstream ancestry and omits private operational history.
+Changes from upstream are reviewed separately. The in-app updater follows
+releases of this fork and runs when you choose **Update and Restart**.
