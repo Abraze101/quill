@@ -311,6 +311,32 @@ class PipelineRoutingTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaisesRegex(WorkflowError, "must be a boolean"):
                 route_settings(dict(self.config["route"], auto_file_explicit_companies=value))
 
+    def test_registered_rename_is_live_only_for_old_and_new_jobs(self):
+        folder = "nested_folder_123"
+        child = {"id": "acme-sales", "name": "Acme / Sales", "drive_folder_id": folder,
+                 "drive_folder_path": [{"name": "Acme", "drive_folder_id": "company_folder_123"},
+                                       {"name": "Sales", "drive_folder_id": folder}]}
+        self.companies.append(child)
+        old_job = self.queue.enqueue(self.session, self.config)
+        with self.queue.db:
+            self.queue.db.execute("UPDATE tasks SET status='held' WHERE job=? AND stage='route'", (old_job,))
+        child["name"] = "Acme / Client Sales"
+        child["drive_folder_path"][-1]["name"] = "Client Sales"
+        self.config["route"]["previous_drive_folder_names"] = {folder: ["Sales"]}
+        self.queue.release(old_job, "route", self.config)
+        self.session = self.session.rename(self.session.with_name("second"))
+        new_job = self.queue.enqueue(self.session, self.config)
+        for job, name in ((old_job, "Acme / Sales"), (new_job, "Acme / Client Sales")):
+            task = next(t for t in self.queue.tasks(job) if t["stage"] == "route")
+            settings = json.loads(task["settings"])
+            self.assertNotIn("previous_drive_folder_names", settings)
+            saved = next(c for c in route_settings(settings)["companies"] if c["id"] == child["id"])
+            self.assertEqual(saved["name"], name)
+            self.assertNotIn("previous_folder_names", saved)
+        self.config["route"]["previous_drive_folder_names"] = {"unknown_folder_id": ["Sales"]}
+        with self.assertRaisesRegex(NeedsConfiguration, "configured Drive folder ID"):
+            route_settings(self.config["route"])
+
 
 if __name__ == "__main__":
     unittest.main()

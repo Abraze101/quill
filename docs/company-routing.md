@@ -95,8 +95,23 @@ and aliases shared by multiple destinations stay in review.
 Adding a subfolder affects newly queued meetings. It does not move existing Drive
 files or change older jobs, choices, upload journals or receipts. The complete
 path is frozen with each new job and bound to its approval and upload identity.
-Changing a saved path requires a new review. The model receives only destination
-labels, descriptions and aliases; folder IDs remain local.
+The model receives destination labels, descriptions and aliases. Folder IDs stay local.
+
+After renaming a destination in Drive, update its label and final path component in
+`route.companies`. Record the previous leaf name under its verified folder ID in
+`route.previous_drive_folder_names`, for example
+`{"EXISTING_SALES_FOLDER_ID": ["Sales Meetings"]}`. Quill checks the current name
+in Drive and requires the same folder ID, ancestors, owner and viewers. Existing
+approvals and upload receipts retain the name the user originally approved.
+
+To update an undecided meeting's picker, run
+`workflow.py refresh-folder-choices JOB --revision REVISION` with its current
+review revision. This explicitly refreshes a held routing task and its review
+after checking the transcript and the existing destinations. Reload Meeting
+Review to choose from the revised list. If interrupted, repeat the command with
+the original revision. Recovery finishes the saved refresh when the current
+configuration still supports those choices. Otherwise it restores the original
+choices for a new review.
 
 ## Filing policy and review
 
@@ -118,7 +133,12 @@ The setting is frozen when a meeting enters the queue. Enabling it affects futur
 
 An optional entry with `id: "general"` and `name: "General"` supports personal, learning, networking and broader planning meetings that do not belong to one company. Give it its own Drive folder ID and a description of that scope. Codex requires transcript evidence for the broader purpose. It must still abstain when context is missing or ownership is unclear; General is not an automatic fallback. A company that clearly owns the work takes precedence. General uses the same meeting subfolders, notes/transcript document, recording archive and approval flow as the company folders.
 
-The company list and review policy are frozen per job. A decision is tied to the exact transcript bytes, folder map, and displayed revision. Adding a category or alias to the live configuration is compatible with older jobs when every original ID, name, destination, description, and alias remains unchanged. Older jobs retain their original map, choices, review revisions and receipts; new categories and aliases apply only to newly queued meetings. Removing or replacing a frozen alias, changing the transcript, or editing/removing an original category requires an explicit new revision and review. There is no automatic migration command. Upload adapters receive only the validated `{route}` file and `{drive_folder_id}` value after routing succeeds. They must still verify Drive access and their completed uploads.
+Quill binds each decision to the transcript bytes, folder map and review revision.
+New categories and aliases appear on newly queued jobs and on undecided reviews
+explicitly refreshed with the command above. Renaming a registered leaf preserves
+an existing approval only when its destination and access still match. Changing
+the transcript, removing an approved destination or changing its permissions
+requires another review. Upload adapters verify Drive access and completed uploads.
 
 Add the optional menu command to Quill's `config.json`:
 

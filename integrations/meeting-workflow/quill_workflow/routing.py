@@ -39,6 +39,11 @@ def _job(value):
     return value
 
 
+def _valid_folder_name(label):
+    return (isinstance(label, str) and 0 < len(label) <= 200 and label == label.strip()
+            and "/" not in label and not any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in label))
+
+
 def validate_folder_path(path, folder, name):
     """Validate an explicit company-to-leaf chain; the Meetings root is implicit."""
     if not isinstance(path, list) or not 2 <= len(path) <= 8:
@@ -51,8 +56,7 @@ def validate_folder_path(path, folder, name):
         if (not isinstance(identity, str) or not re.fullmatch(r"[A-Za-z0-9_-]{10,200}", identity)
                 or identity in seen):
             raise RoutingError("Subfolder path IDs must be valid and unique")
-        if (not isinstance(label, str) or not label or label != label.strip() or len(label) > 200
-                or "/" in label or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in label)):
+        if not _valid_folder_name(label):
             raise RoutingError("Subfolder path names must be plain bounded names")
         seen.add(identity)
         result.append({"name": label, "drive_folder_id": identity})
@@ -96,7 +100,8 @@ def validate_companies(companies):
     normalized, ids, folders = [], set(), set()
     for company in companies:
         if not isinstance(company, dict) or set(company) - {
-                "id", "name", "drive_folder_id", "description", "aliases", "drive_folder_path", "drive_reader_emails"}:
+                "id", "name", "drive_folder_id", "description", "aliases", "drive_folder_path",
+                "drive_reader_emails", "previous_folder_names"}:
             raise RoutingError("Company entries contain unsupported fields")
         company_id, name, folder = (company.get(key) for key in ("id", "name", "drive_folder_id"))
         description = company.get("description", "")
@@ -129,10 +134,49 @@ def validate_companies(companies):
             entry["aliases"] = aliases
         if "drive_folder_path" in company:
             entry["drive_folder_path"] = validate_folder_path(company["drive_folder_path"], folder, name)
+        if "previous_folder_names" in company:
+            history = company["previous_folder_names"]
+            if "drive_folder_path" not in entry or not isinstance(history, list) or len(history) > 20:
+                raise RoutingError("Configure at most 20 previous leaf names on a nested destination")
+            leaf = entry["drive_folder_path"][-1]["name"]
+            if (any(not _valid_folder_name(label) or label in (".", "..") or "\\" in label
+                    or len(name) - len(leaf) + len(label) > 200 for label in history)
+                    or leaf in history or len(set(history)) != len(history)):
+                raise RoutingError("Previous folder names must be distinct, plain historical leaf names")
+            if history:
+                entry["previous_folder_names"] = sorted(history)
         if "drive_reader_emails" in company:
             entry["drive_reader_emails"] = route_reader_emails(company)
         normalized.append(entry)
     return sorted(normalized, key=lambda company: company["id"])
+
+
+def freeze_companies(companies):
+    """A review offers current destinations. Former names apply only to live verification."""
+    choices = validate_companies(companies)
+    for choice in choices:
+        choice.pop("previous_folder_names", None)
+    return choices
+
+
+def matches_destination(current_company, frozen_route):
+    """Match an approved route to the current destination, including registered leaf renames."""
+    try:
+        company, = validate_companies([current_company])
+    except RoutingError:
+        return False
+    destination = _route([company], company["id"])
+    if destination == frozen_route:
+        return True
+    # Build each exact route this company previously used. _route copies the
+    # path, so neither the live configuration nor the frozen approval is edited.
+    for previous_name in company.get("previous_folder_names", []):
+        path = destination["drive_folder_path"]
+        path[-1]["name"] = previous_name
+        destination["company_name"] = " / ".join(part["name"] for part in path)
+        if destination == frozen_route:
+            return True
+    return False
 
 
 def preserves_company_map(current, frozen):
@@ -140,18 +184,17 @@ def preserves_company_map(current, frozen):
 
     Only compare live configuration with a frozen job here. Saved review maps,
     hashes and receipts still require exact equality. Every original entry,
-    including its description and aliases, must remain available. New aliases
-    only affect new jobs; they never revise a frozen map or grant approval.
+    including its description and aliases, must remain available. Only explicitly
+    registered leaf renames can match a different path label for the same folder.
     """
     current_by_id = {company["id"]: company for company in validate_companies(current)}
     for company in validate_companies(frozen):
         live = current_by_id.get(company["id"])
-        if live is None or any(live[key] != company[key]
-                               for key in ("id", "name", "drive_folder_id", "description")):
+        if live is None or live["description"] != company["description"]:
             return False
         if not set(company.get("aliases", [])).issubset(live.get("aliases", [])):
             return False
-        if any(live.get(key) != company.get(key) for key in ("drive_folder_path", "drive_reader_emails")):
+        if not matches_destination(live, _route([company], company["id"])):
             return False
     return True
 

@@ -12,7 +12,7 @@ import subprocess
 import tempfile
 import time
 
-from quill_workflow.routing import (RoutingError, RoutingReviews, _route as configured_route, preserves_company_map,
+from quill_workflow.routing import (RoutingError, RoutingReviews, freeze_companies, matches_destination, preserves_company_map,
                                     transcript_identity, validate_companies)
 from quill_workflow.meeting_title import meeting_title
 from quill_workflow.meeting_dates import recording_timezone
@@ -142,17 +142,29 @@ def automatic_calendar_suggestions_since(config):
 
 
 def route_settings(settings):
-    """Validate and freeze only user-configured destination mappings."""
+    """Validate current destinations and their explicitly registered former names."""
     try:
         companies = validate_companies(settings.get("companies"))
+        # Store rename history separately on disk so an older worker already
+        # uploading another meeting can still read its unchanged settings.
+        if "previous_drive_folder_names" in settings:
+            history = settings["previous_drive_folder_names"]
+            if not isinstance(history, dict) or set(history) - {c["drive_folder_id"] for c in companies}:
+                raise RoutingError("Previous folder names must reference a configured Drive folder ID")
+            for c in companies:
+                if c["drive_folder_id"] in history:
+                    c["previous_folder_names"] = history[c["drive_folder_id"]]
+            companies = validate_companies(companies)
     except RoutingError as error:
         raise NeedsConfiguration(str(error)) from error
     if type(settings.get("review_required", True)) is not bool:
         raise WorkflowError("route.review_required must be a boolean")
     if type(settings.get("auto_file_explicit_companies", False)) is not bool:
         raise WorkflowError("route.auto_file_explicit_companies must be a boolean")
-    return dict(settings, companies=companies, review_required=settings.get("review_required", True),
-                auto_file_explicit_companies=settings.get("auto_file_explicit_companies", False))
+    result = dict(settings, companies=companies, review_required=settings.get("review_required", True),
+                  auto_file_explicit_companies=settings.get("auto_file_explicit_companies", False))
+    result.pop("previous_drive_folder_names", None)
+    return result
 
 
 def large_files_configured(settings, stage):
@@ -400,6 +412,8 @@ class Queue:
     def _enqueue_locked(self, session, config, now=None):
         now = time.time() if now is None else now
         routing = route_settings(config["route"]) if "route" in config else None
+        if routing is not None:
+            routing["companies"] = freeze_companies(routing["companies"])
         staging_root = self.state / "staging"
         staging_root.mkdir(exist_ok=True)
         temporary = Path(tempfile.mkdtemp(prefix="enqueue-", dir=staging_root)) / "recording"
@@ -495,6 +509,7 @@ class Queue:
                     route_settings(config["route"])["companies"], frozen_route["companies"]):
                 raise NeedsConfiguration("Company folders changed; create an explicit revision and a new routing review")
             if stage == "route":
+                settings.pop("previous_drive_folder_names", None)
                 settings.update(companies=frozen_route["companies"], review_required=frozen_route["review_required"],
                                 auto_file_explicit_companies=frozen_route["auto_file_explicit_companies"])
         if stage in ("archive", "publish") and (previous.get("requires_route") is True or frozen_route):
@@ -504,8 +519,8 @@ class Queue:
         with self.db:
             changed = self.db.execute(
                 "UPDATE tasks SET status='pending',settings=?,attempts=0,next_attempt=0,error=NULL "
-                "WHERE job=? AND stage=? AND status IN ('held','failed','safety_held')",
-                (json.dumps(settings, sort_keys=True), job, stage)).rowcount
+                "WHERE job=? AND stage=? AND settings=? AND status IN ('held','failed','safety_held')",
+                (json.dumps(settings, sort_keys=True), job, stage, stored["settings"])).rowcount
         if not changed:
             raise WorkflowError("No held or failed task matched; completed tasks cannot be released again")
 
@@ -1023,7 +1038,10 @@ class ConnectorRunner:
             from quill_workflow.drive_accounts import require_verified_account
             verified_account = require_verified_account(load_config(self.config_path), settings)
 
+        initial_company = None
+
         def guard():
+            live_company = None
             self.require_processing(job)
             if not settings.get("account_link_id"):
                 raise NeedsConfiguration("Choose and verify a Google account in Quill Settings before Drive filing")
@@ -1041,19 +1059,19 @@ class ConnectorRunner:
                 if settings.get("large_files") and (live.get("enabled") is not True
                         or live.get("large_files") != settings["large_files"]):
                     raise NeedsConfiguration("Direct Drive filing was disabled or its connection changed; the saved upload is on hold")
-                if "drive_reader_emails" in route:
+                if "drive_folder_path" in route:
                     live_routing = live_config.get("route")
+                    destination = "shared folder" if "drive_reader_emails" in route else "subfolder"
                     if (not isinstance(live_routing, dict) or live_routing.get("enabled") is not True
                             or live.get("enabled") is not True or live.get("type") != "codex_drive"
                             or live.get("meetings_root_id") != settings["meetings_root_id"]):
-                        raise NeedsConfiguration("Shared-folder filing is disabled or its destination changed")
-                    try:
-                        live_route = configured_route(validate_companies(live_routing.get("companies")),
-                                                      route["company_id"])
-                    except RoutingError as error:
-                        raise NeedsConfiguration("The approved shared folder is no longer configured") from error
-                    if live_route != route:
-                        raise NeedsConfiguration("The shared destination or its approved viewers changed")
+                        raise NeedsConfiguration(f"Filing to the {destination} is disabled or its destination changed")
+                    companies = route_settings(live_routing)["companies"]
+                    live_company = next((company for company in companies if company["id"] == route["company_id"]), None)
+                    if live_company is None or not matches_destination(live_company, route):
+                        raise NeedsConfiguration(f"The approved {destination} or its viewers changed")
+                    if initial_company is not None and live_company["name"] != initial_company["name"]:
+                        raise NeedsConfiguration("The folder was renamed during filing; retry to verify its new name")
             current = self.task(job, "route")
             if (not current or current["status"] != "succeeded"
                     or current["settings"].get("enabled") is not True):
@@ -1061,8 +1079,9 @@ class ConnectorRunner:
             current_route, _ = self.approved_route(job, transcript_path, route_settings(current["settings"]))
             if current_route != route:
                 raise NeedsConfiguration("Company routing changed before upload; a new review is required")
+            return live_company
 
-        guard()
+        initial_company = guard()
         display_title = None
         result_dir = self.state / "results" / job
         notes_path = result_dir / "notes/notes.json"
@@ -1153,6 +1172,8 @@ class ConnectorRunner:
                                  guard=guard, account_link_id=settings.get("account_link_id"), **upload_options)
         try:
             options = {"meeting_title": display_title}
+            if initial_company is not None:
+                options["current_company"] = initial_company
             if date_zone is not None:
                 options["meeting_timezone"] = date_zone
             if combined:

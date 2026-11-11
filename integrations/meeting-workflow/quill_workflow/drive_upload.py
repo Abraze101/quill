@@ -383,12 +383,18 @@ class DriveUploader:
             raise UploadNeedsReview("Drive file size does not match the local recording")
         return item
 
-    def verify_destination(self, route, owner):
+    def verify_destination(self, route, owner, current_company=None):
         """Read back every approved folder from root to leaf before writing."""
-        from .routing import route_folder_path, route_reader_emails, RoutingError
+        from .routing import matches_destination, route_folder_path, route_reader_emails, RoutingError
         try:
             path = route_folder_path(route)
             reader_emails = route_reader_emails(route)
+            if current_company is not None:
+                if not matches_destination(current_company, route):
+                    raise UploadNeedsReview("The configured folder no longer matches the approved destination")
+                # Keep the approved name in every journal and document. Only
+                # Drive's live metadata and name search use the current name.
+                path = current_company.get("drive_folder_path", path)
         except (RoutingError, AttributeError) as error:
             raise UploadNeedsReview("The approved folder path is invalid") from error
         if any(part["drive_folder_id"] == self.root_id for part in path):
@@ -407,7 +413,7 @@ class DriveUploader:
     def upload(self, job, stage, source, route, started, meeting_title=None,
                text_format="legacy", document_path=None, document_title=None, document_text=None,
                template_document_id=None, template_sha256=None, template_payload=None,
-               meeting_timezone=None):
+               meeting_timezone=None, current_company=None):
         self._reserved_media_retry = False
         if not isinstance(job, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", job):
             raise UploadNeedsReview("Expected a fixed meeting job ID")
@@ -548,7 +554,7 @@ class DriveUploader:
             # Google's `trashed` field. Root was explicitly created in My Drive.
             if self.root_id not in self._find("root", root["title"], True):
                 raise UploadNeedsReview("The approved Meetings root is unavailable")
-            ancestors = self.verify_destination(route, owner)
+            ancestors = self.verify_destination(route, owner, current_company)
             reader_emails = ancestors[company_id][2]
             journal["owner"] = owner
             save()

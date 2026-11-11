@@ -442,6 +442,9 @@ def main(argv=None):
     sub.add_parser("status")
     sub.add_parser("delete-work", help="Finish confirmed local deletions after processing stops")
     sub.add_parser("reviews", help="List saved company-folder reviews")
+    refresh = sub.add_parser("refresh-folder-choices", help="Refresh one held meeting's folder choices from current settings")
+    refresh.add_argument("job")
+    refresh.add_argument("--revision", required=True)
     review = sub.add_parser("review", help="Open the local company-folder review page")
     review.add_argument("--no-open", action="store_true", help="Serve without opening a browser")
     review.add_argument("--timeout", type=float, default=1800)
@@ -542,6 +545,10 @@ def main(argv=None):
                 print(json.dumps(reviews.list(), indent=2))
             finally:
                 reviews.close()
+        elif args.command == "refresh-folder-choices":
+            from quill_workflow.folder_choice_refresh import refresh_folder_choices
+            record = refresh_folder_choices(queue, args.config, args.job, args.revision)
+            print(json.dumps({"job": record["job"], "status": record["status"], "revision": record["revision"]}))
         elif args.command in ("choose-company", "keep-local"):
             reviews = RoutingReviews(queue.state)
             try:

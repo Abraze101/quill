@@ -213,6 +213,36 @@ class DriveUploadTests(unittest.TestCase):
             {"type": "user", "role": "reader", "emailAddress": "Sales@example.test"}])
         return leaf
 
+    def test_retry_verifies_only_current_leaf_name_and_keeps_frozen_journals(self):
+        leaf = self.shared_sales()
+        original = self.upload()
+        name = "Sales Calls"
+        current = {"id": self.route["company_id"], "name": "Acme / " + name, "drive_folder_id": leaf,
+                   "drive_reader_emails": self.route["drive_reader_emails"], "previous_folder_names": ["Sales Meetings"],
+                   "drive_folder_path": [self.route["drive_folder_path"][0], {"name": name, "drive_folder_id": leaf}]}
+
+        def retry():
+            return self.uploader.upload(self.job, "archive", self.source, self.route, self.started,
+                                        current_company=current)
+
+        # The historical name alone no longer proves the live leaf is correct.
+        with self.assertRaisesRegex(UploadNeedsReview, "name changed"):
+            retry()
+        self.drive.items[leaf]["title"] = name
+        self.drive.calls.clear()
+        self.assertEqual(retry()["meeting_folder_id"], original["meeting_folder_id"])
+        searched = [self.drive.search_target(args)[1] for tool, args in self.drive.calls if tool == "search"]
+        self.assertIn(name, searched)
+        self.assertNotIn("Sales Meetings", searched)
+        self.assertEqual(self.drive.writes, [])
+        directory = self.uploader.state / "results" / self.job
+        for journal in ["drive-archive.json", "drive-meeting.json"]:
+            self.assertEqual(json.loads((directory / journal).read_text())["identity"]["route"], self.route)
+        self.drive.items[leaf]["permissions"].pop()
+        with self.assertRaises(UploadNeedsReview):
+            retry()
+        self.assertEqual(self.drive.writes, [])
+
     def test_sales_files_inherit_named_readers_and_retry_reuses_upload(self):
         leaf = self.shared_sales()
         direct, _, sizes = self.direct_fixture()

@@ -179,6 +179,38 @@ class PipelineDriveTests(unittest.TestCase):
                 self.transport_factory.assert_not_called()
                 self.uploader.upload.assert_not_called()
 
+    def test_approved_subfolder_uses_its_current_name_only_for_live_verification(self):
+        leaf = self.companies[0]
+        parent = {"name": "Acme", "drive_folder_id": leaf["drive_folder_id"]}
+        leaf.update(name="Acme / Sales", drive_folder_id="sales_folder_123",
+                    drive_folder_path=[parent, {"name": "Sales", "drive_folder_id": "sales_folder_123"}])
+        job, _ = self.prepare()
+        self.runner.config_path = self.root / "workflow.json"
+        current = dict(leaf, name="Acme / Sales Calls", previous_folder_names=["Sales"],
+                       drive_folder_path=[parent, dict(leaf["drive_folder_path"][-1], name="Sales Calls")])
+
+        def replace_config(company):
+            atomic_json(self.runner.config_path, dict(self.config, route=dict(self.config["route"], companies=[company])))
+
+        replace_config(current)
+        self.runner("archive", job, self.settings)
+        call = self.uploader.upload.call_args
+        self.assertEqual(call.args[3]["company_name"], leaf["name"])
+        self.assertEqual(call.kwargs["current_company"]["name"], current["name"])
+        guard = self.uploader_factory.call_args.kwargs["guard"]
+        guard()
+        replace_config(dict(current, previous_folder_names=["Different"]))
+        with self.assertRaisesRegex(NeedsConfiguration, "approved subfolder"):
+            guard()
+        replace_config(dict(current, drive_reader_emails=["new@example.com"]))
+        with self.assertRaisesRegex(NeedsConfiguration, "viewers"):
+            guard()
+        newest = dict(current, name="Acme / Calls",
+                      drive_folder_path=[parent, dict(current["drive_folder_path"][-1], name="Calls")])
+        replace_config(newest)
+        with self.assertRaisesRegex(NeedsConfiguration, "renamed during filing"):
+            guard()
+
     def test_release_preserves_account_binding_and_legacy_absence(self):
         legacy = dict(self.settings)
         legacy.pop("account_link_id")

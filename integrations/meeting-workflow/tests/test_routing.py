@@ -10,7 +10,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from quill_workflow.routing import (RoutingError, RoutingReviews, StaleReviewError,
-                                    preserves_company_map, validate_companies)
+                                    matches_destination, preserves_company_map, validate_companies)
 
 
 class RoutingTests(unittest.TestCase):
@@ -401,6 +401,77 @@ class RoutingTests(unittest.TestCase):
         self.assertFalse(preserves_company_map(changed, self.companies))
         with self.assertRaises(StaleReviewError):
             self.reviews.route("leaf", source, changed)
+
+    def test_registered_rename_preserves_frozen_route_and_new_approvals_use_current_name(self):
+        parent, old, _ = self.nested_companies()
+        old["drive_reader_emails"] = ["alex@example.com"]
+        suggestion = dict(self.suggestion, company_id=old["id"])
+        pending = self.reviews.propose("old", self.transcript, [parent, old], suggestion)
+        live = copy.deepcopy(old)
+        live["drive_folder_path"][-1]["name"] = "Sales Calls"
+        live["name"] = "Acme Studio / Sales Calls"
+        live["previous_folder_names"] = ["Sales Meetings", "Early Sales"]
+        unchanged = copy.deepcopy(live)
+
+        self.assertTrue(preserves_company_map([parent, live], pending["companies"]))
+        approved = self.reviews.approve("old", old["id"], pending["revision"])
+        route = self.reviews.route("old", self.transcript, pending["companies"])
+        self.assertEqual(route, approved["approved_route"])
+        self.assertEqual(route["company_name"], old["name"])
+        self.assertTrue(matches_destination(live, route))
+        self.assertEqual(live, unchanged)
+        self.assertEqual(self.reviews.get("old"), approved)
+        with self.assertRaises(StaleReviewError):
+            self.reviews.route("old", self.transcript, [parent, live])
+
+        current = self.reviews.propose("new", self.transcript, [parent, live], suggestion,
+                                       review_required=False)["approved_route"]
+        self.assertEqual(current["company_name"], live["name"])
+        self.assertEqual(current["drive_folder_path"], live["drive_folder_path"])
+        self.assertEqual(current["drive_reader_emails"], ["alex@example.com"])
+        self.assertNotIn("previous_folder_names", current)
+        self.assertTrue(matches_destination(live, current))
+
+    def test_rename_still_requires_the_exact_approved_destination(self):
+        _, live, _ = self.nested_companies()
+        live["previous_folder_names"] = ["Prospect Calls"]
+        live["drive_reader_emails"] = ["alex@example.com"]
+        historical = copy.deepcopy(live)
+        historical.pop("previous_folder_names")
+        historical["drive_folder_path"][-1]["name"] = "Prospect Calls"
+        historical["name"] = "Acme Studio / Prospect Calls"
+        approved = self.reviews.propose("old", self.transcript, [historical],
+            dict(self.suggestion, company_id=historical["id"]), review_required=False)["approved_route"]
+        self.assertTrue(matches_destination(live, approved))
+        for key, value in (("company_id", "unrelated"), ("company_name", live["name"]),
+                           ("drive_folder_id", "new-destination-001"), ("drive_reader_emails", []),
+                           ("drive_reader_emails", ["another@example.com"]), ("unexpected", True)):
+            with self.subTest(key=key, value=value):
+                self.assertFalse(matches_destination(live, dict(approved, **{key: value})))
+        for index, key, value in ((0, "name", "Other Parent"), (0, "drive_folder_id", "other-parent-001"),
+                                  (-1, "drive_folder_id", "other-leaf-001"), (-1, "name", "prospect calls")):
+            route = copy.deepcopy(approved)
+            route["drive_folder_path"][index][key] = value
+            route["company_name"] = " / ".join(part["name"] for part in route["drive_folder_path"])
+            with self.subTest(index=index, key=key, value=value):
+                self.assertFalse(matches_destination(live, route))
+        for changes in ({"description": "a new purpose"}, {"aliases": []}, {"previous_folder_names": []}):
+            with self.subTest(changes=changes):
+                self.assertFalse(preserves_company_map([dict(live, **changes)], [historical]))
+
+    def test_history_is_optional_bounded_and_only_contains_distinct_nested_leaf_labels(self):
+        parent, leaf, _ = self.nested_companies()
+        self.assertEqual(validate_companies([dict(leaf, previous_folder_names=[])]), validate_companies([leaf]))
+        normalized, = validate_companies([dict(leaf, previous_folder_names=["Older", "Earlier"])])
+        self.assertEqual(normalized["previous_folder_names"], ["Earlier", "Older"])
+        self.assertEqual(validate_companies([normalized]), [normalized])
+        with self.assertRaises(RoutingError):
+            validate_companies([dict(parent, previous_folder_names=["Old Studio"])])
+        for names in (None, "Sales", {}, [None], [2], [" "], [" Sales"], ["Past/Sales"], ["Past\\Sales"],
+                      ["a\nb"], ["a\x7fb"], [".", ".."], ["x" * 200], ["Sales Meetings"], ["Old", "Old"],
+                      [f"old{i}" for i in range(21)]):
+            with self.subTest(names=names), self.assertRaises(RoutingError):
+                validate_companies([dict(leaf, previous_folder_names=names)])
 
     def test_nested_path_validation_rejects_unbound_or_ambiguous_paths(self):
         leaf = self.nested_companies()[1]
