@@ -77,6 +77,20 @@ final class MeetingWindowMatcherTests {
         let withContext = MeetingSignal(source: "tab", meeting: "call", provider: "google-meet", state: .joined,
                                         timestamp: 100, meetingContext: context)
         expectEqual(try decoder.decode(MeetingSignal.self, from: JSONEncoder().encode(withContext)), withContext)
+        let validPayload = try JSONSerialization.jsonObject(with: JSONEncoder().encode(withContext)) as! [String: Any]
+        expectNil(validPayload["conflictingContextProvider"])
+        for provider in ["google-meet", "zoom-web"] {
+            let rejectedRoster = MeetingContext(provider: provider, key: provider == "zoom-web" ? "12345678901" : context.key,
+                                                participants: [.init(name: "someone@example.com", isSelf: false)])
+            let signal = MeetingSignal(source: "tab", meeting: "call", provider: "google-meet", state: .joined,
+                                       timestamp: 100, meetingContext: rejectedRoster)
+            let bytes = try JSONEncoder().encode(signal)
+            let encoded = try JSONSerialization.jsonObject(with: bytes) as! [String: Any]
+            expectNil(encoded["meetingContext"])
+            expectEqual(String(decoding: bytes, as: UTF8.self).contains("someone@example.com"), false)
+            let restored = try decoder.decode(MeetingSignal.self, from: bytes)
+            expectEqual(restored.joinedRemoteProvider, provider == "google-meet" ? "google-meet" : nil)
+        }
         expectEqual(context.validated(), context)
         let next = MeetingContext(provider: "google-meet", key: context.key, participants: [
             .init(name: "Jamie Smith", isSelf: false), .init(name: "Morgan", isSelf: true)])

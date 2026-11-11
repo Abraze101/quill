@@ -102,6 +102,31 @@ class SelectionTests(unittest.TestCase):
         self.assert_library(document)
         self.assertIn("no longer available", document.text.lower())
 
+    def test_list_and_filters_do_not_load_details_and_opening_only_reads_the_selected_job(self):
+        self.server.action_summaries = lambda: {
+            "routing": {}, "resume": {}, "processing": [], "sharing": [],
+            "deletion": [], "cancellation": [],
+        }
+        selected_actions = []
+        def sharing(job):
+            selected_actions.append(job)
+            return [item for item in self.items if item["job"] == job]
+        self.server.sharing_options = sharing
+        selected = dict(self.library_metadata()["later"], notes_text="Selected notes")
+        with patch("quill_workflow.review_server.meeting_index", return_value=self.library_metadata()), \
+                patch("quill_workflow.review_server.meeting_detail", return_value=selected) as detail:
+            for suffix in ("", "?q=Bob", "?folder=acme", "?meeting=" + "0" * 24):
+                status, _, _ = self.request(self.server.review_path + suffix)
+                self.assertEqual(status, 200)
+            detail.assert_not_called()
+            self.assertEqual(selected_actions, [])
+            status, _, document = self.request(self.detail_path("later", "notes"))
+            self.assertEqual(status, 200)
+            self.assertIn("Selected notes", document.text)
+            self.assertNotIn("Earlier meeting", document.text)
+            self.assertEqual(selected_actions, ["later"])
+            detail.assert_called_once_with(self.server.review_state, "later")
+
     def test_inline_calendar_and_busy_sharing_refresh_preserve_meeting(self):
         self.items[1]["suggestion_status"] = "searching"
         _, _, document = self.request(self.detail_path())
@@ -197,7 +222,7 @@ class SelectionTests(unittest.TestCase):
             ({"view": "attention", "folder": "acme"}, []),
             ({"folder": "unknown-company"}, []),
         ]
-        with patch("quill_workflow.review_server.meeting_library", return_value=self.library_metadata()):
+        with patch("quill_workflow.review_server.meeting_index", return_value=self.library_metadata()):
             for fields, expected in cases:
                 with self.subTest(fields=fields):
                     path = self.server.review_path + ("?" + urlencode(fields) if fields else "")
@@ -213,7 +238,7 @@ class SelectionTests(unittest.TestCase):
         self.items[1]["status"] = "needs_attention"
         filters = {"view": "attention", "folder": "acme-health", "q": "Bob"}
         expected = {key: [value] for key, value in filters.items()}
-        with patch("quill_workflow.review_server.meeting_library", return_value=self.library_metadata()):
+        with patch("quill_workflow.review_server.meeting_index", return_value=self.library_metadata()):
             _, _, library = self.request(self.server.review_path + "?" + urlencode(filters))
             rows = by_class(library, "meeting-row")
             self.assertEqual(len(rows), 1)

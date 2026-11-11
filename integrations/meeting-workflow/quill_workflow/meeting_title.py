@@ -24,6 +24,21 @@ def _clip(value, limit):
     return shortened.rstrip(" .-") + "..."
 
 
+def meeting_participants(notes, transcript, attributions=None):
+    """Include the recorder when a nonempty microphone turn supports their name."""
+    from .transcript_sources import effective_attributions, microphone_segment, remote_microphone_owner, segment_name
+    people = notes.get("meeting_title", {}).get("participants", [])
+    owner = remote_microphone_owner(transcript)
+    if not owner or any(person["name"].casefold() == owner.casefold() for person in people):
+        return people
+    if attributions is None:
+        attributions = effective_attributions(transcript, notes)
+    for index, segment in enumerate(transcript.get("segments", [])):
+        if microphone_segment(segment) and segment["text"].strip() and segment_name(segment, attributions, owner) == owner:
+            return [*people, {"name": owner, "evidence": [index]}]
+    return people
+
+
 def meeting_title(notes, transcript, *, participants_first=True):
     """Return a safe attendee-and-topic name, or None for historical notes.
 
@@ -32,8 +47,9 @@ def meeting_title(notes, transcript, *, participants_first=True):
     independently prove that a mentioned person attended the meeting.
     """
     # Validate the derived view before every notes renderer accepts it.
-    from .transcript_sources import effective_attributions
-    attributions = effective_attributions(transcript, notes) if "speaker_review" in notes or "_speaker_identity" in notes else None
+    from .transcript_sources import effective_attributions, remote_microphone_owner, segment_name
+    owner = remote_microphone_owner(transcript)
+    attributions = effective_attributions(transcript, notes) if owner or "speaker_review" in notes or "_speaker_identity" in notes else None
     if "meeting_title" not in notes:
         return None
     title = notes["meeting_title"]
@@ -69,7 +85,9 @@ def meeting_title(notes, transcript, *, participants_first=True):
         if not isinstance(person, dict) or set(person) != {"name", "evidence"}:
             raise ValueError("Meeting title participants need a name and evidence")
         name = person["name"]
-        if not isinstance(name, str) or not 1 <= len(name) <= 60 or _plain(name) != name:
+        # The capture-bound recorder name never enters the filename. Keep an
+        # exact spelling such as "Morgan Lee Jr." in the attendee list.
+        if not isinstance(name, str) or not 1 <= len(name) <= 60 or (name != owner and _plain(name) != name):
             raise ValueError("Meeting title participant name must be plain, exact text")
         normalized = " ".join(unicodedata.normalize("NFC", name).casefold().split())
         if normalized in {"me", "them", "speaker", "other speaker", "participant", "participants",
@@ -78,9 +96,8 @@ def meeting_title(notes, transcript, *, participants_first=True):
             raise ValueError("Meeting title cannot use anonymous participant names")
         cited = evidence(person["evidence"])
         pattern = r"(?<!\w)" + re.escape(normalized) + r"(?!\w)"
-        confirmed = attributions is not None and any(
-            attributions.get(segments[index].get("speaker"), {}).get("name") == name
-            for index in person["evidence"])
+        confirmed = any(segment_name(segments[index], attributions, owner) == name
+                        for index in person["evidence"] if not owner or segments[index]["text"].strip())
         if not confirmed and not any(re.search(pattern, " ".join(unicodedata.normalize("NFC", text).casefold().split()))
                                     for text in cited):
             raise ValueError("Meeting title participant name is absent from its cited evidence")
@@ -94,6 +111,8 @@ def meeting_title(notes, transcript, *, participants_first=True):
     if "_title_guests" in notes:
         from .title_participants import validate_guest_names
         names = validate_guest_names(notes["_title_guests"])
+    if owner:
+        names = [name for name in names if name.casefold() != owner.casefold()]
     included = []
     for name in names:
         candidate = ", ".join(included + [name])

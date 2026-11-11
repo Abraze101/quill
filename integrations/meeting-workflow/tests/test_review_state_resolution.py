@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from quill_workflow.review_server import _review_entries, _reviews_page, create_server
+from quill_workflow.review_server import _review_entries, _reviews_page, _selection, create_server
 from quill_workflow.routing import RoutingReviews
 
 
@@ -67,7 +67,7 @@ class ReviewStateResolutionTests(unittest.TestCase):
                 "recipient_draft": None}
 
     def entry(self):
-        entries = _review_entries(self.server)
+        entries = _review_entries(self.server, selected=_selection("meeting"))
         self.assertEqual(len(entries), 1)
         self.assertEqual(self.calls, [])
         entry = entries[0]
@@ -318,7 +318,7 @@ class ReviewStateResolutionTests(unittest.TestCase):
                                  storage={"document": {"status": "confirmed", "file_ids": ["saved-file"]},
                                           "media": {"status": "uncertain"}}),
         })
-        with patch("quill_workflow.review_server.meeting_library", return_value=library), \
+        with patch("quill_workflow.review_server.meeting_index", return_value=library), \
                 patch("quill_workflow.review_server.workspace", return_value="rendered") as render:
             self.assertEqual(_reviews_page(self.server), "rendered")
         entries = render.call_args.args[0]
@@ -334,7 +334,7 @@ class ReviewStateResolutionTests(unittest.TestCase):
         empty = {"title": None, "display_date": None, "transcript_text": None, "recording_files": [],
                  "storage_status": "not_confirmed", "storage": {"document": {"status": "unknown"}}}
         library = {job: dict(empty) for job in ("meeting", "processing", "deletion")}
-        with patch("quill_workflow.review_server.meeting_library", return_value=library), \
+        with patch("quill_workflow.review_server.meeting_index", return_value=library), \
                 patch("quill_workflow.review_server.workspace", return_value="rendered") as render:
             self.assertEqual(_reviews_page(self.server), "rendered")
         entries = {entry["job"]: entry for entry in render.call_args.args[0]}

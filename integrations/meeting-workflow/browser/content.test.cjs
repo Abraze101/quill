@@ -40,7 +40,7 @@ function harness(initialFailure = null, initialURL = 'https://meet.google.com/ab
     getElementById: id => ids.get(id) ?? null,
     querySelectorAll: selector => {
       if (selector.startsWith('button')) return state.toolbar ? controls : [];
-      if (selector.startsWith('[data-participant-id]')) { state.rosterReads++; return state.people; }
+      if (selector.startsWith('[data-participant-id] [data-self-name]')) { state.rosterReads++; return state.people; }
       return [];
     },
   };
@@ -50,7 +50,7 @@ function harness(initialFailure = null, initialURL = 'https://meet.google.com/ab
       childNodes: text === undefined ? [] : [{ nodeType: 3, nodeValue: text }],
       disabled: false,
       getAttribute: name => attributes[name] ?? null,
-      closest: () => null,
+      closest: selector => selector === "[data-participant-id]" && attributes["data-self-name"] ? node : null,
       getClientRects: () => [{}],
     };
     if (attributes.id) ids.set(attributes.id, node);
@@ -105,7 +105,7 @@ function harness(initialFailure = null, initialURL = 'https://meet.google.com/ab
   vm.runInContext(contentSource, context, { filename: 'content.js' });
   return {
     state, observer, attempts, delivered, timers, listeners, location, warningNodes, mountedWarnings,
-    person: name => element('span', { 'data-self-name': name }, name),
+    person: name => element('span', { 'data-self-name': name, 'data-participant-id': 'synthetic-' + name }, name),
     mutate: () => observer.callback(),
     pagehide: () => listeners.get('pagehide')?.(),
     tick() {

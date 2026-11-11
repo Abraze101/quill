@@ -48,6 +48,13 @@ class MeetingDocumentTests(unittest.TestCase):
         with zipfile.ZipFile(io.BytesIO(payload)) as package:
             return ET.fromstring(package.read(name))
 
+    def test_remote_owner_is_named_on_mic_turns_and_in_document_attendees(self):
+        transcript = dict(self.transcript, remote_microphone_owner="Morgan Lee", speaker_labels="audio_source")
+        _, paragraphs, _ = self.render(transcript=transcript)
+        self.assertIn("Identified participants Max, Morgan Lee", paragraphs)
+        self.assertTrue(any("Morgan Lee  Yes.  Exactly." in line for line in paragraphs))
+        self.assertTrue(any("System audio  Yes.  Exactly." in line for line in paragraphs))
+
     def test_document_names_every_matching_separated_segment_without_guessing_unknown(self):
         transcript = diarized_transcript()
         notes = {"schema_version": 1, "meeting_title": {"text": "Agenda planning", "evidence": [2],

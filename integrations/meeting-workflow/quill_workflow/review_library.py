@@ -7,7 +7,7 @@ escaping. No original recording path, calendar suggestion, or current company
 configuration is used to invent meeting metadata.
 """
 from datetime import datetime
-from contextlib import closing
+from contextlib import closing, contextmanager
 import hashlib
 import json
 import os
@@ -25,8 +25,8 @@ from .meeting_title import meeting_title
 from .native_template import build_bound_payload
 from .pipeline import WorkflowError, render_notes
 from .routing import RoutingError, _route as configured_route, validate_companies
-from .transcript_sources import (effective_attributions, render_reviewed_transcript,
-                                 segment_label, speaker_attributions)
+from .transcript_sources import (effective_attributions, remote_microphone_owner, render_reviewed_transcript,
+                                 segment_label, segment_name)
 
 
 _JOB = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
@@ -77,20 +77,28 @@ class _Sources:
     def close(self):
         os.close(self.fd)
 
-    def read(self, relative, limit=MAX_JSON_BYTES):
-        key = str(relative)
-        if key in self.cache:
-            return self.cache[key]
+    @contextmanager
+    def _parent_member(self, relative):
         parts = Path(relative).parts
         if not parts or Path(relative).is_absolute() or any(part in (".", "..") for part in parts):
-            return _INVALID
+            raise ValueError("Expected a fixed member under the workflow state")
         directory = os.dup(self.fd)
         try:
             for part in parts[:-1]:
                 child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
                 os.close(directory)
                 directory = child
-            descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+            yield directory, parts[-1]
+        finally:
+            os.close(directory)
+
+    def read(self, relative, limit=MAX_JSON_BYTES):
+        key = str(relative)
+        if key in self.cache:
+            return self.cache[key]
+        try:
+            with self._parent_member(relative) as (directory, name):
+                descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
             with os.fdopen(descriptor, "rb") as source:
                 before = os.fstat(source.fileno())
                 if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= limit:
@@ -105,10 +113,22 @@ class _Sources:
             result = None
         except (OSError, ValueError):
             result = _INVALID
-        finally:
-            os.close(directory)
         self.cache[key] = result
         return result
+
+    def has_saved_transcript(self, job):
+        # Keep the same attachment precedence as _transcript. Ignore a missing
+        # attachment; an invalid one must not expose a different capture.
+        for member in (f"results/{job}/input/transcript.json", f"recordings/{job}/transcript.json"):
+            try:
+                with self._parent_member(member) as (directory, name):
+                    info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                return stat.S_ISREG(info.st_mode) and 0 < info.st_size <= MAX_JSON_BYTES
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError):
+                return False
+        return False
 
     def json(self, relative, limit=MAX_JSON_BYTES):
         raw = self.read(relative, limit)
@@ -119,7 +139,7 @@ class _Sources:
         except (ValueError, UnicodeError, RecursionError):
             return _INVALID
 
-    def rows(self):
+    def rows(self, job=None, *, index=False):
         """Read one SQLite snapshot without creating a missing database."""
         path = self.state / "jobs.sqlite3"
         info = os.stat("jobs.sqlite3", dir_fd=self.fd, follow_symlinks=False)
@@ -141,19 +161,26 @@ class _Sources:
             after = path.lstat()
             if (info.st_dev, info.st_ino) != (after.st_dev, after.st_ino):
                 return [], {}, set()
+            params = () if job is None else (job,)
+            job_filter = "" if job is None else " WHERE j.id=?"
+            task_filter = "" if job is None else " WHERE job=?"
             if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='local_names'").fetchone():
                 query = ("SELECT j.id,j.session,n.destination,n.status AS naming_status FROM jobs j "
                          "LEFT JOIN local_names n ON n.job=j.id")
             else:
-                query = "SELECT id,session,NULL AS destination,NULL AS naming_status FROM jobs"
-            jobs = [dict(row) for row in db.execute(query)]
+                query = "SELECT j.id,j.session,NULL AS destination,NULL AS naming_status FROM jobs j"
+            jobs = [dict(row) for row in db.execute(query + job_filter, params)]
             if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='local_title_labels'").fetchone():
-                labels = {row["job"]: row for row in db.execute("SELECT job,title,meeting_date FROM local_title_labels")}
-                for job in jobs:
-                    if job["naming_status"] == "succeeded" and job["id"] in labels:
-                        job["label"] = labels[job["id"]]
+                labels = {row["job"]: row for row in db.execute(
+                    "SELECT job,title,meeting_date FROM local_title_labels" + task_filter, params)}
+                for entry in jobs:
+                    if entry["naming_status"] == "succeeded" and entry["id"] in labels:
+                        entry["label"] = labels[entry["id"]]
             tasks = {}
-            for row in db.execute("SELECT job,stage,status,settings,receipt FROM tasks"):
+            query = "SELECT job,stage,status,settings,receipt FROM tasks" + task_filter
+            if index:
+                query += (" WHERE " if job is None else " AND ") + "stage IN ('route','archive','publish')"
+            for row in db.execute(query, params):
                 value = dict(row)
                 try:
                     value["settings"] = _decode(value["settings"])
@@ -165,7 +192,7 @@ class _Sources:
             if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='local_deletions'").fetchone():
                 # Any tombstone closes access to local content while Trash is
                 # pending too. The deletion view supplies its own recovery row.
-                removed = {row[0] for row in db.execute("SELECT job FROM local_deletions")}
+                removed = {row[0] for row in db.execute("SELECT job FROM local_deletions" + task_filter, params)}
         return jobs, tasks, removed
 
 
@@ -183,10 +210,8 @@ def _receipt(sources, job, stage, tasks, transcript_hash):
     return receipt
 
 
-def _route(sources, job, tasks, transcript_hash):
-    receipt = _receipt(sources, job, "route", tasks, transcript_hash)
-    settings = tasks.get("route", {}).get("settings", {})
-    if not receipt or not isinstance(settings, dict) or settings.get("enabled") is not True:
+def _receipt_route(settings, receipt):
+    if not isinstance(receipt, dict) or not isinstance(settings, dict) or settings.get("enabled") is not True:
         return None
     route = receipt.get("route")
     companies = settings.get("companies")
@@ -197,6 +222,73 @@ def _route(sources, job, tasks, transcript_hash):
     except RoutingError:
         return None
     return route if route == expected else None
+
+
+def _route(sources, job, tasks, transcript_hash):
+    receipt = _receipt(sources, job, "route", tasks, transcript_hash)
+    return _receipt_route(tasks.get("route", {}).get("settings", {}), receipt)
+
+
+def _display_microphone_owner(sources, job, transcript, metadata, *, selected):
+    """A live setting can label a legacy display only on its registered Mac and meeting."""
+    owner = remote_microphone_owner(transcript)
+    if owner:
+        return owner, "recording"
+    if (not isinstance(metadata, dict) or "remote_microphone_owner" in metadata
+            or "remote_microphone_owner" in transcript or not metadata.get("meeting_context")):
+        return None, None
+    from .meeting_context import meeting_context
+    from .speaker_timeline import MAX_TIMELINE_BYTES, validate_timeline
+    try:
+        context = meeting_context(metadata["meeting_context"])
+        with closing(_Sources(Path.home() / ".config/quill")) as native:
+            config = native.json("config.json", 100_000)
+        if not isinstance(config, dict) or not isinstance(config.get("transcription"), dict):
+            return None, None
+        status = config.get("completion_status_file", "~/.local/state/quill/workflow/status.json")
+        if not isinstance(status, str) or not status:
+            return None, None
+        status = Path(status).expanduser()
+        if not status.is_absolute() or not os.path.samestat(status.parent.stat(), os.fstat(sources.fd)):
+            return None, None
+        owner = remote_microphone_owner(config["transcription"])
+        if not owner:
+            return None, None
+        people = context["participants"]
+        self_names = {p["name"] for p in people if p["self"]}
+        if metadata.get("speaker_activity_file") == "speaker-activity.json":
+            # The list does not open per-meeting timelines. A selected view can
+            # check the saved recording for agreement before using an old name.
+            if not selected:
+                return None, None
+            raw = sources.json(f"recordings/{job}/speaker-activity.json", MAX_TIMELINE_BYTES * 2)
+            if raw is not None:
+                timeline = validate_timeline(raw)
+                if any(timeline[key] != context[key] for key in ("provider", "key")):
+                    return None, None
+                self_names.update(p["name"] for p in timeline["participants"] if p["self"])
+        if self_names == {owner} or (not self_names and any(p["name"] == owner for p in people)):
+            return owner, "historical_meeting"
+    except (OSError, ValueError, TypeError, RuntimeError, RecursionError):
+        pass
+    return None, None
+
+
+def _display_names(transcript, people, owner):
+    """List established voices. A recorder default requires nonempty speech from the mic."""
+    people = people or {}
+    names = [person["name"] for person in people.values()
+             if person.get("name") and person.get("review_status") != "microphone_owner"]
+    count = 0
+    if owner:
+        for segment in transcript["segments"]:
+            speaker = people.get(segment.get("speaker"), {})
+            if (segment["text"].strip() and (not speaker.get("name") or speaker.get("review_status") == "microphone_owner")
+                    and segment_name(segment, people, owner) == owner):
+                count += 1
+        if count:
+            names.append(owner)
+    return list(dict.fromkeys(names)), count
 
 
 def _transcript(sources, job):
@@ -212,19 +304,20 @@ def _transcript(sources, job):
         return None, None, None, []
     try:
         capture_notice = notice(value)
-        attributions = speaker_attributions(value)
+        attributions = effective_attributions(value)
+        owner = remote_microphone_owner(value)
         lines = []
         for segment in value["segments"]:
             if (not isinstance(segment, dict) or not isinstance(segment.get("text"), str)
                     or type(segment.get("start_ms")) is not int or segment["start_ms"] < 0):
                 raise ValueError("Invalid transcript segment")
-            lines.append(segment_label(segment, attributions) + ": " + segment["text"])
+            lines.append(segment_label(segment, attributions, owner) + ": " + segment["text"])
         text = "\n\n".join(lines)
         if text and capture_notice:
             text = capture_notice + "\n\n" + text
         if len(text) > MAX_TRANSCRIPT_CHARACTERS:
             text = text[:MAX_TRANSCRIPT_CHARACTERS] + "\n\n[Transcript preview shortened.]"
-        participants = [person["name"] for person in (attributions or {}).values() if person.get("name")]
+        participants, _ = _display_names(value, attributions, owner)
         return value, hashlib.sha256(raw).hexdigest(), text or None, participants
     except (ValueError, TypeError, KeyError, RecursionError):
         return None, None, None, []
@@ -291,6 +384,128 @@ def _local_folder(row):
             or ".." in Path(value).parts or any(unicodedata.category(char).startswith("C") for char in value)):
         return None
     return value
+
+
+def _label(row, metadata):
+    from .local_naming import _display_title, _label_date
+    label = row.get("label")
+    if label is None:
+        return None, None
+    try:
+        day = _label_date(datetime.fromisoformat(metadata["started"].replace("Z", "+00:00")),
+                          recording_timezone(metadata), label["meeting_date"])
+        return _display_title(label["title"]), f"{day.month}/{day.day}/{day:%y}"
+    except (KeyError, TypeError, AttributeError, ValueError, WorkflowError):
+        return None, None
+
+
+def _queued_receipt(tasks, job, stage):
+    """Read the outcome recorded by the worker. Detail verifies its current sources separately."""
+    task = tasks.get(stage, {})
+    receipt, settings = task.get("receipt"), task.get("settings")
+    if (task.get("status") != "succeeded" or not isinstance(settings, dict) or not isinstance(receipt, dict)
+            or receipt.get("job") != job or receipt.get("stage") != stage
+            or receipt.get("idempotency_key") != job + ":" + stage
+            or receipt.get("settings_sha256") != _settings_hash(settings)
+            or not re.fullmatch(r"[0-9a-f]{64}", str(receipt.get("input_sha256", "")))):
+        return None
+    return receipt
+
+
+def _index_storage(sources, job, tasks, route, route_receipt):
+    """A queued success attests to a historical filing only. Return no actionable Drive IDs."""
+    storage, filed_name = {}, None
+    for stage, label in (("publish", "document"), ("archive", "media")):
+        task = tasks.get(stage, {})
+        settings = task.get("settings", {})
+        receipt = _queued_receipt(tasks, job, stage)
+        if (route and receipt and settings.get("type") == "codex_drive" and settings.get("enabled") is True
+                and receipt.get("route_sha256") == _settings_hash(route)
+                and receipt["input_sha256"] == route_receipt["input_sha256"]
+                and all(isinstance(receipt.get(key), str) and _ID.fullmatch(receipt[key])
+                        for key in ("folder_id", "meeting_folder_id"))
+                and isinstance(receipt.get("files"), list) and receipt["files"]
+                and all(isinstance(item, dict) and isinstance(item.get("id"), str)
+                        and _ID.fullmatch(item["id"]) for item in receipt["files"])):
+            status = "recorded"
+            filed_name = filed_name or _text(receipt.get("meeting_folder_name"))
+        elif (isinstance(settings, dict) and settings.get("enabled") is False and not task.get("receipt")
+                and sources.read(f"results/{job}/drive-{stage}.json", 1) is None):
+            status = "not_requested"
+        else:
+            status = {"held": "pending", "pending": "pending", "running": "pending",
+                      "retry": "pending", "failed": "failed", "cancelled": "cancelled"}.get(task.get("status"), "unknown")
+        storage[label] = {"status": status, "file_ids": []}
+    states = {item["status"] for item in storage.values()}
+    if states == {"not_requested"}:
+        storage_status = "not_requested"
+    elif "recorded" in states:
+        storage_status = "filing_recorded" if states <= {"recorded", "not_requested"} else "partial_filing_recorded"
+    else:
+        storage_status = "not_confirmed"
+    return storage, storage_status, filed_name
+
+
+def _index_entry(sources, row, tasks):
+    from .meeting_context import meeting_context
+    job = row["id"]
+    metadata = sources.json(f"recordings/{job}/meta.json", 100_000)
+    date, recorded_at = _date(metadata)
+    try:
+        context = meeting_context(metadata.get("meeting_context")) if isinstance(metadata, dict) else None
+    except ValueError:
+        context = None
+    participants = list(dict.fromkeys(p["name"] for p in context["participants"])) if context else []
+    route_receipt = _queued_receipt(tasks, job, "route")
+    route = _receipt_route(tasks.get("route", {}).get("settings"), route_receipt)
+    storage, storage_status, filed_name = _index_storage(sources, job, tasks, route, route_receipt)
+    local = _local_folder(row)
+    title, label_date = _label(row, metadata) if recorded_at is not None else (None, None)
+    if title is None and date:
+        # A successful local rename is newer than an upload receipt and keeps
+        # explicit owner decisions. Strip only Quill's recorded date and
+        # collision suffix; an unverified original path cannot name a meeting.
+        if row.get("naming_status") == "succeeded" and local:
+            saved_name = Path(local).name.removesuffix(" - " + job[:8])
+            title = _text(saved_name.removesuffix(" - " + date.replace("/", "-")))
+        if title is None and filed_name:
+            title = _text(filed_name.removesuffix(" - " + date))
+    elif title is None:
+        title = filed_name
+    files = _recording_files(metadata)
+    # Some older jobs retain only their queued transcript. Check its presence
+    # when it is the sole reason to list the meeting; detail validates the text.
+    summary = {"title": title, "display_date": label_date or date, "recorded_at": recorded_at,
+               "participants": participants, "participants_source": "visible_in_call" if participants else None,
+               "local_folder": local, "recording_files": files,
+               "company_id": route["company_id"] if route else None, "folder_id": route["drive_folder_id"] if route else None,
+               "folder_name": _text(route["company_name"]) if route else None,
+               "storage_status": storage_status, "storage": storage}
+    if not (title or date or files or filed_name) and storage_status not in ("filing_recorded", "partial_filing_recorded"):
+        summary["has_saved_transcript"] = sources.has_saved_transcript(job)
+    return summary
+
+
+def meeting_index(state):
+    """List saved labels, visible call participants and filing receipts without reading notes, transcripts or media."""
+    try:
+        with closing(_Sources(state)) as sources:
+            jobs, tasks, removed = sources.rows(index=True)
+            index = {}
+            for row in jobs:
+                job = row["id"]
+                if not isinstance(job, str) or not _JOB.fullmatch(job) or job in removed:
+                    continue
+                try:
+                    index[job] = _index_entry(sources, row, tasks.get(job, {}))
+                except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError, RecursionError):
+                    # A malformed saved row must not hide the rest of the meeting list.
+                    continue
+                finally:
+                    sources.cache.clear()
+            return index
+    except (OSError, ValueError, TypeError, sqlite3.Error):
+        return {}
 
 
 def _matches_file(sources, relative, identity):
@@ -482,23 +697,17 @@ def _entry(sources, row, tasks, *, include_notes=False):
     metadata = sources.json(f"recordings/{job}/meta.json", 100_000)
     display_date, recorded_at = _date(metadata)
     notes, title = _notes(sources, job, tasks, transcript, transcript_hash)
-    label = row.get("label")
     reviewed_title = None
-    if label is not None and notes is not None and recorded_at is not None:
-        from .local_naming import _display_title, _label_date
-        try:
-            day = _label_date(datetime.fromisoformat(metadata["started"].replace("Z", "+00:00")),
-                              recording_timezone(metadata), label["meeting_date"])
-            reviewed_title = _display_title(label["title"])
-            title, display_date = reviewed_title, f"{day.month}/{day.day}/{day:%y}"
-        except (ValueError, WorkflowError):
-            pass
+    if notes is not None and recorded_at is not None:
+        reviewed_title, label_date = _label(row, metadata)
+        if reviewed_title:
+            title, display_date = reviewed_title, label_date
     if notes is not None and "speaker_review" in notes:
         people = effective_attributions(transcript, notes)
         transcript_text = render_reviewed_transcript(transcript, notes)
         if len(transcript_text) > MAX_TRANSCRIPT_CHARACTERS:
             transcript_text = transcript_text[:MAX_TRANSCRIPT_CHARACTERS] + "\n\n[Transcript preview shortened.]"
-        participants = [person["name"] for person in (people or {}).values() if person.get("name")]
+        participants, _ = _display_names(transcript, people, remote_microphone_owner(transcript))
     route = _route(sources, job, tasks, transcript_hash)
     storage = {name: _storage(sources, job, stage, tasks, transcript_hash, route, metadata, notes, transcript)
                for name, stage in (("document", "publish"), ("media", "archive"))}
@@ -524,7 +733,9 @@ def _entry(sources, row, tasks, *, include_notes=False):
             from .speaker_corrections import load_bundle
             from .speaker_identity import attach
             bundle = load_bundle(sources, job, transcript, notes)
-            if bundle["report"] or bundle["corrections"]["assignments"] or (notes or {}).get("_speaker_identity"):
+            owner, owner_source = _display_microphone_owner(sources, job, transcript, metadata, selected=include_notes)
+            reviewed = bool(bundle["report"] or bundle["corrections"]["assignments"] or (notes or {}).get("_speaker_identity"))
+            if reviewed:
                 try:
                     from .speaker_notes import load_reviewed_notes
                     revised = load_reviewed_notes(sources, job, transcript, notes, bundle)
@@ -533,10 +744,17 @@ def _entry(sources, row, tasks, *, include_notes=False):
                 display_notes = attach(revised or notes, transcript, bundle)
                 if notes is not None or revised is not None:
                     notes = display_notes
-                people = effective_attributions(transcript, display_notes) or {}
-                result["transcript_text"] = render_reviewed_transcript(transcript, display_notes)[:MAX_TRANSCRIPT_CHARACTERS]
-                result["participants"] = list(dict.fromkeys(p["name"] for p in people.values() if p.get("name")))
                 result["speaker_corrections_local"] = bool(bundle["corrections"]["assignments"])
+            else:
+                display_notes = notes
+            if reviewed or owner:
+                people = effective_attributions(transcript, display_notes, microphone_owner=owner)
+                result["transcript_text"] = render_reviewed_transcript(
+                    transcript, display_notes, microphone_owner=owner)[:MAX_TRANSCRIPT_CHARACTERS]
+                result["participants"], count = _display_names(transcript, people, owner)
+                if count:
+                    result.update(microphone_owner=owner, microphone_owner_source=owner_source,
+                                  microphone_owner_segments=count)
         except (ValueError, TypeError, KeyError, OSError):
             result["speaker_review_error"] = "Speaker corrections need review; original text is shown."
     if include_notes:
@@ -565,7 +783,7 @@ def meeting_detail(state, job):
     except (OSError, ValueError, TypeError):
         return None
     try:
-        jobs, all_tasks, removed = sources.rows()
+        jobs, all_tasks, removed = sources.rows(job)
         if job in removed:
             return None
         row = next((row for row in jobs if row["id"] == job), None)

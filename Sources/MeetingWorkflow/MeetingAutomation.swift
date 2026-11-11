@@ -22,22 +22,37 @@ public struct MeetingContext: Codable, Equatable, Sendable {
         let pattern = provider == "google-meet" ? "^[a-z]{3}-[a-z]{4}-[a-z]{3}$" : "^[0-9]{9,12}$"
         guard ["google-meet", "zoom-web"].contains(provider), coverage == "visible_only",
               key.range(of: pattern, options: .regularExpression) != nil,
-              participants.count <= 50 else { return nil }
-        for person in participants {
-            let name = person.name
-            guard !name.isEmpty, name.unicodeScalars.count <= 100, name.utf8.count <= 400,
-                  name == name.precomposedStringWithCanonicalMapping,
-                  name == name.split(whereSeparator: \.isWhitespace).joined(separator: " "),
-                  !name.unicodeScalars.contains(where: {
-                      switch $0.properties.generalCategory {
-                      case .control, .format, .surrogate, .privateUse, .unassigned: return true
-                      default: return false
-                      }
-                  }),
-                  !name.contains("@"), !name.contains("://"),
-                  !["you", "me", "host", "unknown", "participant", "participants", "guest"].contains(name.lowercased()) else { return nil }
-        }
+              participants.count <= 50, participants.allSatisfy({ Self.validName($0.name) }) else { return nil }
         return self
+    }
+
+    private static func validName(_ name: String) -> Bool {
+        !name.isEmpty && name.unicodeScalars.count <= 100 && name.utf8.count <= 400
+            && name == name.precomposedStringWithCanonicalMapping
+            && name == name.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+            && !name.unicodeScalars.contains {
+                switch $0.properties.generalCategory {
+                case .control, .format, .surrogate, .privateUse, .unassigned: return true
+                default: return false
+                }
+            }
+            && !name.contains("@") && !name.contains("://")
+            && !["you", "me", "host", "unknown", "participant", "participants", "guest"].contains(name.lowercased())
+    }
+
+    /// An explicit per-device label applies only to validated supported-call
+    /// context. Participant display names never supply the microphone owner.
+    public static func microphoneOwner(_ candidate: String?, joinedProvider: String?) -> String? {
+        guard let joinedProvider, ["google-meet", "zoom-web"].contains(joinedProvider),
+              let name = candidate, Self.validName(name), name.unicodeScalars.count <= 60,
+              name.utf8.elementsEqual(name.precomposedStringWithCanonicalMapping.utf8) else { return nil }
+        let lower = name.lowercased()
+        guard !lower.hasSuffix("(suggested)"),
+              !["microphone", "mic", "system", "system audio", "other speaker", "everyone",
+                "anonymous", "speaker"].contains(lower),
+              lower.range(of: #"^(?:(?:microphone|mic|system(?: audio)?|other|remote)[ _-]+)?(?:speaker|participant)[ _-]*(?:[0-9]+|[a-z])$"#,
+                          options: .regularExpression) == nil else { return nil }
+        return name
     }
 
     public func merging(_ next: MeetingContext) -> MeetingContext {
@@ -78,6 +93,16 @@ public struct MeetingSignal: Codable, Equatable, Sendable {
     public let timestamp: TimeInterval
     public let browserWindow: BrowserWindow?
     public let meetingContext: MeetingContext?
+    // Retain only the conflict when a roster is rejected. A nil flag keeps
+    // the wire representation of ordinary signals unchanged.
+    private var conflictingContextProvider: Bool?
+    /// A positive join is sufficient even when the browser cannot extract a
+    /// call key or roster. Conflicting provider evidence cannot assign a mic.
+    public var joinedRemoteProvider: String? {
+        guard state == .joined, ["google-meet", "zoom-web"].contains(provider),
+              conflictingContextProvider != true else { return nil }
+        return provider
+    }
     public let speakerActivity: MeetingSpeakerActivity?
 
     public init(source: String, meeting: String, provider: String, state: State, timestamp: TimeInterval, browserWindow: BrowserWindow? = nil, meetingContext: MeetingContext? = nil, speakerActivity: MeetingSpeakerActivity? = nil) {
@@ -87,16 +112,22 @@ public struct MeetingSignal: Codable, Equatable, Sendable {
         self.state = state
         self.timestamp = timestamp
         self.browserWindow = browserWindow
-        self.meetingContext = meetingContext?.provider == provider ? meetingContext?.validated() : nil
+        if let meetingContext, meetingContext.provider != provider {
+            self.meetingContext = nil
+            self.conflictingContextProvider = true
+        } else {
+            self.meetingContext = meetingContext?.validated()
+        }
         self.speakerActivity = state == .joined ? speakerActivity?.validated(provider: provider, receivedAt: timestamp) : nil
     }
 
     private enum CodingKeys: String, CodingKey {
-        case source, meeting, provider, state, timestamp, browserWindow, meetingContext, speakerActivity
+        case source, meeting, provider, state, timestamp, browserWindow, meetingContext, speakerActivity, conflictingContextProvider
     }
 
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
+        let markedConflict = try values.decodeIfPresent(Bool.self, forKey: .conflictingContextProvider) == true
         // Optional naming evidence must never disable join/leave detection if
         // a newer/older browser sends an unavailable or malformed activity field.
         self.init(source: try values.decode(String.self, forKey: .source),
@@ -105,8 +136,9 @@ public struct MeetingSignal: Codable, Equatable, Sendable {
                   state: try values.decode(State.self, forKey: .state),
                   timestamp: try values.decode(TimeInterval.self, forKey: .timestamp),
                   browserWindow: try values.decodeIfPresent(BrowserWindow.self, forKey: .browserWindow),
-                  meetingContext: try values.decodeIfPresent(MeetingContext.self, forKey: .meetingContext),
+                  meetingContext: markedConflict ? nil : try values.decodeIfPresent(MeetingContext.self, forKey: .meetingContext),
                   speakerActivity: try? values.decodeIfPresent(MeetingSpeakerActivity.self, forKey: .speakerActivity))
+        if markedConflict { conflictingContextProvider = true }
     }
 }
 

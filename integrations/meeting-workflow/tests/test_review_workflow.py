@@ -52,6 +52,43 @@ class ReviewWorkflowTests(unittest.TestCase):
             self.assertEqual(start.call_count, 2)
         self.assertEqual(self.statuses(), {"archive": "held", "notes": "held", "route": "pending", "publish": "held"})
 
+    def test_list_badges_require_no_content_or_deletion_inventory_and_leave_review_pending(self):
+        from quill_workflow.local_deletion import LocalMeetingDeletion
+        from quill_workflow.sharing import SharingReviews
+        from contextlib import closing
+        with closing(RoutingReviews(self.queue.state)) as reviews:
+            pending = reviews.propose(self.job, b'{"segments":[{"text":"synthetic"}]}',
+                                      self.config["route"]["companies"], {"schema_version": 1, "company_id": None,
+                                      "confidence": "low", "reason": "Synthetic", "evidence": [], "ambiguous": True})
+        with closing(SharingReviews(self.queue.state, self.config_path)) as sharing:
+            sharing.put({"job": self.job, "status": "ready", "title": "Synthetic", "revision": "saved",
+                         "preview": "private note", "recipient_draft": "personal@example.com"})
+        unfinished = self.root / "recordings" / "Finished before queue"
+        unfinished.mkdir()
+        atomic_json(unfinished / "meta.json", {"started": "2026-01-02T00:00:00Z", "ended": "2026-01-02T00:10:00Z",
+                                               "files": {}, "transcription_requested": True})
+        before = self.queue.tasks(self.job)
+        with (patch.object(LocalMeetingDeletion, "_snapshot", side_effect=AssertionError("inventory")),
+              patch.object(SharingReviews, "card", side_effect=AssertionError("full sharing preview")),
+              patch.object(workflow, "_resumable_stages", side_effect=AssertionError("full notes")),
+              patch.object(workflow, "start_worker", side_effect=AssertionError("worker started"))):
+            summary = workflow.review_action_summaries(self.config_path, self.queue.state)
+        self.assertEqual(summary["routing"][self.job]["status"], "pending")
+        self.assertEqual(summary["resume"], {})
+        self.assertEqual(summary["sharing"], [{"job": self.job, "status": "ready", "title": "Synthetic", "error": None}])
+        self.assertCountEqual([i["title"] for i in summary["deletion"]], ["test", unfinished.name])
+        self.assertEqual([i["phase"] for i in summary["cancellation"]], ["transcription"])
+        self.assertEqual(before, self.queue.tasks(self.job))
+        with closing(RoutingReviews(self.queue.state)) as reviews:
+            self.assertEqual(reviews.get(self.job), pending)
+
+    def test_completed_meeting_skips_source_validation_for_empty_resume_option(self):
+        record = self.approved_resume_fixture()
+        with self.queue.db:
+            self.queue.db.execute("UPDATE tasks SET status='succeeded' WHERE job=?", (self.job,))
+        with patch.object(workflow.ConnectorRunner, "approved_route", side_effect=AssertionError("loaded completed meeting")):
+            self.assertEqual(workflow.resumable_stages(record, self.config_path, self.queue.state), [])
+
     def test_disabled_routing_keeps_choice_local_without_starting_worker(self):
         self.config["route"]["enabled"] = False
         atomic_json(self.config_path, self.config)

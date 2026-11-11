@@ -72,67 +72,89 @@
     return name;
   }
 
-  function visibleParticipants(document, provider, isVisible) {
-    // Only dedicated participant-name elements. Never aggregate a roster,
-    // chat, caption, or accessible announcement into an alleged identity.
-    const meetTileSelector = "[data-participant-id][data-tile-media-id]";
-    const selector = provider === "google-meet"
-      ? "[data-participant-id] [data-self-name],[data-participant-id][data-self-name],"
-        + meetTileSelector + " .notranslate"
-      : provider === "zoom-web"
-        ? ".video-avatar__avatar-name" : null;
-    if (!selector) return [];
-    const people = [], seen = new Set();
-    const excluded = "[role='log'],[data-message-id],[data-caption-id],[aria-hidden='true'],[hidden],.chat-container,.chat-message,.chat-box";
-    const tileNames = new Map();
+  const meetTile = "[data-participant-id][data-tile-media-id]";
+  const meetRow = "[role='listitem'][data-participant-id]";
+  const participantOwner = "[data-participant-id]";
+  const excludedParticipant = "[role='log'],[data-message-id],[data-caption-id],[aria-hidden='true'],[hidden],.chat-container,.chat-message,.chat-box";
 
-    function meetTileName(element) {
-      if (element.tagName !== "SPAN" || element.childElementCount !== 0 || !element.matches(".notranslate")) return null;
-      const tile = element.closest(meetTileSelector);
-      if (!tile) return null;
-      if (!tileNames.has(tile)) {
-        // Current Meet puts icon labels and empty placeholders beside the
-        // display name. Read visible SPAN leaves only, never tile text.
-        const nodes = tile.querySelectorAll(".notranslate");
-        const names = [];
-        if (nodes.length <= 100) {
-          for (const node of nodes) {
-            if (node.tagName !== "SPAN" || node.childElementCount !== 0
-                || node.closest(meetTileSelector) !== tile || !isVisible(node)
-                || node.closest(excluded)) continue;
-            const value = node.textContent;
-            if (participantName(value)) names.push({ element: node, value });
-            if (names.length > 1) break;
-          }
-        }
-        tileNames.set(tile, names.length === 1 ? names[0] : null);
-      }
-      const name = tileNames.get(tile);
-      return name?.element === element ? name.value : null;
+  function participantLabel(value, explicitSelf) {
+    if (typeof value !== "string" || value.length > 400) return null;
+    const suffix = /\s*\(you\)\s*$/i;
+    const name = participantName(value.replace(suffix, ""));
+    return name ? { name, self: explicitSelf || suffix.test(value) } : null;
+  }
+
+  function hasSelfMarker(element, owner) {
+    // A wrapper inside this participant may carry the marker. An enclosing
+    // roster or a nested participant cannot assert identity for this tile.
+    const marker = element.closest("[data-is-self='true']");
+    return Boolean(marker && marker.closest(participantOwner) === owner);
+  }
+
+  function meetParticipantLabel(container, ownerSelector, visible) {
+    if (!visible(container) || container.closest(excludedParticipant)) return null;
+    const row = ownerSelector === meetRow;
+    const nodes = container.querySelectorAll(row ? ".zWGUib" : ".notranslate");
+    if (nodes.length > 100) return null;
+    const ownedLeaf = node => node.tagName === "SPAN" && node.childElementCount === 0
+      && visible(node) && !node.closest(excludedParticipant) && node.closest(participantOwner) === container;
+    let label = null;
+    for (const node of nodes) {
+      if (!ownedLeaf(node)) continue;
+      const candidate = participantLabel(node.textContent, hasSelfMarker(node, container));
+      if (!candidate) continue;
+      if (label) return null;
+      label = candidate;
     }
+    if (label && row) {
+      const badges = container.querySelectorAll(".NnTWjc");
+      if (badges.length <= 10) label.self ||= [...badges].some(node => ownedLeaf(node)
+        && (node.textContent || "").trim() === "(You)");
+    }
+    return label;
+  }
 
-    for (const element of [...document.querySelectorAll(selector)].slice(0, 100)) {
-      if (!isVisible(element) || element.closest(excluded)) continue;
-      let value = provider === "google-meet" ? element.getAttribute("data-self-name") : null;
-      if (provider === "google-meet" && !value) {
-        value = meetTileName(element);
-        if (!value) continue;
+  function visibleParticipants(document, provider, visible) {
+    const byID = new Map();
+    function add(owner, label) {
+      const key = owner?.getAttribute("data-participant-id");
+      if (!label || !key || key.length > 512) return;
+      if (!byID.has(key)) byID.set(key, label);
+      else {
+        const known = byID.get(key);
+        if (known && known.name === label.name) known.self ||= label.self;
+        else byID.set(key, null);
       }
-      // Zoom's dedicated display-name element may include a small self badge.
-      // Inspect leaf-sized text only; a changed container shape is omitted.
-      if (!value) {
-        if (element.childElementCount > 2 || (element.textContent || "").length > 400) continue;
-        value = element.textContent;
+    }
+    let candidates;
+    if (provider === "google-meet") {
+      const legacy = document.querySelectorAll("[data-participant-id] [data-self-name],[data-participant-id][data-self-name]");
+      for (const element of [...legacy].slice(0, 100)) {
+        if (!visible(element) || element.closest(excludedParticipant)) continue;
+        const owner = element.closest(participantOwner);
+        if (owner) add(owner, participantLabel(element.getAttribute("data-self-name"), hasSelfMarker(element, owner)));
       }
-      const self = element.getAttribute("data-is-self") === "true"
-        || (typeof value === "string" && /\s*\(you\)\s*$/i.test(value));
-      if (self) value = value.replace(/\s*\(you\)\s*$/i, "");
-      const name = participantName(value);
-      if (!name) continue;
-      const key = name.toLowerCase() + "|" + self;
-      if (seen.has(key)) continue;
+      for (const selector of [meetRow, meetTile]) {
+        for (const container of [...document.querySelectorAll(selector)].slice(0, 100)) {
+          add(container, meetParticipantLabel(container, selector, visible));
+        }
+      }
+      candidates = [...byID.values()].filter(Boolean);
+      if (candidates.filter(person => person.self).length > 1) candidates = candidates.filter(person => !person.self);
+    } else if (provider === "zoom-web") {
+      candidates = [];
+      for (const element of [...document.querySelectorAll(".video-avatar__avatar-name")].slice(0, 100)) {
+        if (!visible(element) || element.closest(excludedParticipant) || element.childElementCount > 2) continue;
+        const label = participantLabel(element.textContent, element.getAttribute("data-is-self") === "true");
+        if (label) candidates.push(label);
+      }
+    } else return [];
+
+    const people = [], seen = new Set();
+    for (const person of candidates) {
+      const key = person.name.toLowerCase() + "|" + person.self;
+      if (!seen.has(key)) people.push(person);
       seen.add(key);
-      people.push({ name, self });
       if (people.length === 20) break;
     }
     return people;
@@ -186,6 +208,8 @@
     if (leave && people && audio) return { provider, state: "joined", reason: "in-call-controls" };
     return { provider, state: "unknown", reason: "no-confirmed-call-state" };
   }
-  root.QuillMeetingDetector = { classify, controlLabel, warningEvidence, visibleParticipants, participantName };
-  if (typeof module !== "undefined") module.exports = { classify, controlLabel, warningEvidence, visibleParticipants, participantName };
+  const api = { classify, controlLabel, warningEvidence, visibleParticipants, participantName,
+    meetParticipantLabel, meetTile, meetRow };
+  root.QuillMeetingDetector = api;
+  if (typeof module !== "undefined") module.exports = api;
 })(globalThis);

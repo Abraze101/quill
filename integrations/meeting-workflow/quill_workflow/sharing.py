@@ -275,15 +275,41 @@ class SharingReviews:
         result["retryable"] = result["status"] == "needs_attention" and record.get("attempts", 0) < 3
         return result
 
-    def options(self):
+    def summaries(self, removed, stopped):
+        """Read saved sharing states without rebuilding draft content or offering a grant."""
+        from .local_deletion import _busy
+        summaries = []
+        for job, title, status, approval, updated, error in self.db.execute(
+                "SELECT job,json_extract(record,'$.title'),json_extract(record,'$.status'),"
+                "json_extract(record,'$.approval.source_hash'),json_extract(record,'$.updated'),json_extract(record,'$.error') "
+                "FROM sharing_reviews"):
+            if job in removed or status == "private" or (job in stopped and approval is None and status != "shared"):
+                continue
+            if status in ("sharing", "preparing") and isinstance(updated, (int, float)) and time.time() - updated > 15:
+                lock = self.state / ("sharing-" + hashlib.sha256(job.encode()).hexdigest() + ".lock")
+                try:
+                    if not _busy(lock):
+                        status = "needs_attention"
+                        error = "The sharing operation stopped. Open this meeting to review its saved result."
+                except (OSError, WorkflowError):
+                    status = "needs_attention"
+                    error = "The sharing status could not be verified. Open this meeting to check."
+            summaries.append({"job": job, "title": title, "status": status, "error": error})
+        return summaries
+
+    def options(self, job=None):
         queue = Queue(self.state)
         try:
-            jobs = [row[0] for row in queue.db.execute("SELECT job FROM tasks WHERE stage='publish' AND status='succeeded' ORDER BY rowid DESC")]
+            arguments = (job,) if job is not None else ()
+            jobs = dict.fromkeys(row[0] for row in queue.db.execute(
+                "SELECT job FROM tasks WHERE stage='publish' AND status='succeeded'"
+                + (" AND job=?" if arguments else "") + " ORDER BY rowid DESC", arguments))
         finally:
             queue.close()
-        jobs.extend(row[0] for row in self.db.execute("SELECT job FROM sharing_reviews") if row[0] not in jobs)
+        jobs.update(dict.fromkeys(row[0] for row in self.db.execute(
+            "SELECT job FROM sharing_reviews" + (" WHERE job=?" if arguments else ""), arguments)))
         from .local_deletion import deleted_jobs, stopped_jobs
-        removed, stopped = deleted_jobs(self.state), stopped_jobs(self.state)
+        removed, stopped = deleted_jobs(self.state, job), stopped_jobs(self.state, job)
         cards = []
         for job in jobs:
             if job in removed:

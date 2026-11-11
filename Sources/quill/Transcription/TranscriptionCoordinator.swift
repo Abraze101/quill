@@ -364,6 +364,7 @@ actor TranscriptionCoordinator {
             speakers: meta.speakerIdentificationRequested ? speakers : nil,
             speaker_name_policy: meta.speakerIdentificationRequested ? SpeakerIdentityNames.Policy.explicitIntroV3.rawValue : nil,
             speaker_identification: identification,
+            remote_microphone_owner: meta.remoteMicrophoneOwner,
             capture_quality: meta.captureQuality
         )
         try Task.checkCancellation()
@@ -439,6 +440,7 @@ private struct SessionMeta {
 
     let tracks: [Track]
     let speakerIdentificationRequested: Bool
+    let remoteMicrophoneOwner: String?
     let captureQuality: Transcript.CaptureQuality?
 
     enum MetaError: Error, CustomStringConvertible {
@@ -469,8 +471,25 @@ private struct SessionMeta {
         if let system = files["system"] {
             tracks.append(Track(file: system, speaker: "them", offsetMs: offsets["system"] ?? 0, source: "system"))
         }
+        var owner: String?
+        if let name = json["remote_microphone_owner"] as? String {
+            if let frozen = json["remote_microphone_provider"] {
+                let provider = frozen as? String
+                let context = json["meeting_context"]
+                if context == nil || context is NSNull || (context as? [String: Any])?["provider"] as? String == provider {
+                    owner = MeetingContext.microphoneOwner(name, joinedProvider: provider)
+                }
+            } else if let saved = json["meeting_context"] as? [String: Any],
+                      let bytes = try? JSONSerialization.data(withJSONObject: saved),
+                      let context = try? JSONDecoder().decode(MeetingContext.self, from: bytes) {
+                // Build 17 bound the profile to a validated context before
+                // capture rather than storing the joined provider separately.
+                owner = MeetingContext.microphoneOwner(name, joinedProvider: context.validated()?.provider)
+            }
+        }
         return SessionMeta(tracks: tracks,
             speakerIdentificationRequested: json["speaker_identification_requested"] as? Bool == true,
+            remoteMicrophoneOwner: owner,
             captureQuality: Transcript.CaptureQuality.read(from: json))
     }
 }
@@ -560,6 +579,7 @@ private struct Transcript: Codable {
     var speakers: [String: Speaker]? = nil
     var speaker_name_policy: String? = nil
     var speaker_identification: Identification? = nil
+    var remote_microphone_owner: String? = nil
     var capture_quality: CaptureQuality? = nil
 
     /// Publish readable text before the canonical completion marker. If the
@@ -579,19 +599,38 @@ private struct Transcript: Codable {
     }
 
     private func rendered(title: String) -> String {
-        let notice = speaker_labels == "diarized_v1"
-            ? "Speaker labels are estimated from audio. Names come from explicit self-introductions; unclear speech keeps its audio-source label."
-            : "Microphone and system audio identify audio sources, not individual speakers."
+        let owner = remote_microphone_owner.flatMap { candidate in
+            // One other identified voice is enough to establish that the
+            // microphone is shared. Leave its unresolved speech unassigned.
+            let shared = speakers?.values.contains { person in
+                guard person.source == "mic", let name = person.name else { return false }
+                return name.caseInsensitiveCompare(candidate) != .orderedSame
+            } ?? false
+            return shared ? nil : candidate
+        }
+        let notice: String
+        if owner != nil {
+            notice = "The microphone uses the recorder’s configured name unless a speaker has an identified name."
+        } else {
+            notice = speaker_labels == "diarized_v1"
+                ? "Speaker labels are estimated from audio. Names come from explicit self-introductions; unclear speech keeps its audio-source label."
+                : "Microphone and system audio identify audio sources, not individual speakers."
+        }
         var lines = ["# \(title)", "", "engine: \(engine) (\(model))", "", notice, ""]
         if capture_quality != nil { lines += [CaptureQuality.notice, ""] }
         if let identification = speaker_identification, identification.status != "completed" {
-            lines += ["Speaker detection \(identification.status). Unidentified speech remains labeled by audio source.", ""]
+            let detail = owner == nil ? " Unidentified speech remains labeled by audio source." : ""
+            lines += ["Speaker detection \(identification.status).\(detail)", ""]
         }
         for seg in segments {
             let label: String
-            if let identity = speakers?[seg.speaker] { label = identity.name ?? identity.label }
+            let identity = speakers?[seg.speaker]
+            let source = seg.source ?? seg.speaker
+            if let name = identity?.name { label = name }
+            else if let owner, ["mic", "me"].contains(source) { label = owner }
+            else if let identity { label = identity.label }
             else {
-                label = switch seg.source ?? seg.speaker {
+                label = switch source {
                 case "me", "mic": "Microphone"
                 case "them", "system": "System audio"
                 default: "Audio source unspecified"

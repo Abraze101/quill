@@ -69,6 +69,10 @@ def title_guests(notes, transcript, identity_context=None, meeting_context=None,
     # A platform "You" label identifies the recorder’s account, not everybody on
     # the microphone. Explicit local aliases also work for non-browser calls.
     owner_keys = {name.casefold() for name in validate_guest_names(list(owner_names))}
+    from .transcript_sources import remote_microphone_owner
+    recorder = remote_microphone_owner(transcript)
+    if recorder:
+        owner_keys.add(recorder.casefold())
     owner_keys.update(p["name"].casefold() for p in platform_people if p["self"])
     owner_first = {name.split()[0] for name in owner_keys}
     # An unqualified first name cannot bind an account. Match full identities
@@ -114,13 +118,18 @@ def title_guests(notes, transcript, identity_context=None, meeting_context=None,
 
 
 def bind_title_guests(notes, transcript, identity_context=None, meeting_context=None, *, owner_names=()):
-    from .meeting_title import meeting_title
+    from .meeting_title import meeting_participants, meeting_title
     if "_title_guests" in notes:
         notes = dict(notes)
         notes.pop("_title_guests")
     # Validate the model roster and evidence before deriving or using its names.
     meeting_title(notes, transcript)
     if "meeting_title" in notes:
+        participants = meeting_participants(notes, transcript)
+        # Keep a complete eight-person model roster intact. Renderers can
+        # still include the independent recorder entry alongside that roster.
+        if participants != notes["meeting_title"]["participants"] and len(participants) <= 8:
+            notes = dict(notes, meeting_title=dict(notes["meeting_title"], participants=participants))
         guests = title_guests(notes, transcript, identity_context, meeting_context, owner_names=owner_names)
         return dict(notes, _title_guests=guests)
     return notes

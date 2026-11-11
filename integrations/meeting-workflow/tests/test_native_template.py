@@ -138,6 +138,15 @@ class NativeTemplateTests(unittest.TestCase):
         self.assertEqual(payload["transcript_segments"], len(self.transcript["segments"]))
         self.assertTrue(verify_document(filled_document(payload), payload, template_document()))
 
+    def test_remote_owner_appears_in_native_roster_and_mic_segments(self):
+        transcript = dict(self.transcript, remote_microphone_owner="Morgan Lee", speaker_labels="audio_source")
+        payload = self.payload(transcript=transcript)
+        slots = payload["replacements"]
+        self.assertEqual(slots["{{QUILL_PARTICIPANTS}}"], "Max, Morgan Lee")
+        self.assertIn("00:00 | Morgan Lee  Hi Max.", slots["{{QUILL_TRANSCRIPT}}"])
+        self.assertIn("00:01 | System audio  Draft scope:", slots["{{QUILL_TRANSCRIPT}}"])
+        self.assertNotIn("Morgan Lee", payload["title"])
+
     def test_track_labels_never_turn_names_or_metadata_into_voice_identity(self):
         for value in ("Max", "Speaker 1", None, {"name": "Max"}):
             with self.subTest(value=value):

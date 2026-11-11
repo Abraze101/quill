@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Quill on_stop entry point and durable worker. No global installation."""
 import argparse
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import fcntl
 import hashlib
 import json
@@ -51,25 +51,31 @@ def start_worker(config, state, supervised=False):
                      stderr=subprocess.DEVNULL, start_new_session=True)
 
 
-def processing_meetings(config_path, state):
+def _processing_cards(items, state, *, include_worker=True):
+    result = [item for item in items if item["state"] != "idle"]
+    if include_worker:
+        worker = health(state)
+        if worker["state"] == "needs_attention":
+            result.insert(0, {"title": "Meeting processing stopped", "detail": worker["error"] or
+                             "Automatic recovery needs attention", "retryable": False})
+    return result
+
+
+def processing_meetings(config_path, state, job=None):
     from quill_workflow.queue_status import meetings
     queue = Queue(state)
     try:
         # Listing does not release work or read/transcribe recordings. Every
         # submitted Retry is revalidated against live settings and sources.
         current = load_config(config_path)
-        result = meetings(queue)
+        result = meetings(queue, job)
         for item in result:
+            if not item["retryable"]:
+                continue
             tasks = queue.tasks(item["job"])
             selected = [task for task in tasks if task["status"] in ("failed", "retry")]
-            item["retryable"] = (item["retryable"] and all(configured(current.get(task["stage"], {}),
-                                                                        task["stage"]) for task in selected))
-        result = [item for item in result if item["state"] != "idle"]
-        worker = health(state)
-        if worker["state"] == "needs_attention":
-            result.insert(0, {"title": "Meeting processing stopped", "detail": worker["error"] or
-                             "Automatic recovery needs attention", "retryable": False})
-        return result
+            item["retryable"] = all(configured(current.get(task["stage"], {}), task["stage"]) for task in selected)
+        return _processing_cards(result, state, include_worker=job is None)
     finally:
         queue.close()
 
@@ -86,11 +92,11 @@ def retry_meeting(job, revision, config_path, state):
         queue.close()
 
 
-def deletion_options(config_path, state):
+def deletion_options(config_path, state, job=None):
     from quill_workflow.local_deletion import LocalMeetingDeletion
     deletion = LocalMeetingDeletion(state, config_path)
     try:
-        return deletion.options()
+        return deletion.options(job)
     finally:
         deletion.close()
 
@@ -151,13 +157,54 @@ def reconcile_deletions(config_path, state):
         deletion.close()
 
 
-def sharing_options(config_path, state):
+def sharing_options(config_path, state, job=None):
     from quill_workflow.sharing import SharingReviews
     reviews = SharingReviews(state, config_path)
     try:
-        return reviews.options()
+        return reviews.options(job)
     finally:
         reviews.close()
+
+
+def review_action_summaries(config_path, state):
+    """Collect list badges. Eligibility for a button is checked on the selected meeting."""
+    from quill_workflow.local_deletion import LocalMeetingDeletion, stopped_jobs
+    from quill_workflow.queue_status import meetings
+    from quill_workflow.sharing import SharingReviews
+
+    current = load_config(config_path)
+    with closing(LocalMeetingDeletion(state, config_path)) as deletion:
+        queue = deletion.queue
+        stopped = stopped_jobs(queue.state)
+        removed = {row[0] for row in queue.db.execute("SELECT job FROM local_deletions")}
+        removals, cancellations = deletion.summaries(stopped)
+        with closing(RoutingReviews(queue.state)) as reviews:
+            routing = {}
+            for job, status, companies, approved in reviews.db.execute(
+                    "SELECT job,json_extract(record,'$.status'),json_extract(record,'$.companies'),"
+                    "json_extract(record,'$.approved_route') FROM routing_reviews "
+                    "ORDER BY json_extract(record,'$.created_at'),job"):
+                if job not in stopped:
+                    routing[job] = {"job": job, "status": status, "approved_route": json.loads(approved) if approved else None,
+                                    "companies": [{"id": row["id"], "name": row["name"]} for row in json.loads(companies)]}
+        skipped = {job for job, record in routing.items() if record["status"] == "skipped"}
+        tasks = list(queue.db.execute("SELECT job,stage,status,error FROM tasks ORDER BY job,stage"))
+        processing = meetings(queue, summary_tasks=tasks, stopped=stopped, skipped=skipped)
+        enabled = {stage for stage in ("route", "archive", "publish") if configured(current.get(stage, {}), stage)}
+        states = {}
+        for task in tasks:
+            states.setdefault(task["job"], {})[task["stage"]] = task["status"]
+        resume = {}
+        for job, record in routing.items():
+            saved = states.get(job, {})
+            if record["status"] == "approved":
+                stages = _waiting_stages(saved, enabled)
+                if stages:
+                    resume[job] = stages
+        with closing(SharingReviews(queue.state, config_path)) as sharing:
+            cards = sharing.summaries(removed, stopped)
+        return {"routing": routing, "resume": resume, "processing": _processing_cards(processing, state),
+                "sharing": cards, "cancellation": cancellations, "deletion": removals}
 
 
 def sharing_decision(action, job, revision, emails, config_path, state, suggestion=None):
@@ -292,11 +339,23 @@ def enabled_stages(config_path):
     return {stage: current.get(stage, {}).get("enabled") is True for stage in WORKFLOW_STAGES}
 
 
+def _waiting_stages(statuses, enabled):
+    if "route" not in enabled or "route" not in statuses or statuses.get("notes") != "succeeded":
+        return []
+    return [stage for stage in ("route", "archive", "publish")
+            if stage in enabled and statuses.get(stage) in ("held", "failed", "pending", "retry")]
+
+
 def _resumable_stages(queue, record, current):
     """Validate one exact approved review before offering or releasing work."""
-    queue.require_processing(record["job"])
-    if record.get("status") != "approved" or not configured(current.get("route", {}), "route"):
+    if record.get("status") != "approved":
         return []
+    tasks = {task["stage"]: task for task in queue.tasks(record["job"])}
+    stages = _waiting_stages({stage: task["status"] for stage, task in tasks.items()},
+                             {stage for stage in ("route", "archive", "publish") if configured(current.get(stage, {}), stage)})
+    if not stages:
+        return []
+    queue.require_processing(record["job"])
     reviews = RoutingReviews(queue.state)
     try:
         saved = reviews.get(record["job"])
@@ -304,9 +363,6 @@ def _resumable_stages(queue, record, current):
         reviews.close()
     if not saved or saved["status"] != "approved" or saved["revision"] != record["revision"]:
         raise WorkflowError("This meeting review changed; reopen the current review")
-    tasks = {task["stage"]: task for task in queue.tasks(record["job"])}
-    if "route" not in tasks or tasks.get("notes", {}).get("status") != "succeeded":
-        return []
     frozen = route_settings(json.loads(tasks["route"]["settings"]))
     if not preserves_company_map(route_settings(current["route"])["companies"], frozen["companies"]):
         raise WorkflowError("Company folders changed; this meeting needs a new review")
@@ -332,9 +388,7 @@ def _resumable_stages(queue, record, current):
             or not notes_markdown_matches(markdown.read_text(encoding="utf-8"),
                                           read_json(notes / "notes.json"), json.loads(source))):
         raise WorkflowError("Saved notes and their source references need review before resuming")
-    return [stage for stage in ("route", "archive", "publish")
-            if tasks.get(stage, {}).get("status") in ("held", "failed", "pending", "retry")
-            and configured(current.get(stage, {}), stage)]
+    return stages
 
 
 def resumable_stages(record, config_path, state):
@@ -580,16 +634,17 @@ def main(argv=None):
                 if action in ("speaker_save", "speaker_clear", "speaker_refresh_notes"):
                     start_refresh(queue.state, job, args.config)
             serve_review(queue.state,
+                         action_summaries=lambda: review_action_summaries(args.config, queue.state),
                          speaker_options=speakers.options, on_speaker=speaker_decision,
                          on_decision=lambda record: resume_reviewed_job(record, args.config, queue.state),
                          resume_options=lambda record: resumable_stages(record, args.config, queue.state),
                          on_resume=lambda record, stages: resume_waiting_work(record, args.config, queue.state, stages),
-                         processing_options=lambda: processing_meetings(args.config, queue.state),
+                         processing_options=lambda job=None: processing_meetings(args.config, queue.state, job),
                          on_retry=lambda job, revision: retry_meeting(job, revision, args.config, queue.state),
-                         sharing_options=lambda: sharing_options(args.config, queue.state),
+                         sharing_options=lambda job=None: sharing_options(args.config, queue.state, job),
                          on_sharing=lambda action, job, revision, emails=None, suggestion=None: sharing_decision(
                              action, job, revision, emails, args.config, queue.state, suggestion),
-                         deletion_options=lambda: deletion_options(args.config, queue.state),
+                         deletion_options=lambda job=None: deletion_options(args.config, queue.state, job),
                          on_delete=lambda action, job, revision, confirmation=None: deletion_decision(
                              action, job, revision, args.config, queue.state, confirmation),
                          cancellation_options=lambda job=None: cancellation_options(args.config, queue.state, job),

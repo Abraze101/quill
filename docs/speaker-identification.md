@@ -11,6 +11,20 @@ microphone can contain several speakers, and system audio can contain several
 remote participants. Microphone and system speakers have separate IDs. Quill
 does not assume one microphone equals one person or merge voices across tracks.
 
+For a Mac used by one person on remote calls, set
+`transcription.remote_microphone_owner` in the native Quill configuration to
+that person's display name. Quill saves it with the recording when capture
+starts during a detected Google Meet or browser Zoom call. Microphone speech
+uses that name, including turns that speaker separation split or left unassigned.
+A different identified local speaker keeps their name, and ambiguous microphone
+turns in that recording keep their source labels. A manual recording started
+outside a detected call uses the usual speaker labels.
+
+For older recordings, the local meeting view can apply the configured name when
+the saved Meet or Zoom evidence identifies that person in the call and no self
+badge conflicts. This updates the displayed transcript and participant list.
+Original recordings, filed documents and upload receipts retain their saved contents.
+
 New captures use `speaker_name_policy: "explicit_intro_v3"`. It accepts direct
 introductions such as “My name is Jamie” and “Hi, I'm Alex,” including a bounded
 set of natural lead-ins such as “Well, yeah, my name is Jamie” or “It doesn't show

@@ -1,5 +1,6 @@
 """Local, reversible speaker corrections with source and stale-form checks."""
 import copy
+from contextlib import closing
 import hashlib
 import json
 import os
@@ -58,7 +59,7 @@ class SpeakerCorrections:
             raise ValueError("Processing is stopped for this meeting")
         sources = _Sources(self.state)
         try:
-            jobs, tasks, removed = sources.rows()
+            jobs, tasks, removed = sources.rows(job)
             if job in removed or not any(row["id"] == job for row in jobs):
                 raise ValueError("This meeting is no longer available")
             transcript, raw_hash, _, _ = _transcript(sources, job)
@@ -75,11 +76,18 @@ class SpeakerCorrections:
     def options(self, job):
         try:
             transcript, notes, bundle, revision = self._snapshot(job)
-            people = effective_attributions(transcript, attach(notes, transcript, bundle)) or {}
+            from .review_library import _Sources, _display_microphone_owner, _display_names
+            with closing(_Sources(self.state)) as sources:
+                metadata = sources.json(f"recordings/{job}/meta.json", 100_000)
+                owner, owner_source = _display_microphone_owner(sources, job, transcript, metadata, selected=True)
+            people = effective_attributions(transcript, attach(notes, transcript, bundle), microphone_owner=owner) or {}
+            _, default_count = _display_names(transcript, people, owner)
             learned = self.learned()
             result = []
             for identity, person in people.items():
-                samples = [s["text"] for s in transcript["segments"] if s["speaker"] == identity]
+                samples = [s["text"] for s in transcript["segments"] if s["speaker"] == identity and s["text"].strip()]
+                if person.get("review_status") == "microphone_owner" and not samples:
+                    person = {"label": person["label"]}
                 # Longer excerpts make a voice easier to recognize than an isolated 'yes'.
                 samples = sorted(samples, key=len, reverse=True)[:3]
                 result.append({"id": identity, "label": person["label"],
@@ -94,7 +102,6 @@ class SpeakerCorrections:
             status = read_status(self.state, job) or {}
             if status.get("state") == "succeeded":
                 from .speaker_notes import load_reviewed_notes
-                from .review_library import _Sources
                 sources = _Sources(self.state)
                 try:
                     if load_reviewed_notes(sources, job, transcript, notes, bundle) is None:
@@ -103,6 +110,9 @@ class SpeakerCorrections:
                     sources.close()
             return {"job": job, "revision": revision, "speakers": result,
                     "notes_status": status.get("state"), "notes_error": status.get("error"),
+                    "microphone_owner": owner if default_count else None,
+                    "microphone_owner_source": owner_source if default_count else None,
+                    "microphone_owner_segments": default_count,
                     "candidates": bundle["context"]["candidates"],
                     "local_participants": [dict(person) for person in
                         bundle["context"].get("timeline", {}).get("participants", []) if person["self"]],

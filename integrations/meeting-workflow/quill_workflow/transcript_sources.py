@@ -175,7 +175,38 @@ def speaker_attributions(transcript):
     return result
 
 
-def segment_label(segment, attributions=None):
+def remote_microphone_owner(transcript):
+    """The recorder profile captured for a supported remote call, separate from voice evidence."""
+    owner = transcript.get("remote_microphone_owner")
+    if owner is None:
+        return None
+    from .speaker_review import _name
+    return _name(owner)
+
+
+def microphone_segment(segment):
+    source = segment.get("source")
+    return source == "mic" if source is not None else segment.get("speaker") in ("me", "mic")
+
+
+def _available_mic_owner(people, owner):
+    # A positive identification of someone else on this mic overrides its default.
+    if owner and not any(p.get("source") == "mic" and p.get("name")
+                         and _name_key(p["name"]) != _name_key(owner) for p in (people or {}).values()):
+        return owner
+    return None
+
+
+def segment_name(segment, attributions=None, microphone_owner=None):
+    person = (attributions or {}).get(segment.get("speaker"), {})
+    return person.get("name") or (
+        _available_mic_owner(attributions, microphone_owner) if microphone_segment(segment) else None)
+
+
+def segment_label(segment, attributions=None, microphone_owner=None):
+    name = segment_name(segment, attributions, microphone_owner)
+    if name:
+        return name
     if attributions is None:
         return source_label(segment.get("speaker"))
     person = attributions.get(segment.get("speaker"))
@@ -226,7 +257,22 @@ def name_in_text(name, text):
     return re.search(r"(?<!\w)" + re.escape(_name_key(name)) + r"(?!\w)", _name_key(text)) is not None
 
 
-def effective_attributions(transcript, notes=None):
+def effective_attributions(transcript, notes=None, *, microphone_owner=None):
+    people = _reviewed_attributions(transcript, notes)
+    owner = _available_mic_owner(people, remote_microphone_owner(transcript) or microphone_owner)
+    if owner:
+        for person in (people or {}).values():
+            if person.get("source") == "mic" and not person.get("name"):
+                person.pop("suggested_name", None)
+                person.pop("email", None)
+                person.update(name=owner, review_status="microphone_owner",
+                              review_reason="This is the recorder’s microphone on a remote call.")
+    if isinstance(notes, dict) and ("speaker_review" in notes or "_speaker_identity" in notes):
+        return _validate_reviewed_notes(notes, transcript, people, owner)
+    return people
+
+
+def _reviewed_attributions(transcript, notes=None):
     """Validate a source-bound review without changing transcript IDs or text.
 
     Suggested names are deliberately separate from confirmed `name` values so
@@ -237,7 +283,7 @@ def effective_attributions(transcript, notes=None):
         if isinstance(notes, dict) and "_speaker_identity" in notes:
             from .speaker_identity import apply_bundle
             people = apply_bundle(people, transcript, notes["_speaker_identity"])
-            return _validate_reviewed_notes(notes, transcript, people)
+            return people
         return people
     review = notes["speaker_review"]
     if (not isinstance(review, dict)
@@ -304,10 +350,10 @@ def effective_attributions(transcript, notes=None):
     if "_speaker_identity" in notes:
         from .speaker_identity import apply_bundle
         people = apply_bundle(people, transcript, notes["_speaker_identity"])
-    return _validate_reviewed_notes(notes, transcript, people)
+    return people
 
 
-def _validate_reviewed_notes(notes, transcript, people):
+def _validate_reviewed_notes(notes, transcript, people, microphone_owner=None):
     segments = transcript["segments"]
     suggested = {_name_key(person["suggested_name"]) for person in (people or {}).values()
                  if person.get("suggested_name")}
@@ -320,13 +366,15 @@ def _validate_reviewed_notes(notes, transcript, people):
             refs = action.get("evidence")
             if (not isinstance(refs, list) or not refs
                     or any(type(index) is not int or not 0 <= index < len(segments) for index in refs)
-                    or not any(name_in_text(action["owner"], segments[index]["text"]) for index in refs)):
+                    or not any(name_in_text(action["owner"], segments[index]["text"])
+                               or (microphone_owner and segment_name(segments[index], people, microphone_owner) == action["owner"])
+                               for index in refs)):
                 raise ValueError("Suggested action owner name is absent from independent cited transcript evidence")
-    _validate_suggested_prose(notes, segments, people or {}, suggested)
+    _validate_suggested_prose(notes, segments, people or {}, suggested, microphone_owner)
     return people
 
 
-def _validate_suggested_prose(notes, segments, people, suggested):
+def _validate_suggested_prose(notes, segments, people, suggested, microphone_owner=None):
     """A contextual name cannot silently become a definite prose attribution."""
     if not suggested:
         return
@@ -343,7 +391,7 @@ def _validate_suggested_prose(notes, segments, people, suggested):
             if not matches:
                 continue
             supported = any(name_in_text(name, segment["text"])
-                            or _name_key(people.get(segment.get("speaker"), {}).get("name", "")) == name
+                            or _name_key(segment_name(segment, people, microphone_owner) or "") == name
                             for segment in cited)
             if not supported and any(not normalized[match.end():].startswith(" (suggested)") for match in matches):
                 raise ValueError("Suggested speaker name in notes needs independent cited evidence or an adjacent (suggested) label")
@@ -364,23 +412,26 @@ def _validate_suggested_prose(notes, segments, people, suggested):
             check(draft.get(field), draft.get("evidence"))
 
 
-def attribution_notice(transcript, notes=None):
+def attribution_notice(transcript, notes=None, *, microphone_owner=None):
+    if remote_microphone_owner(transcript) or microphone_owner:
+        return "The recorder’s name is the default for microphone speech unless another local speaker has been identified. Remote voices are labeled separately."
     if isinstance(notes, dict) and ("speaker_review" in notes or "_speaker_identity" in notes):
         return REVIEW_NOTICE
     return DIARIZED_NOTICE if transcript.get("speaker_labels") == "diarized_v1" else SOURCE_NOTICE
 
 
-def render_reviewed_transcript(transcript, notes):
+def render_reviewed_transcript(transcript, notes, *, microphone_owner=None):
     """A derived readable view; never overwrite the immutable source transcript."""
-    people = effective_attributions(transcript, notes)
+    people = effective_attributions(transcript, notes, microphone_owner=microphone_owner)
+    owner = remote_microphone_owner(transcript) or microphone_owner
     from .capture_quality import notice
     capture_notice = notice(transcript)
-    lines = ([capture_notice, ""] if capture_notice else []) + [attribution_notice(transcript, notes), ""]
+    lines = ([capture_notice, ""] if capture_notice else []) + [attribution_notice(transcript, notes, microphone_owner=owner), ""]
     for segment in transcript["segments"]:
         start = segment.get("start_ms")
         if type(start) is not int or start < 0:
             raise ValueError("Transcript segment needs a timestamp")
         seconds = start // 1000
-        lines.extend([f"[{seconds // 60:02d}:{seconds % 60:02d}] " + segment_label(segment, people)
+        lines.extend([f"[{seconds // 60:02d}:{seconds % 60:02d}] " + segment_label(segment, people, owner)
                       + ": " + segment["text"], ""])
     return "\n".join(lines)

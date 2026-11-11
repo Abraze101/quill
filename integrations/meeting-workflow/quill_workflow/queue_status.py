@@ -17,25 +17,33 @@ def retry_revision(tasks):
                                     sort_keys=True).encode()).hexdigest()
 
 
-def meetings(queue):
+def meetings(queue, job=None, *, summary_tasks=None, stopped=None, skipped=None):
     from .routing import RoutingReviews
     from .local_deletion import stopped_jobs
-    removed = {row[0] for row in queue.db.execute("SELECT job FROM local_deletions")}
-    tasks = [task for task in queue.tasks() if task["job"] not in removed]
-    cancelled = stopped_jobs(queue.state) - removed
-    skipped = set()
-    if (queue.state / "reviews.sqlite3").exists():
+    arguments = (job,) if job is not None else ()
+    removed = {row[0] for row in queue.db.execute(
+        "SELECT job FROM local_deletions" + (" WHERE job=?" if arguments else ""), arguments)}
+    tasks = queue.tasks(job) if summary_tasks is None else summary_tasks
+    cancelled = stopped_jobs(queue.state, job) if stopped is None else stopped
+    if skipped is None and (queue.state / "reviews.sqlite3").exists():
         reviews = RoutingReviews(queue.state)
         try:
-            skipped = {record["job"] for record in reviews.list("skipped")}
+            if job is None:
+                skipped = {record["job"] for record in reviews.list("skipped")}
+            else:
+                record = reviews.get(job)
+                skipped = {job} if record and record["status"] == "skipped" else set()
         finally:
             reviews.close()
+    skipped = skipped or set()
     titles = {row["id"]: Path(row["destination"] or row["session"]).name[:180]
               for row in queue.db.execute("SELECT j.id,j.session,n.destination FROM jobs j "
-                                           "LEFT JOIN local_names n ON j.id=n.job")}
+                                           "LEFT JOIN local_names n ON j.id=n.job"
+                                           + (" WHERE j.id=?" if arguments else ""), arguments)}
     grouped = {}
     for task in tasks:
-        grouped.setdefault(task["job"], []).append(task)
+        if task["job"] not in removed:
+            grouped.setdefault(task["job"], []).append(task)
     summaries = []
     for job, saved in grouped.items():
         running = next((task for task in saved if task["status"] == "running"), None)
@@ -62,11 +70,11 @@ def meetings(queue):
             state, detail = "waiting_for_company", "Choose this meeting's company folder"
         elif pending:
             state, detail = "queued", "Waiting for an earlier step"
-        retryable = job not in cancelled and job not in skipped and not running and not any(task["status"] == "safety_held" for task in saved) and any(task["status"] in ("failed", "retry")
+        retryable = summary_tasks is None and job not in cancelled and job not in skipped and not running and not any(task["status"] == "safety_held" for task in saved) and any(task["status"] in ("failed", "retry")
                                        and task["receipt"] is None for task in saved)
         summaries.append({"job": job, "title": titles.get(job, "Meeting"), "state": state,
                           "detail": str(detail)[:500], "retryable": retryable,
-                          "revision": retry_revision(saved),
+                          "revision": retry_revision(saved) if summary_tasks is None else None,
                           "stage": chosen["stage"] if chosen else None})
     return summaries
 

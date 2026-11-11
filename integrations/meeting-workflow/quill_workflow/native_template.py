@@ -10,10 +10,10 @@ import re
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .meeting_document import timestamp
-from .meeting_title import meeting_title
+from .meeting_title import meeting_participants, meeting_title
 from .capture_quality import with_summary_notice
 from .transcript_sources import (SOURCE_NOTICE, DIARIZED_NOTICE, attribution_notice,
-                                 effective_attributions, segment_label)
+                                 effective_attributions, remote_microphone_owner, segment_label)
 
 
 FORMAT = "native_template_google_doc_v1"
@@ -77,6 +77,7 @@ def build_payload(notes, transcript, metadata, route, timezone="UTC", *, partici
     from .pipeline import render_notes
     render_notes(notes, transcript)
     attributions = effective_attributions(transcript, notes)
+    owner = remote_microphone_owner(transcript)
     if not isinstance(metadata, dict) or not isinstance(route, dict):
         raise ValueError("Meeting metadata and approved company route are required")
     if not isinstance(timezone, str) or not timezone:
@@ -103,7 +104,7 @@ def build_payload(notes, transcript, metadata, route, timezone="UTC", *, partici
         raise ValueError("Document needs an approved company name")
     heading = meeting_title(notes, transcript, participants_first=participants_first) or "Meeting notes and transcript"
     short_date = f"{started.month}/{started.day}/{started.year % 100:02d}"
-    participants = notes.get("meeting_title", {}).get("participants", [])
+    participants = meeting_participants(notes, transcript, attributions)
     transcript_lines = []
     for segment in transcript["segments"]:
         if not isinstance(segment, dict):
@@ -114,12 +115,12 @@ def build_payload(notes, transcript, metadata, route, timezone="UTC", *, partici
             timestamp(segment["end_ms"])
             if segment["end_ms"] < segment["start_ms"]:
                 raise ValueError("Transcript segment end precedes its start")
-        source = segment_label(segment, attributions)
+        source = segment_label(segment, attributions, owner)
         transcript_lines.append(start + " | " + source + "  " + value)
     # Older payloads must stay byte-for-byte compatible with pending Drive
     # write reconciliation. New captures explicitly declare source-only labels.
     transcript_text = "\n".join(transcript_lines)
-    if "speaker_review" in notes:
+    if owner or "speaker_review" in notes:
         transcript_text = attribution_notice(transcript, notes) + "\n\n" + transcript_text
     elif transcript.get("speaker_labels") == "audio_source":
         transcript_text = SOURCE_NOTICE + "\n\n" + transcript_text

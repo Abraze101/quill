@@ -1,6 +1,7 @@
 /* Bounded meeting-interface observations. No media, chat, captions or profiles. */
 (function (root) {
   "use strict";
+  const { meetParticipantLabel, meetTile, meetRow } = root.QuillMeetingDetector || require("./detector.js");
   const MAX_PEOPLE = 20;
   const MAX_SAMPLES = 32;
   const MAX_AGE_MS = 20000;
@@ -69,8 +70,6 @@
   // interface observations, not a biometric identity or an account lookup.
   function read(document, provider, visible, session = null) {
     if (provider !== "google-meet") return null;
-    const tileSelector = "[data-participant-id][data-tile-media-id]";
-    const rowSelector = "[role='listitem'][data-participant-id]";
     const excluded = "[role='log'],[data-message-id],[data-caption-id],[aria-hidden='true'],[hidden],.chat-container,.chat-message,.chat-box";
     let reader = readers.get(document);
     if (!reader || reader.session !== session) {
@@ -78,17 +77,12 @@
       readers.set(document, reader);
     }
     const people = new Map();
-    function leafNames(container, selector, owner) {
-      const nodes = [...container.querySelectorAll(selector)];
-      if (nodes.length > 100) return [];
-      return nodes.filter(node => node.tagName === "SPAN" && node.childElementCount === 0
-        && visible(node) && !node.closest(excluded) && node.closest(owner) === container)
-        .map(node => node.textContent).filter(value => name(value));
-    }
-    function collect(container, owner, names, self = false) {
+    function collect(container, owner) {
       const key = container.getAttribute("data-participant-id");
-      if (!key || key.length > 512 || !visible(container) || container.closest(excluded) || names.length !== 1) return;
-      const display = names[0];
+      if (!key || key.length > 512) return;
+      const label = meetParticipantLabel(container, owner, visible);
+      if (!label) return;
+      const { name: display, self } = label;
       if (reader.self.has(key) && reader.self.get(key) !== display) reader.self.delete(key);
       if (self && reader.self.size < MAX_PEOPLE) reader.self.set(key, display);
       if (!people.has(key)) people.set(key, { key, name: display, self: false, states: new Set() });
@@ -107,23 +101,21 @@
         person.states.add(active ? "active" : "idle");
       }
     }
-    const tiles = [...document.querySelectorAll(tileSelector)];
-    const rows = [...document.querySelectorAll(rowSelector)];
+    const tiles = [...document.querySelectorAll(meetTile)];
+    const rows = [...document.querySelectorAll(meetRow)];
     if (tiles.length > 100 || rows.length > 100) return null;
     // Read the explicitly labelled local participant before the tiles so a
     // closed People drawer can subsequently retain this same-document hint.
-    for (const row of rows) {
-      const labels = [...row.querySelectorAll(".NnTWjc")];
-      const self = labels.length <= 10 && labels.some(node => node.tagName === "SPAN"
-        && node.childElementCount === 0 && visible(node) && !node.closest(excluded)
-        && node.closest(rowSelector) === row && (node.textContent || "").trim() === "(You)");
-      collect(row, rowSelector, leafNames(row, ".zWGUib", rowSelector), self);
-    }
-    for (const tile of tiles) collect(tile, tileSelector, leafNames(tile, ".notranslate", tileSelector));
+    for (const row of rows) collect(row, meetRow);
+    for (const tile of tiles) collect(tile, meetTile);
     if (!people.size || people.size > MAX_PEOPLE) return null;
     const participants = [...people.values()];
     if (participants.some(person => person.conflict || person.states.size > 1)
-        || !participants.some(person => person.states.size === 1)) return null;
+        || participants.filter(person => person.self).length > 1) {
+      reader.self.clear();
+      return null;
+    }
+    if (!participants.some(person => person.states.size === 1)) return null;
     const active = participants.filter(person => person.states.has("active")).map(person => person.key);
     if (active.length > 4) return null;
     return { source: "google-meet-dom-v1", participants: participants.map(({ key, name, self }) => ({ key, name, self })), active };

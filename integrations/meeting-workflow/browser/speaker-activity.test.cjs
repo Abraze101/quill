@@ -1,5 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { visibleParticipants } = require('./detector.js');
 const { createCollector, read } = require('./speaker-activity.js');
 
 function fixture() {
@@ -79,7 +80,7 @@ function domFixture() {
   const tiles = [], rows = [];
   const document = { querySelectorAll: selector => selector === TILE ? tiles : selector === ROW ? rows : [] };
   const visible = element => element.visible !== false;
-  function person({ key = 'private-key', display = 'Casey Rivera', self = false, state = 'idle', row = false } = {}) {
+  function person({ key = 'private-key', display = 'Casey Rivera', self = false, marked = false, state = 'idle', row = false } = {}) {
     const owner = row ? ROW : TILE;
     const container = { visible: true, excluded: false, key, names: [], labels: [], indicators: [],
       getAttribute: attribute => attribute === 'data-participant-id' ? container.key : null,
@@ -91,7 +92,11 @@ function domFixture() {
         return [];
       } };
     function leaf(text) { return { tagName: 'SPAN', childElementCount: 0, textContent: text, visible: true,
-      closest: selector => selector === owner ? container : null }; }
+      closest(selector) {
+        if (selector === owner || selector === '[data-participant-id]') return container;
+        if (selector === "[data-is-self='true']" && marked) return { closest: () => container };
+        return null;
+      } }; }
     container.names = [leaf(display)];
     if (self) container.labels = [leaf('(You)')];
     const indicator = { visible: true, classes: new Set(state === 'active' ? ['HX2H7'] : state === 'idle' ? ['gjg47c'] : []),
@@ -122,6 +127,57 @@ test('explicit People self badge is retained for matching tile in this meeting b
   h.rows.splice(0);
   assert.equal(h.read('call-A').participants[0].self, true);
   assert.equal(h.read('call-B').participants[0].self, false);
+});
+
+test('visible Meet roster captures the explicit People badge even without a speaking indicator', () => {
+  const h = domFixture();
+  const local = h.person({ key: 'local', display: 'Morgan Kim', row: true, self: true });
+  const remote = h.person({ key: 'other', display: 'Casey Rivera', row: true, self: true });
+  remote.labels[0].textContent = '(Host)';
+  local.indicators = []; remote.indicators = [];
+  assert.deepEqual(visibleParticipants(h.document, 'google-meet', h.visible), [
+    { name: 'Morgan Kim', self: true }, { name: 'Casey Rivera', self: false },
+  ]);
+  assert.equal(h.read('call'), null);
+});
+
+test('both readers bind a tile ancestor self attribute only inside its own participant', () => {
+  const h = domFixture();
+  h.person({ key: 'local', display: 'Morgan Kim', marked: true });
+  const other = h.person({ key: 'remote', display: 'Casey Rivera' });
+  const closest = other.names[0].closest;
+  other.names[0].closest = selector => selector === "[data-is-self='true']"
+    ? { closest: () => h.tiles[0] } : closest(selector);
+  assert.deepEqual(visibleParticipants(h.document, 'google-meet', h.visible), [
+    { name: 'Morgan Kim', self: true }, { name: 'Casey Rivera', self: false },
+  ]);
+  assert.deepEqual(h.read('call').participants.map(p => [p.key, p.self]), [['local', true], ['remote', false]]);
+});
+
+test('self badges on hidden leaves and nested participants cannot label the enclosing People row', () => {
+  const h = domFixture();
+  const row = h.person({ row: true, self: true });
+  const badge = row.labels[0];
+  badge.visible = false;
+  assert.equal(visibleParticipants(h.document, 'google-meet', h.visible)[0].self, false);
+  badge.visible = true;
+  badge.closest = selector => selector === '[data-participant-id]' ? {} : null;
+  assert.equal(visibleParticipants(h.document, 'google-meet', h.visible)[0].self, false);
+  assert.equal(h.read('call').participants[0].self, false);
+});
+
+test('conflicting self IDs or conflicting names on one ID never produce a local identity', () => {
+  const h = domFixture();
+  h.person({ key: 'one', display: 'First Person', row: true, self: true });
+  h.person({ key: 'two', display: 'Second Person', marked: true });
+  assert.deepEqual(visibleParticipants(h.document, 'google-meet', h.visible), []);
+  assert.equal(h.read('call'), null);
+  h.tiles[0].key = 'one';
+  assert.deepEqual(visibleParticipants(h.document, 'google-meet', h.visible), []);
+  assert.equal(h.read('call'), null);
+  h.rows.length = 0; h.tiles.length = 0;
+  h.person({ key: 'one', display: 'First Person' });
+  assert.equal(h.read('call').participants[0].self, false);
 });
 
 test('tile and People row deduplicate active identities and reject conflicting names or states', () => {

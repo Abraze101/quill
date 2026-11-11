@@ -14,7 +14,7 @@ import time
 
 from quill_workflow.routing import (RoutingError, RoutingReviews, freeze_companies, matches_destination, preserves_company_map,
                                     transcript_identity, validate_companies)
-from quill_workflow.meeting_title import meeting_title
+from quill_workflow.meeting_title import meeting_participants, meeting_title
 from quill_workflow.meeting_dates import recording_timezone
 from quill_workflow.recording_safety import (FILENAME, RecordingSafetyHold, ProcessingCancelled, check_cancellation,
                                              processing_safety, read_safety, require_approved)
@@ -830,9 +830,10 @@ def _render_historical_notes(data, transcript, include_sources=False, *, partici
         refs = evidence(title)
         if include_sources:
             lines.extend(["Title source: " + refs, ""])
-        if title["participants"]:
+        participants = meeting_participants(data, transcript)
+        if participants:
             lines.extend(["Participants identified in the transcript:", ""])
-            for person in title["participants"]:
+            for person in participants:
                 refs = evidence({"text": person["name"], "evidence": person["evidence"]})
                 lines.append("- " + person["name"] + (" (" + refs + ")" if include_sources else ""))
             lines.append("")
@@ -896,7 +897,7 @@ def render_notes(data, transcript, include_sources=False, *, participants_first=
     capture_notice = notice(transcript)
     if capture_notice:
         lines.extend([capture_notice, ""])
-    participants = data.get("meeting_title", {}).get("participants", [])
+    participants = meeting_participants(data, transcript)
     if participants:
         lines.extend(["Participants: " + ", ".join(escaped(person["name"]) for person in participants), ""])
     lines.extend(["## Summary", "", sections["SUMMARY"], "", "## Decisions", ""])

@@ -18,6 +18,8 @@ final class RecordingSession {
     var microphoneCoverageComplete: Bool { mic.captureReport["coverage_complete"] as? Bool == true }
     private let recordingTimeZone: TimeZone
     private let speakerIdentificationRequested: Bool
+    private let remoteMicrophoneOwner: String?
+    private let remoteMicrophoneProvider: String?
     private var meetingContext: MeetingContext?
     private var speakerTimeline: MeetingSpeakerTimeline?
     private var speakerSignalOwner: (source: String, meeting: String)?
@@ -25,11 +27,6 @@ final class RecordingSession {
     private let activityMonotonicAnchor: TimeInterval
     private var activityClockReliable = true
     private var savedSpeakerActivity = false
-
-    func observeMeetingContext(_ context: MeetingContext) {
-        guard endedAt == nil, let context = context.validated() else { return }
-        meetingContext = meetingContext?.merging(context) ?? context
-    }
 
     func observeMeetingSignal(_ signal: MeetingSignal, at date: Date = Date(),
                               monotonicNow: TimeInterval = RecordingCaptureTimeline.now) {
@@ -40,7 +37,7 @@ final class RecordingSession {
         if let previous = meetingContext,
            previous.provider != context.provider || previous.key != context.key { return }
         speakerSignalOwner = (signal.source, signal.meeting)
-        observeMeetingContext(context)
+        meetingContext = meetingContext?.merging(context) ?? context
         guard speakerIdentificationRequested, activityClockReliable else { return }
         guard let activity = signal.speakerActivity else {
             speakerTimeline?.breakContinuity()
@@ -76,9 +73,14 @@ final class RecordingSession {
     /// Create the session folder under `root` (yyyy.MM.dd-HHmm, suffixed on
     /// collision) without starting capture yet.
     init(root: URL, startedAt: Date = Date(), timeZone: TimeZone = .current,
-         speakerIdentificationRequested: Bool = false) throws {
+         speakerIdentificationRequested: Bool = false, initialMeetingSignal: MeetingSignal? = nil,
+         remoteMicrophoneOwner: String? = nil) throws {
         self.startedAt = startedAt
         self.speakerIdentificationRequested = speakerIdentificationRequested
+        // A later join may supply context, but cannot identify the microphone
+        // retroactively for audio recorded before the call.
+        remoteMicrophoneProvider = initialMeetingSignal?.joinedRemoteProvider
+        self.remoteMicrophoneOwner = MeetingContext.microphoneOwner(remoteMicrophoneOwner, joinedProvider: remoteMicrophoneProvider)
         activityWallAnchor = Date().timeIntervalSince1970
         activityMonotonicAnchor = RecordingCaptureTimeline.now
         // Freeze location at the start. Ending, processing or uploading after
@@ -98,6 +100,7 @@ final class RecordingSession {
         }
         try FileManager.default.createDirectory(at: candidate, withIntermediateDirectories: true)
         dir = candidate
+        if let initialMeetingSignal { observeMeetingSignal(initialMeetingSignal) }
     }
 
     /// Start both tracks. If the mic fails after the system tap started, the
@@ -230,6 +233,9 @@ final class RecordingSession {
             "system_capture": systemReport,
             "transcription_requested": transcriptionRequested,
             "speaker_identification_requested": transcriptionRequested && speakerIdentificationRequested,
+            // Distinguish this capture's explicit decision from legacy
+            // metadata that predates the recorder profile.
+            "remote_microphone_owner": remoteMicrophoneOwner as Any? ?? NSNull(),
             "screen_recording_requested": screenRequested,
             "screen_recording_started": screenStarted,
         ]
@@ -242,6 +248,12 @@ final class RecordingSession {
         }
         if let origin = captureOrigins.min() { meta["capture_start_offset_seconds"] = origin }
         if let screenError { meta["screen_error"] = screenError }
+        if let remoteMicrophoneProvider {
+            meta["remote_microphone_provider"] = remoteMicrophoneProvider
+            if let meetingContext, meetingContext.provider != remoteMicrophoneProvider {
+                meta["remote_microphone_owner"] = NSNull()
+            }
+        }
         if let meetingContext {
             meta["meeting_context"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(meetingContext))
         }

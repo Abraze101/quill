@@ -47,6 +47,24 @@ class SharingTests(unittest.TestCase):
     def prepare(self):
         card = self.reviews.card("test")
         return self.reviews.decide("sharing_prepare", "test", card["revision"], "Alice@example.com, bob@example.com")
+
+    def test_targeted_sharing_card_never_validates_another_meetings_draft(self):
+        for job in ("chosen", "other"):
+            record = self.reviews._new(job, self.source)
+            record["status"] = "available"
+            self.reviews.put(record)
+        with patch.object(self.reviews, "snapshot", wraps=self.reviews.snapshot) as snapshot:
+            card, = self.reviews.options("chosen")
+        self.assertEqual(card["job"], "chosen")
+        snapshot.assert_called_once_with("chosen")
+
+    def test_interrupted_sharing_summary_is_read_only_and_honors_approved_or_removed_state(self):
+        confirmed = self.confirm()
+        with patch("quill_workflow.sharing.time.time", return_value=confirmed["updated"] + 20):
+            result, = self.reviews.summaries(set(), {"test"})
+            self.assertEqual(result["status"], "needs_attention")
+            self.assertEqual(self.reviews.get("test"), confirmed)
+            self.assertEqual(self.reviews.summaries({"test"}, {"test"}), [])
     def ready(self):
         record = self.prepare()
         return self.reviews.run("test", record["revision"], self.adapter)

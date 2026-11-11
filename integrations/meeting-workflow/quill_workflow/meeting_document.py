@@ -17,9 +17,9 @@ import xml.etree.ElementTree as ET
 import zipfile
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .meeting_title import meeting_title
+from .meeting_title import meeting_participants, meeting_title
 from .capture_quality import notice
-from .transcript_sources import attribution_notice, effective_attributions, segment_label
+from .transcript_sources import attribution_notice, effective_attributions, remote_microphone_owner, segment_label
 
 FORMAT = "combined_google_doc_v1"
 VERSION = 1
@@ -242,6 +242,7 @@ def render_document(notes, transcript, metadata, route, timezone_name="UTC", not
     from .pipeline import render_notes  # Validate every note and evidence reference.
     render_notes(notes, transcript)
     attributions = effective_attributions(transcript, notes)
+    owner = remote_microphone_owner(transcript)
     if not isinstance(metadata, dict) or not isinstance(route, dict):
         raise ValueError("Document metadata and approved company route are required")
     if not isinstance(timezone_name, str) or not timezone_name:
@@ -265,7 +266,7 @@ def render_document(notes, transcript, metadata, route, timezone_name="UTC", not
     if not isinstance(company, str) or not company.strip():
         raise ValueError("Document needs an approved company name")
     doc.paragraph("Company " + company, "Metadata")
-    participants = notes.get("meeting_title", {}).get("participants", [])
+    participants = meeting_participants(notes, transcript, attributions)
     if participants:
         doc.paragraph("Identified participants " + ", ".join(person["name"] for person in participants), "Metadata")
     capture_notice = notice(transcript)
@@ -308,7 +309,7 @@ def render_document(notes, transcript, metadata, route, timezone_name="UTC", not
         end = timestamp(segment["end_ms"]) if "end_ms" in segment else None
         if end and segment["end_ms"] < segment["start_ms"]:
             raise ValueError("Transcript segment end precedes its start")
-        source = segment_label(segment, attributions)
+        source = segment_label(segment, attributions, owner)
         label = start + " | " + source + "  "
         doc.paragraph(text, "Transcript", bookmark=index, prefix=label)
     files = {

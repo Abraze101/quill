@@ -102,6 +102,10 @@ enum Config {
         transcription()?["speaker_identification"] as? Bool == true
     }
 
+    static func remoteMicrophoneOwner() -> String? {
+        transcription()?["remote_microphone_owner"] as? String
+    }
+
     /// Automatic starts are opt-in. A missing detector or config never starts
     /// capture, and disabling this leaves ordinary manual recording available.
     static func meetingAutomationEnabled() -> Bool {

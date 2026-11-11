@@ -5,7 +5,8 @@ import sys
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from quill_workflow.transcript_sources import introduction_candidates, introduction_name, speaker_attributions, segment_label
+from quill_workflow.transcript_sources import (effective_attributions, introduction_candidates, introduction_name,
+                                               render_reviewed_transcript, speaker_attributions, segment_label)
 
 
 def diarized_transcript():
@@ -23,6 +24,35 @@ def diarized_transcript():
 
 
 class TranscriptSourcesTests(unittest.TestCase):
+    def test_remote_call_default_labels_split_and_unassigned_microphone_speech(self):
+        call = diarized_transcript()
+        call["remote_microphone_owner"] = "Robin Lee"
+        call["speakers"]["mic_speaker_1"] = {"source": "mic", "label": "Microphone speaker 1"}
+        call["speakers"]["mic_speaker_2"] = {"source": "mic", "label": "Microphone speaker 2"}
+        call["segments"][0].update(text="Can you hear me?", speaker="mic_speaker_2")
+        call["segments"].append(dict(call["segments"][3], speaker="unknown", text="I agree."))
+        people = effective_attributions(call)
+        self.assertEqual([people[k]["name"] for k in ("mic_speaker_1", "mic_speaker_2")], ["Robin Lee"] * 2)
+        output = render_reviewed_transcript(call, {})
+        self.assertIn("Robin Lee: I agree.", output)
+        self.assertIn("Jamie: My name is Jamie.", output)
+        self.assertIn("System audio (unidentified): The connection is unclear.", output)
+
+    def test_positive_other_local_voice_overrides_default_without_naming_ambiguous_lines(self):
+        call = dict(diarized_transcript(), remote_microphone_owner="Robin Lee")
+        call["segments"].append(dict(call["segments"][3], speaker="unknown", text="Please continue."))
+        output = render_reviewed_transcript(call, {})
+        self.assertIn("Anna: Hi, I am Anna.", output)
+        self.assertIn("Microphone (unidentified): Please continue.", output)
+
+    def test_remote_mic_owner_on_source_only_call_does_not_carry_over_to_manual_recording(self):
+        call = {"segments": [{"start_ms": 0, "speaker": "me", "text": "Checking in."},
+                             {"start_ms": 3000, "speaker": "them", "text": "Go ahead."}]}
+        self.assertIn("Microphone: Checking in.", render_reviewed_transcript(call, {}))
+        call["remote_microphone_owner"] = "Robin Lee"
+        text = render_reviewed_transcript(call, {})
+        self.assertIn("Robin Lee: Checking in.", text)
+        self.assertIn("System audio: Go ahead.", text)
     def test_shared_native_v3_corpus_and_v2_compatibility(self):
         for version, policies in (("v2", ("explicit_intro_v2", "explicit_intro_v3")),
                                   ("v3", ("explicit_intro_v3",))):

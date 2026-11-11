@@ -666,6 +666,7 @@ private struct AppSleepChecks {
         try await speakerActivitySessionChecks()
         try await AppController.meetingContextIsBoundToRecording()
         try await AppController.ambiguousMeetingContextIsOmitted()
+        try await AppController.contextFreeRemoteMicrophoneOwner()
         try await AppController.warningHistoryDoesNotControlCapture()
         try await AppController.warningHistoryIncludesFailedStartup()
         try await AppController.crashCheckpointAndRestartReview()
@@ -793,6 +794,7 @@ private func speakerActivitySessionChecks() async throws {
 extension AppController {
     static func meetingContextIsBoundToRecording() async throws {
         try await withFixture { app in
+            Fixture.remoteMicrophoneOwner = "Casey Jones"
             func signal(_ names: [String], meeting: String = "call", key: String = "abc-defg-hij", source: String = "tab") -> MeetingSignal {
                 .init(source: source, meeting: meeting, provider: "google-meet", state: .joined, timestamp: 1000,
                       meetingContext: .init(provider: "google-meet", key: key,
@@ -802,6 +804,7 @@ extension AppController {
             app.requestStart()
             try await waitFor { app.phase == .recording }
             let directory = app.session!.dir
+            Fixture.remoteMicrophoneOwner = "New Recorder"
             precondition(app.automaticMeeting == nil, "Context took ownership of a manual recording")
             app.meetingAutomation.observe([signal(["Morgan"])], now: 1000)
             app.tick()
@@ -824,16 +827,20 @@ extension AppController {
             let names = (context["participants"] as! [[String: Any]]).map { $0["name"] as! String }
             precondition(names == ["Jamie", "Morgan"], "Context mixed meetings or dropped later visible people")
             precondition(context["key"] as? String == "abc-defg-hij")
+            precondition(metadata["remote_microphone_owner"] as? String == "Casey Jones",
+                         "A joined remote call must freeze the configured owner at capture start")
             app.meetingAutomation.observe([], now: 1001)
             app.requestStart()
             try await waitFor { app.phase == .recording }
             let next = try app.session!.recoveryMetadata(transcriptionRequested: false, screenRequested: false, screenStarted: false)
             precondition(next["meeting_context"] == nil, "Previous meeting leaked into a new recording")
+            precondition(next["remote_microphone_owner"] is NSNull)
             app.meetingAutomation.observe([signal(["Later participant"], meeting: "later-call", key: "xyz-abcd-efg")], now: 1000)
             app.tick()
             let joinedLater = try app.session!.recoveryMetadata(transcriptionRequested: false, screenRequested: false, screenStarted: false)
             precondition((joinedLater["meeting_context"] as? [String: Any])?["key"] as? String == "xyz-abcd-efg",
                          "A meeting joined after manual recording began lost its context")
+            precondition(joinedLater["remote_microphone_owner"] is NSNull, "A late join relabelled earlier local speech")
             precondition(app.automaticMeeting == nil)
             app.requestStop(manually: true)
             try await waitFor { app.phase == .idle }
@@ -842,6 +849,7 @@ extension AppController {
 
     static func ambiguousMeetingContextIsOmitted() async throws {
         try await withFixture { app in
+            Fixture.remoteMicrophoneOwner = "Casey Jones"
             let signals = ["one", "two"].map { id in
                 MeetingSignal(source: id, meeting: id, provider: "google-meet", state: .joined, timestamp: 1000,
                     meetingContext: .init(provider: "google-meet", key: "abc-defg-hij",
@@ -853,6 +861,38 @@ extension AppController {
             app.tick()
             let metadata = try app.session!.recoveryMetadata(transcriptionRequested: false, screenRequested: false, screenStarted: false)
             precondition(metadata["meeting_context"] == nil, "Manual recording guessed between joined calls")
+            precondition(metadata["remote_microphone_owner"] is NSNull)
+            app.requestStop(manually: true)
+            try await waitFor { app.phase == .idle }
+        }
+    }
+
+    static func contextFreeRemoteMicrophoneOwner() async throws {
+        try await withFixture { app in
+            Fixture.remoteMicrophoneOwner = "Casey Jones"
+            for provider in ["google-meet", "zoom-web"] {
+                let joined = MeetingSignal(source: "tab", meeting: "call", provider: provider,
+                                           state: .joined, timestamp: 1000)
+                app.meetingAutomation.observe([joined], now: 1000)
+                app.requestStart()
+                try await waitFor { app.phase == .recording }
+                let meta = try app.session!.recoveryMetadata(transcriptionRequested: true, screenRequested: false, screenStarted: false)
+                precondition(meta["remote_microphone_provider"] as? String == provider)
+                precondition(meta["remote_microphone_owner"] as? String == "Casey Jones")
+                precondition(meta["meeting_context"] == nil, "A joined provider must not invent a key or roster")
+                app.requestStop(manually: true)
+                try await waitFor { app.phase == .idle }
+            }
+            let wrong = MeetingContext(provider: "zoom-web", key: "12345678901", participants: [])
+            let conflict = MeetingSignal(source: "tab", meeting: "call", provider: "google-meet",
+                                         state: .joined, timestamp: 1000, meetingContext: wrong)
+            let decoded = try JSONDecoder().decode(MeetingSignal.self, from: JSONEncoder().encode(conflict))
+            precondition(decoded.joinedRemoteProvider == nil && decoded.meetingContext == nil)
+            app.meetingAutomation.observe([decoded], now: 1000)
+            app.requestStart()
+            try await waitFor { app.phase == .recording }
+            let meta = try app.session!.recoveryMetadata(transcriptionRequested: true, screenRequested: false, screenStarted: false)
+            precondition(meta["remote_microphone_owner"] is NSNull && meta["remote_microphone_provider"] == nil)
             app.requestStop(manually: true)
             try await waitFor { app.phase == .idle }
         }

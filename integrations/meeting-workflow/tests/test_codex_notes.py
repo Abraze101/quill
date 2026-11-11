@@ -34,6 +34,26 @@ class CodexNotesTests(unittest.TestCase):
         self.assertEqual(json.dumps(transcript, sort_keys=True), original)
         self.assertEqual(transcript_digest(transcript), digest)
 
+    def test_remote_microphone_commitment_supports_named_owner_and_attendee_without_spoken_name(self):
+        owner = "Morgan Lee"
+        transcript = {"remote_microphone_owner": owner, "speaker_labels": "diarized_v1", "speakers": {},
+                      "segments": [{"speaker": "unknown", "source": "system", "start_ms": 0, "text": "Can you help?"},
+                                   {"speaker": "unknown", "source": "mic", "start_ms": 1000, "text": "I will send it."}]}
+        atomic_json(self.transcript, transcript)
+        self.notes["actions"] = [{"text": "Send the file.", "owner": owner, "evidence": [1], "due": None}]
+        executable, calls = self.sequence([json.dumps(self.notes)])
+        self.invoke(executable)
+        result = json.loads(self.output.read_text())
+        self.assertEqual(result["meeting_title"]["participants"], [{"name": owner, "evidence": [1]}])
+        self.assertEqual(result["_title_guests"], [])
+        self.assertEqual(result["actions"][0]["owner"], owner)
+        segments = json.loads(calls.read_text())[0]["payload"]["transcript"]["segments"]
+        self.assertEqual([s["speaker_name_for_notes"] for s in segments], [None, owner])
+        self.assertEqual(json.loads(self.transcript.read_text()), transcript)
+        self.notes["actions"][0]["evidence"] = [0]
+        with self.assertRaisesRegex(WorkflowError, "Action owner name is absent"):
+            validate_result(self.notes, transcript)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)

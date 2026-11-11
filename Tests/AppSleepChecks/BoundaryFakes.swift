@@ -28,6 +28,7 @@ enum Fixture {
     static var notices: [String] = []
     static var transcriptionEnabled = true
     static var speakerIdentificationEnabled = false
+    static var remoteMicrophoneOwner: String?
     static var retryGate = Gate(open: true)
     static var retryCalls = 0
     static var retryResult = TranscriptionCoordinator.RetryResult.queued(1)
@@ -51,6 +52,7 @@ enum Fixture {
         enqueued = []; registered = []; notices = []
         transcriptionEnabled = true; retryGate = Gate(open: true); retryCalls = 0
         speakerIdentificationEnabled = false
+        remoteMicrophoneOwner = nil
         retryResult = .queued(1); allowInformationAlerts = false; informationAlerts = []
         micCaptureOrigin = nil; systemCaptureOrigin = nil
         micHasFirstBuffer = true; systemHasFirstBuffer = true
@@ -329,6 +331,7 @@ enum Config {
     static func meetingAutomationEnabled() -> Bool { Fixture.automationEnabled }
     static func transcriptionEnabled() -> Bool { Fixture.transcriptionEnabled }
     static func speakerIdentificationEnabled() -> Bool { Fixture.speakerIdentificationEnabled }
+    static func remoteMicrophoneOwner() -> String? { Fixture.remoteMicrophoneOwner }
     static func showInDock() -> Bool { false }
     static func recordingCheckInHours() -> Int { 2 }
     static func onStop() -> String? { "test-only-spy-never-executed" }

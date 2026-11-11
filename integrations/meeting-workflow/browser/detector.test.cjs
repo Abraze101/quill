@@ -4,10 +4,23 @@ const { classify, controlLabel, warningEvidence, visibleParticipants, participan
 const control = (label, visible = true) => ({label, visible, enabled: true});
 const meet = { url: 'https://meet.google.com/abc-defg-hij', controls: [control('Leave call'), control('People'), control('Turn off microphone (⌘ + d)')] };
 
+const TILE = '[data-participant-id][data-tile-media-id]';
+const ROW = "[role='listitem'][data-participant-id]";
+const OWNER = '[data-participant-id]';
+const LEGACY = '[data-participant-id] [data-self-name],[data-participant-id][data-self-name]';
+function meetDocument(legacy = [], tiles = []) {
+  return { querySelectorAll: selector => selector === LEGACY ? legacy : selector === TILE ? tiles : [] };
+}
+
 function participant(value, { self = false, visible = true, excluded = false, children = 0 } = {}) {
+  const owner = { getAttribute: key => key === 'data-participant-id' ? 'id:' + value : null };
   return { visible, childElementCount: children,
     getAttribute(name) { return name === 'data-self-name' ? value : name === 'data-is-self' && self ? 'true' : null; },
-    closest() { return excluded ? {} : null; },
+    closest(selector) {
+      if (selector === OWNER) return owner;
+      if (selector === "[data-is-self='true']") return self ? this : null;
+      return excluded ? {} : null;
+    },
     get textContent() { if (excluded) throw new Error('Must not read excluded text'); return value; } };
 }
 
@@ -16,16 +29,12 @@ test('visible Meet names are bounded and normalized without reading chat or capt
     participant('Owner Name (You)'), participant('Hidden', { visible: false }),
     participant('Private chat', { excluded: true }), participant('person@example.test'),
     participant('https://example.test'), participant('You'), participant('A'.repeat(101))];
-  let selector;
-  const result = visibleParticipants({ querySelectorAll(value) { selector = value; return rows; } }, 'google-meet', item => item.visible);
+  const result = visibleParticipants(meetDocument(rows), 'google-meet', item => item.visible);
   assert.deepEqual(result, [{ name: 'Casey Rivera', self: false }, { name: 'Owner Name', self: true }]);
-  assert.equal(selector, '[data-participant-id] [data-self-name],[data-participant-id][data-self-name],'
-    + '[data-participant-id][data-tile-media-id] .notranslate');
 });
 
 function mediaTile(entries) {
-  const tileSelector = '[data-participant-id][data-tile-media-id]';
-  const tile = { querySelectorAll(selector) {
+  const tile = { visible: true, closest: () => null, getAttribute: () => 'tile-key', querySelectorAll(selector) {
     assert.equal(selector, '.notranslate');
     return nodes;
   }, get textContent() { throw new Error('Must not read aggregate tile text'); } };
@@ -35,7 +44,7 @@ function mediaTile(entries) {
     getAttribute() { return null; },
     matches(selector) { return selector === '.notranslate'; },
     closest(selector) {
-      return selector === tileSelector ? (inTile ? tile : null) : excluded ? {} : null;
+      return selector === OWNER ? (inTile ? tile : null) : excluded ? {} : null;
     },
     get textContent() {
       if (forbidText) throw new Error('Must not read excluded or non-leaf text');
@@ -46,7 +55,7 @@ function mediaTile(entries) {
 }
 
 test('Meet media tiles read the visible name SPAN without icons or container text', () => {
-  const { nodes } = mediaTile([
+  const { tile } = mediaTile([
     ...['frame_person', 'visual_effects', 'more_vert', 'devices'].map(text => (
       { text, tag: 'I', visible: false, forbidText: true })),
     { text: 'Jamie Rivera' },
@@ -55,21 +64,21 @@ test('Meet media tiles read the visible name SPAN without icons or container tex
     { children: 1, forbidText: true },
     { text: 'Private chat', excluded: true, forbidText: true },
   ]);
-  const result = visibleParticipants({ querySelectorAll: () => nodes }, 'google-meet', item => item.visible);
+  const result = visibleParticipants(meetDocument([], [tile]), 'google-meet', item => item.visible);
   assert.deepEqual(result, [{ name: 'Jamie Rivera', self: false }]);
 });
 
 test('Meet media tiles omit ambiguous names and names outside the tile', () => {
-  const ambiguous = mediaTile([{ text: 'Jamie Rivera' }, { text: 'Casey Lane' }]).nodes;
-  const unscoped = mediaTile([{ text: 'Unscoped person', inTile: false }]).nodes;
-  const result = visibleParticipants({ querySelectorAll: () => [...ambiguous, ...unscoped] },
+  const ambiguous = mediaTile([{ text: 'Jamie Rivera' }, { text: 'Casey Lane' }]).tile;
+  const unscoped = mediaTile([{ text: 'Unscoped person', inTile: false }]).tile;
+  const result = visibleParticipants(meetDocument([], [ambiguous, unscoped]),
     'google-meet', item => item.visible);
   assert.deepEqual(result, []);
 });
 
 test('Meet media tiles ignore blank leaves and deduplicate legacy name evidence', () => {
-  const { nodes } = mediaTile([{ text: 'Jamie Rivera' }, { text: '  ' }]);
-  const result = visibleParticipants({ querySelectorAll: () => [participant('Jamie Rivera'), ...nodes] },
+  const { tile } = mediaTile([{ text: 'Jamie Rivera' }, { text: '  ' }]);
+  const result = visibleParticipants(meetDocument([participant('Jamie Rivera')], [tile]),
     'google-meet', item => item.visible);
   assert.deepEqual(result, [{ name: 'Jamie Rivera', self: false }]);
 });
@@ -83,7 +92,7 @@ test('Zoom reads only dedicated tile names and omits expanded containers and uns
 });
 
 test('visible participant extraction stops at twenty and rejects unsupported providers', () => {
-  const document = { querySelectorAll: () => Array.from({ length: 100 }, (_, index) => participant('Person ' + index)) };
+  const document = meetDocument(Array.from({ length: 100 }, (_, index) => participant('Person ' + index)));
   assert.equal(visibleParticipants(document, 'google-meet', () => true).length, 20);
   assert.deepEqual(visibleParticipants(document, 'discord', () => true), []);
   for (const value of [null, '', 'A\u202eB', '\u0000Name', 'x'.repeat(101), 'guest', 'me']) assert.equal(participantName(value), null);

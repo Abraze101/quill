@@ -79,6 +79,12 @@ actor ParakeetEngine: TranscriptionEngine {
     func transcribe(_ audio: URL, identifySpeakers: Bool) async throws -> [TranscriptSegment] {
         guard identifySpeakers else { return try await transcribe(audio) }
         let fixture = audio.deletingLastPathComponent().lastPathComponent
+        if fixture == "owner-competing", audio.lastPathComponent == "mic.caf" {
+            speakerStatus = .partial
+            return [.init(start: 0, end: 1, text: "My name is Alex.", speakerID: "S1"),
+                    .init(start: 1, end: 2, text: "My name is Morgan.", speakerID: "S2"),
+                    .init(start: 2, end: 3, text: "Overlapping speech.")]
+        }
         if fixture == "speakers-skipped-track", audio.lastPathComponent == "system.caf" {
             throw CocoaError(.fileReadCorruptFile)
         }
@@ -319,6 +325,7 @@ struct TranscriptionLeaseChecks {
         await coordinator.enqueue(missing)
         precondition(!FileManager.default.fileExists(atPath: missing.path), "Missing recording was recreated")
         try await checkCanonicalSpeakers(root: root, coordinator: coordinator)
+        try await checkRemoteMicrophoneOwner(root: root, coordinator: coordinator)
         try await checkFailedWritesRemainPending(root: root, coordinator: coordinator)
         try await checkCaptureQuality(root: root, coordinator: coordinator)
         try await checkManualRetry(root: root.appendingPathComponent("retry-checks"))
@@ -772,6 +779,78 @@ struct TranscriptionLeaseChecks {
                 precondition(segments.filter { $0["speaker"] as? String == "unknown" }.count == 2)
             }
             precondition(Set(segments.compactMap { $0["source"] as? String }) == Set(["mic", "system"]))
+        }
+    }
+
+    private static func checkRemoteMicrophoneOwner(root: URL, coordinator: TranscriptionCoordinator) async throws {
+        let owner = "Casey Jones"
+        let meet = MeetingContext(provider: "google-meet", key: "abc-defg-hij", participants: [])
+        let zoom = MeetingContext(provider: "zoom-web", key: "12345678901", participants: [])
+        let unsupported = MeetingContext(provider: "discord", key: "12345678901", participants: [])
+        for (name, identify, context, configuredName) in [
+            ("owner-identified", true, meet, "Alex"), ("owner-conflict", true, meet, owner),
+            ("owner-competing", true, meet, "Alex"), ("owner-unavailable", true, zoom, owner),
+            ("owner-source-only", false, zoom, owner), ("owner-no-context", false, nil, owner),
+            ("owner-joined-meet", false, nil, owner), ("owner-joined-zoom", false, nil, owner),
+            ("owner-conflicting-provider", false, zoom, owner), ("owner-invalid-provider", false, nil, owner),
+            ("owner-unconfirmed", false, unsupported, owner), ("owner-invalid", false, meet, "mic_speaker_2"),
+            ("owner-historical", false, meet, nil)
+        ] as [(String, Bool, MeetingContext?, String?)] {
+            let session = try fixture(name, root: root)
+            let url = session.appendingPathComponent("meta.json")
+            var metadata = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as! [String: Any]
+            metadata["speaker_identification_requested"] = identify
+            metadata["remote_microphone_owner"] = configuredName
+            if ["owner-joined-meet", "owner-conflicting-provider"].contains(name) {
+                metadata["remote_microphone_provider"] = "google-meet"
+            } else if name == "owner-joined-zoom" {
+                metadata["remote_microphone_provider"] = "zoom-web"
+            } else if name == "owner-invalid-provider" {
+                metadata["remote_microphone_provider"] = "discord"
+            }
+            if let context {
+                metadata["meeting_context"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(context))
+            }
+            try JSONSerialization.data(withJSONObject: metadata).write(to: url)
+            await coordinator.enqueue(session)
+            try await waitForTranscript(session)
+            let json = try JSONSerialization.jsonObject(with: Data(contentsOf: session.appendingPathComponent("transcript.json"))) as! [String: Any]
+            let markdown = try String(contentsOf: session.appendingPathComponent("transcript.md"), encoding: .utf8)
+            if ["owner-conflict", "owner-competing"].contains(name) {
+                precondition(json["remote_microphone_owner"] as? String == configuredName)
+                precondition(markdown.contains("] Alex:** My name is Alex."))
+                precondition(markdown.contains("] Microphone:** Overlapping speech."))
+                precondition(!markdown.contains("] Casey Jones:**"))
+                if name == "owner-competing" {
+                    precondition(markdown.contains("] Morgan:** My name is Morgan."))
+                } else {
+                    precondition(markdown.contains("] Microphone speaker 2:** A different voice."))
+                }
+                continue
+            } else if name == "owner-identified" {
+                precondition(json["remote_microphone_owner"] as? String == "Alex")
+            } else if ["owner-unavailable", "owner-source-only", "owner-joined-meet", "owner-joined-zoom"].contains(name) {
+                precondition(json["remote_microphone_owner"] as? String == owner)
+                precondition(markdown.contains("] Casey Jones:**"))
+            } else {
+                precondition(json["remote_microphone_owner"] == nil)
+                precondition(markdown.contains("] Microphone:**"))
+            }
+            guard name == "owner-identified" else {
+                precondition(markdown.contains("] System audio:**"))
+                continue
+            }
+            let speakers = json["speakers"] as! [String: [String: Any]]
+            precondition(speakers["mic_speaker_1"]?["name"] as? String == "Alex")
+            precondition(speakers["mic_speaker_2"]?["name"] == nil && speakers["unknown"] == nil)
+            precondition(markdown.contains("] Alex:**") && markdown.contains("] Max:**"))
+            precondition(markdown.contains("] Alex:** A different voice.")
+                && markdown.contains("] Alex:** Overlapping speech."))
+            precondition(markdown.contains("] Other speaker 2:**") && markdown.contains("] System audio:**"))
+            let baseline = try JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent("speakers/transcript.json"))) as! [String: Any]
+            for key in ["segments", "speakers", "speaker_identification", "speaker_name_policy", "speaker_labels"] {
+                precondition((json[key] as! NSObject).isEqual(baseline[key]), "Owner fallback changed source attribution or timestamps")
+            }
         }
     }
 

@@ -41,6 +41,23 @@ class MeetingTitleTests(unittest.TestCase):
         self.assertNotIn("_title_guests", self.notes)
         self.assertEqual(meeting_title(self.notes, self.transcript), "Max, Mei Chen - AI voice agent review")
 
+    def test_remote_recorder_has_real_mic_evidence_in_roster_and_is_excluded_from_guest_titles(self):
+        from quill_workflow.title_participants import bind_title_guests
+        transcript = {"remote_microphone_owner": "Morgan Lee", "speaker_labels": "audio_source", "segments": [
+            {"speaker": "them", "start_ms": 0, "text": "Welcome, Morgan Lee."},
+            {"speaker": "me", "start_ms": 400, "text": "  "},
+            {"speaker": "me", "start_ms": 700, "text": "Let's review the agenda."}]}
+        notes = {"schema_version": 1, "meeting_title": {"text": "Agenda", "evidence": [2], "participants": []},
+                 "summary": [{"text": "The participants reviewed the agenda.", "evidence": [2]}]}
+        result = bind_title_guests(notes, transcript)
+        self.assertEqual(result["meeting_title"]["participants"], [{"name": "Morgan Lee", "evidence": [2]}])
+        self.assertEqual(result["_title_guests"], [])
+        self.assertEqual(meeting_title(result, transcript), "Agenda")
+        self.assertIn("Participants: Morgan Lee", render_notes(result, transcript))
+        self.assertEqual(notes["meeting_title"]["participants"], [])
+        transcript["segments"][2]["speaker"] = "them"
+        self.assertEqual(bind_title_guests(notes, transcript)["meeting_title"]["participants"], [])
+
     def test_no_host_guess_from_recorder_invitation_or_first_name(self):
         from quill_workflow.title_participants import bind_title_guests
         context = {"organizer": {"name": "Max Parker", "email": "host@example.test"}, "candidates": [
@@ -54,6 +71,23 @@ class MeetingTitleTests(unittest.TestCase):
                          "Max - AI voice agent review")
         self.assertEqual(meeting_title(bind_title_guests(self.notes, self.transcript, context), self.transcript),
                          "AI voice agent review")
+
+    def test_recorder_suffix_spelling_is_preserved_in_attendees_but_never_enters_filename(self):
+        from quill_workflow.title_participants import bind_title_guests
+        transcript = {"remote_microphone_owner": "Morgan Jr.", "segments": [
+            {"speaker": "me", "source": "mic", "start_ms": 0, "text": "Let's start."}]}
+        notes = {"schema_version": 1, "meeting_title": {"text": "Planning", "evidence": [0], "participants": []},
+                 "summary": [{"text": "Planning started.", "evidence": [0]}]}
+        bound = bind_title_guests(notes, transcript)
+        self.assertIn("Participants: Morgan Jr.", render_notes(bound, transcript))
+        self.assertEqual(meeting_title(bound, transcript), "Planning")
+
+    def test_distinct_identified_microphone_speaker_does_not_add_recorder_as_an_attendee(self):
+        from test_transcript_sources import diarized_transcript
+        from quill_workflow.title_participants import bind_title_guests
+        transcript = dict(diarized_transcript(), remote_microphone_owner="Morgan Lee")
+        notes = {"schema_version": 1, "meeting_title": {"text": "Agenda", "evidence": [2], "participants": []}}
+        self.assertEqual(bind_title_guests(notes, transcript)["meeting_title"]["participants"], [])
 
     def test_configured_recorder_and_alias_are_excluded_even_as_invited_guests(self):
         from quill_workflow.title_participants import bind_title_guests

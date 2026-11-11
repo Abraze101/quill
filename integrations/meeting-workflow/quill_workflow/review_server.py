@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 
 from .routing import RoutingError, RoutingReviews, StaleReviewError
 from .review_ui import document, notes_html, workspace, meeting_url
-from .review_library import meeting_library, meeting_detail
+from .review_library import meeting_index, meeting_detail
 
 DELETION_ACTIONS = {"delete_prepare", "delete_confirm"}
 MAX_FORM_BYTES = 8192
@@ -50,7 +50,7 @@ def _speaker_identity_form(server, item, speaker):
 def _speaker_removal_pending(server, job):
     return bool(server.deletion_options and any(
         item.get("job") == job and (item.get("cancelling") or item.get("interrupted") or item.get("available") is False)
-        for item in server.deletion_options()))
+        for item in (server.deletion_options(job) if server.action_summaries else server.deletion_options())))
 
 
 def _speaker_record(server, job):
@@ -89,13 +89,15 @@ def _speaker_panel(server, job):
     body = '<div class="speaker-review"><p class="muted">' + (
         'Names are matched automatically when the evidence is clear. Correct a name only if needed.' if item["speakers"] else
         'No separate voices are available to name in this transcript.') + '</p>'
+    if item.get("microphone_owner") and item.get("microphone_owner_segments"):
+        body += '<p class="notes-caption">Microphone speech on this call is labeled ' + _escape(item["microphone_owner"]) + '.</p>'
     local = item.get("local_participants", [])
     if isinstance(local, list):
         names = list(dict.fromkeys(person["name"] for person in local[:100]
                                   if isinstance(person, dict) and isinstance(person.get("name"), str)))
         if names:
             body += '<p class="notes-caption">Your meeting identity: ' + _escape(", ".join(names)) + '</p>'
-    labels = {"confirmed": "Confirmed", "matched": "Matched in meeting", "suggested": "Suggested", "corrected": "Your correction", "user_confirmed": "Your correction"}
+    labels = {"microphone_owner": "Recorder’s microphone", "confirmed": "Confirmed", "matched": "Matched in meeting", "suggested": "Suggested", "corrected": "Your correction", "user_confirmed": "Your correction"}
     for index, speaker in enumerate(item["speakers"]):
         prefix = "speaker-" + str(index)
         name = speaker.get("name") if isinstance(speaker.get("name"), str) else ""
@@ -153,10 +155,13 @@ def _speaker_panel(server, job):
 
 
 def _notes_preview(state, job):
+    return _detail_notes(state, job, meeting_detail(state, job))
+
+
+def _detail_notes(state, job, selected):
     """Prefer validated local notes, including a source-bound speaker refresh."""
     if not isinstance(job, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", job):
         return None
-    selected = meeting_detail(state, job)
     if selected is not None:
         text = selected.get("notes_text")
         if not isinstance(text, str):
@@ -496,42 +501,87 @@ def _cancel_controls(server, item):
             + label + '</button></form></section>')
 
 
-def _review_entries(server):
-    """Resolve one presentation state without changing any workflow decision."""
+def _live_options(server, job=None):
+    """Read actionable information for the open meeting. Older adapters return lists."""
     reviews = RoutingReviews(server.review_state)
     try:
-        routing = {record["job"]: reviews.get(record["job"]) for record in reviews.list()}
+        if job is None:
+            routing = {item["job"]: item for item in reviews.list()}
+        else:
+            from .local_deletion import stopped_jobs
+            record = reviews.get(job) if job not in stopped_jobs(server.review_state, job) else None
+            routing = {job: record} if record else {}
     finally:
         reviews.close()
+    resume = {}
+    if server.resume_options and server.on_resume:
+        for key, record in routing.items():
+            if record["status"] == "approved":
+                try:
+                    resume[key] = server.resume_options(record)
+                except Exception:
+                    pass  # A changed source must never expose a release action.
+
+    def options(callback):
+        if callback is None:
+            return []
+        return callback(job) if job is not None else callback()
+
+    return {"routing": routing, "resume": resume, "processing": options(server.processing_options),
+            "cancellation": options(server.cancellation_options), "sharing": options(server.sharing_options),
+            "deletion": options(server.deletion_options) if server.on_delete else []}
+
+
+def _meeting_sources(options):
     sources = {}
 
     def source_for(job):
         return sources.setdefault(job, {"processing": []})
 
-    for job, record in routing.items():
+    for job, record in options["routing"].items():
         if record["status"] == "pending":
             source_for(job)["folder"] = record
-        elif record["status"] == "approved" and server.resume_options and server.on_resume:
-            try:
-                stages = server.resume_options(record)
-            except Exception:
-                # A changed source or configuration must never expose a release.
-                stages = []
-            if stages:
-                source_for(job)["resume"] = (record, stages)
-
-    for index, item in enumerate(server.processing_options() if server.processing_options else []):
+        elif options["resume"].get(job):
+            source_for(job)["resume"] = (record, options["resume"][job])
+    for index, item in enumerate(options["processing"]):
         source_for(item.get("job", ("worker", index)))["processing"].append(item)
-    if server.cancellation_options:
-        for item in server.cancellation_options():
-            source_for(item["job"])["cancellation"] = item
-    for index, item in enumerate(server.sharing_options() if server.sharing_options else []):
+    for item in options["cancellation"]:
+        source_for(item["job"])["cancellation"] = item
+    for index, item in enumerate(options["sharing"]):
         source_for(item["job"])["sharing"] = (index, item)
-    if server.deletion_options and server.on_delete:
-        for item in server.deletion_options():
-            if item["job"] in sources or item.get("available"):
-                source_for(item["job"])["deletion"] = item
+    for item in options["deletion"]:
+        if item["job"] in sources or item.get("available"):
+            source_for(item["job"])["deletion"] = item
+    return sources
 
+
+def _listed_meeting(saved):
+    return (any(saved.get(key) for key in ("title", "display_date", "transcript_text", "recording_files", "has_saved_transcript"))
+            or any(item.get("status") in ("confirmed", "recorded") for item in saved.get("storage", {}).values()))
+
+
+def _review_entries(server, selected=None):
+    options = server.action_summaries() if server.action_summaries else _live_options(server)
+    routing = options["routing"]
+    sources = _meeting_sources(options)
+    library = meeting_index(server.review_state)
+    for job, saved in library.items():
+        if _listed_meeting(saved):
+            sources.setdefault(job, {"processing": []})
+
+    chosen = next((job for job in sources if _selection(job) == selected), None)
+    selected_detail = None
+    if isinstance(chosen, str):
+        if server.action_summaries:
+            current = _live_options(server, chosen)
+            live_source = _meeting_sources(current).get(chosen)
+            if live_source or _listed_meeting(library.get(chosen, {})):
+                sources[chosen] = live_source or {"processing": []}
+                routing[chosen] = current["routing"].get(chosen)
+            else:
+                sources.pop(chosen)
+        if chosen in sources:
+            selected_detail = meeting_detail(server.review_state, chosen)
     entries = []
     for index, (job, source) in enumerate(sources.items()):
         record = routing.get(job)
@@ -540,8 +590,9 @@ def _review_entries(server):
         sharing_index, sharing = source.get("sharing", (0, None))
         deletion = source.get("deletion")
         cancellation = source.get("cancellation") or {}
-        notes = _notes_preview(server.review_state, job)
-        if notes is None and sharing:
+        opened = job == chosen
+        notes = _detail_notes(server.review_state, job, selected_detail) if opened else None
+        if opened and notes is None and sharing:
             notes = sharing.get("preview")
         fallback = (sharing.get("title") if sharing else None) or next(
             (item.get("title") for item in processing if item.get("title")), None)
@@ -559,7 +610,8 @@ def _review_entries(server):
             route = record["approved_route"]
             entry.update(folder_id=route["company_id"], folder_name=route["company_name"])
         if sharing:
-            entry["sharing_body"] = _sharing_cards(server, [sharing], start_index=sharing_index)
+            if opened:
+                entry["sharing_body"] = _sharing_cards(server, [sharing], start_index=sharing_index)
             entry["sharing_status"] = sharing["status"]
             entry["sharing_label"] = {
                 "available": "No attendee copy shared",
@@ -571,7 +623,8 @@ def _review_entries(server):
                 "needs_attention": "Sharing result needs review",
             }.get(sharing["status"], "No sharing confirmation available")
         if deletion:
-            entry["deletion_body"] = _deletion_controls(server, deletion)
+            if opened:
+                entry["deletion_body"] = _deletion_controls(server, deletion)
             local_folder = deletion.get("local_folder") or deletion.get("folder")
             if isinstance(local_folder, str) and local_folder:
                 entry["local_folder"] = local_folder
@@ -615,7 +668,7 @@ def _review_entries(server):
                          priority=priority, attention=attention or bool(errors))
             # Unknown and failed processing never becomes a generic Resume.
             # A retry button is shown only when the processing adapter permits it.
-            if not active and process.get("retryable") and server.on_retry:
+            if opened and not active and process.get("retryable") and server.on_retry:
                 entry["body"] = (_identity_form(server, process) +
                                  '<button name="action" value="retry">Retry this meeting</button></form>')
         elif cancellation.get("state") == "available" and cancellation.get("phase") == "transcription":
@@ -623,12 +676,12 @@ def _review_entries(server):
         elif pending:
             entry.update(status="Choose a folder", detail="Your notes are ready. Choose where to file this meeting.",
                          tone="amber", priority=1, attention=True,
-                         body=_folder_body(server, pending, index))
+                         body=_folder_body(server, pending, index) if opened else "")
         elif source.get("resume"):
             approved, stages = source["resume"]
             entry.update(status="Ready to resume", detail="Your folder choice is saved. Some work is still on hold.",
                          tone="amber", priority=1, attention=True,
-                         body=_resume_body(server, approved, stages))
+                         body=_resume_body(server, approved, stages) if opened else "")
         elif any(item.get("state") == "waiting_for_company" for item in processing):
             entry.update(status="Check status", detail="The saved folder review is unavailable. Reload before continuing.",
                          tone="red", priority=0, attention=True)
@@ -646,7 +699,7 @@ def _review_entries(server):
         elif record and record["status"] == "skipped":
             entry.update(status="Kept on this Mac", detail="You chose to keep this meeting local without filing it in Drive.")
 
-        if not deletion_pending and not cancelled and cancellation.get("state") == "available" and server.on_cancel_processing:
+        if opened and not deletion_pending and not cancelled and cancellation.get("state") == "available" and server.on_cancel_processing:
             entry["cancel_controls"] = _cancel_controls(server, cancellation)
 
         # Sharing remains an independent action, but a prepared approval or a
@@ -655,30 +708,7 @@ def _review_entries(server):
             entry["attention"] = True
             if process or pending or source.get("resume"):
                 entry["metadata"].append("Sharing also needs review.")
-        entries.append(entry)
-    return sorted(entries, key=lambda entry: entry["priority"])
-
-
-def _reviews_page(server, notice=None, selected=None, **navigation):
-    entries = _review_entries(server)
-    known = {entry["selection"]: entry for entry in entries}
-    for job, saved in meeting_library(server.review_state).items():
-        selection = _selection(job)
-        entry = known.get(selection)
-        if entry is None:
-            has_content = any(saved.get(key) for key in (
-                "title", "display_date", "transcript_text", "recording_files"))
-            has_saved_copy = any(item.get("status") == "confirmed"
-                                 for item in saved.get("storage", {}).values())
-            # Old queue rows and their remembered paths can outlive cleanup.
-            # They alone are not evidence that a meeting is still available.
-            if not has_content and not has_saved_copy:
-                continue
-            entry = {"job": job, "selection": selection, "title": saved.get("title") or "Saved meeting",
-                     "status": "On this Mac", "detail": "", "tone": "neutral", "attention": False,
-                     "body": "", "notes": _notes_preview(server.review_state, job), "metadata": []}
-            entries.append(entry)
-            known[selection] = entry
+        saved = (selected_detail if opened and selected_detail is not None else library.get(job)) or {}
         if saved.get("title"):
             entry["title"] = saved["title"]
         for key in ("display_date", "recorded_at", "participants", "storage_status", "storage",
@@ -687,17 +717,30 @@ def _reviews_page(server, notice=None, selected=None, **navigation):
                 entry[key] = saved[key]
         if saved.get("company_id") and saved.get("folder_name"):
             entry.update(folder_id=saved["company_id"], folder_name=saved["folder_name"])
-        metadata = ([", ".join(saved["participants"])] if saved.get("participants") else [])
+        metadata = []
+        if saved.get("participants"):
+            names = ", ".join(saved["participants"])
+            metadata.append("Seen in call · " + names if saved.get("participants_source") == "visible_in_call" else names)
         if saved.get("display_date"):
             metadata.append(saved["display_date"])
         entry["metadata"] = metadata + entry.get("metadata", [])
         if entry["status"] in ("On this Mac", "Notes ready"):
-            if saved["storage_status"] == "saved_in_drive":
+            if saved.get("storage_status") == "saved_in_drive":
                 entry.update(status="Saved in Drive", detail="Quill verified the filed items.")
-            elif saved["storage_status"] == "partly_saved":
+            elif saved.get("storage_status") == "partly_saved":
                 entry.update(status="Partly saved in Drive", detail="Some files have confirmed Drive saves. View activity for details.")
-            elif saved["storage_status"] == "not_requested":
+            elif saved.get("storage_status") == "filing_recorded":
+                entry.update(status="Drive filing recorded")
+            elif saved.get("storage_status") == "partial_filing_recorded":
+                entry.update(status="Partial Drive filing recorded")
+            elif saved.get("storage_status") == "not_requested":
                 entry.update(status="Kept on this Mac", detail="Drive filing was not requested for this meeting.")
+        entries.append(entry)
+    return sorted(entries, key=lambda entry: entry["priority"])
+
+
+def _reviews_page(server, notice=None, selected=None, **navigation):
+    entries = _review_entries(server, selected)
     companies = {}
     for entry in entries:
         if server.speaker_options and server.on_speaker:
@@ -996,11 +1039,11 @@ class _LoopbackReviewServer(HTTPServer):
 def create_server(state, on_decision=None, resume_options=None, on_resume=None,
                   processing_options=None, on_retry=None, sharing_options=None, on_sharing=None,
                   deletion_options=None, on_delete=None, cancellation_options=None, on_cancel_processing=None,
-                  speaker_options=None, on_speaker=None):
+                  speaker_options=None, on_speaker=None, action_summaries=None):
     """Create an unstarted loopback server. Caller owns shutdown/server_close."""
     for callback in (on_decision, resume_options, on_resume, processing_options, on_retry,
                      sharing_options, on_sharing, deletion_options, on_delete, cancellation_options, on_cancel_processing,
-                     speaker_options, on_speaker):
+                     speaker_options, on_speaker, action_summaries):
         if callback is not None and not callable(callback):
             raise TypeError("Review callbacks must be callable")
     reviews = RoutingReviews(state)
@@ -1027,13 +1070,14 @@ def create_server(state, on_decision=None, resume_options=None, on_resume=None,
     server.on_cancel_processing = on_cancel_processing
     server.speaker_options = speaker_options
     server.on_speaker = on_speaker
+    server.action_summaries = action_summaries
     return server
 
 
 def serve_review(state, on_decision=None, open_browser=True, timeout_seconds=1800, on_ready=None,
                  resume_options=None, on_resume=None, processing_options=None, on_retry=None,
                  sharing_options=None, on_sharing=None, deletion_options=None, on_delete=None,
-                 cancellation_options=None, on_cancel_processing=None, speaker_options=None, on_speaker=None):
+                 cancellation_options=None, on_cancel_processing=None, speaker_options=None, on_speaker=None, action_summaries=None):
     """Serve until timeout. Closing the UI never discards saved decisions."""
     if (isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float))
             or not math.isfinite(timeout_seconds) or not 0 < timeout_seconds <= 86400):
@@ -1041,7 +1085,7 @@ def serve_review(state, on_decision=None, open_browser=True, timeout_seconds=180
     server = create_server(state, on_decision, resume_options, on_resume, processing_options, on_retry,
                            sharing_options, on_sharing, deletion_options=deletion_options, on_delete=on_delete,
                            cancellation_options=cancellation_options, on_cancel_processing=on_cancel_processing,
-                           speaker_options=speaker_options, on_speaker=on_speaker)
+                           speaker_options=speaker_options, on_speaker=on_speaker, action_summaries=action_summaries)
     timer = threading.Timer(timeout_seconds, server.shutdown)
     timer.daemon = True
     try:

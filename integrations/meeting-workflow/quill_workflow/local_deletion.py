@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS local_deletion_reviews (
 """
 
 
-def deleted_jobs(state):
+def deleted_jobs(state, job=None):
     """Read tombstones without creating a queue or changing its state."""
     path = Path(state) / "jobs.sqlite3"
     if not path.exists():
@@ -72,14 +72,14 @@ def deleted_jobs(state):
     with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True) as db:
         if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='local_deletions'").fetchone():
             return set()
+        if job is not None:
+            return {row[0] for row in db.execute("SELECT job FROM local_deletions WHERE job=?", (job,))}
         return {row[0] for row in db.execute("SELECT job FROM local_deletions")}
 
 
 def stopped_jobs(state, job=None):
     """Close processing actions without hiding the kept recording or its receipts."""
-    removed = deleted_jobs(state)
-    if job is not None:
-        removed.intersection_update({job})
+    removed = deleted_jobs(state, job)
     arguments = (job,) if job is not None else ()
     path = Path(state) / "jobs.sqlite3"
     if not path.exists():
@@ -290,10 +290,12 @@ class LocalMeetingDeletion:
                 stack.enter_context(_lock(source / LEASE))
             yield
 
-    def _local_sources(self):
+    def _local_sources(self, exclude=()):
         config = load_config(self.config_path)
         root = Path(config.get("recordings_root", str(Path.home() / "Recordings"))).expanduser().resolve(strict=True)
         for source in list(root.iterdir())[:10000]:
+            if str(source) in exclude:
+                continue
             try:
                 info = _directory(source)
                 meta = read_json(source / "meta.json", 100000)
@@ -308,8 +310,8 @@ class LocalMeetingDeletion:
         if self.queue.db.execute("SELECT 1 FROM jobs WHERE id=?", (job,)).fetchone():
             return session_path(self.queue, job)
         known = self._known_sources()
-        for candidate, source in self._local_sources():
-            if job == candidate and str(source) not in known:
+        for candidate, source in self._local_sources(exclude=known):
+            if job == candidate:
                 return source
         raise WorkflowError("This saved meeting is unavailable")
 
@@ -318,19 +320,15 @@ class LocalMeetingDeletion:
         # be verified. Do not relabel that source as a fresh prequeue meeting
         # and bypass its saved identity checks. These paths are only exclusions.
         known = set()
-        for row in self.queue.db.execute("SELECT id,session FROM jobs").fetchall():
-            known.add(str(Path(os.path.abspath(Path(row["session"]).expanduser()))))
-            try:
-                known.add(str(session_path(self.queue, row["id"])))
-            except Exception:
-                pass  # _snapshot reports this job's own failure in its card.
+        for row in self.queue.db.execute("SELECT session FROM jobs"):
+            known.add(str(Path(os.path.abspath(Path(row[0]).expanduser()))))
         for row in self.queue.db.execute("SELECT destination FROM local_names WHERE destination IS NOT NULL"):
             known.add(str(Path(os.path.abspath(Path(row[0]).expanduser()))))
         for row in self.queue.db.execute("SELECT path FROM local_name_aliases"):
             known.add(str(Path(os.path.abspath(Path(row[0]).expanduser()))))
         return known
 
-    def _snapshot(self, job, *, for_cancellation=False):
+    def _snapshot(self, job, *, for_cancellation=False, include_related=True):
         if self._get(job):
             raise WorkflowError("This meeting has already been removed from processing")
         tasks = self.queue.tasks(job)
@@ -371,7 +369,8 @@ class LocalMeetingDeletion:
         manifest_path = self.queue.state / "recordings" / job / "manifest.json"
         manifest = read_json(manifest_path) if manifest_path.exists() else None
         same_source = [job]
-        for row in self.queue.db.execute("SELECT id FROM jobs WHERE id<>?", (job,)).fetchall():
+        candidates = self.queue.db.execute("SELECT id FROM jobs WHERE id<>?", (job,)).fetchall() if include_related else ()
+        for row in candidates:
             candidate = row["id"]
             if self._get(candidate):
                 continue
@@ -530,9 +529,8 @@ class LocalMeetingDeletion:
             except (OSError, ValueError, WorkflowError, RecordingSafetyHold):
                 continue
         known.update(row[0] for row in self.queue.db.execute("SELECT path FROM local_name_aliases"))
-        for job, source in self._local_sources():
-            if str(source) not in known:
-                append(job, source)
+        for job, source in self._local_sources(exclude=known):
+            append(job, source)
         listed = {item["job"] for item in results}
         for row in self.queue.db.execute("SELECT j.id, j.session FROM processing_cancellations c JOIN jobs j ON c.job=j.id "
                                          "LEFT JOIN local_deletions d ON d.job=c.job WHERE d.job IS NULL"):
@@ -572,39 +570,106 @@ class LocalMeetingDeletion:
         self.queue.write_status()
         return self._cancel_option(snapshot)
 
-    def options(self):
-        items = []
-        rows = [dict(row) for row in self.queue.db.execute("SELECT id,session FROM jobs ORDER BY created DESC").fetchall()]
-        known = self._known_sources()
-        rows.extend({"id": job, "session": str(source)} for job, source in self._local_sources() if str(source) not in known)
-        ids = {row["id"] for row in rows}
-        for row in self.queue.db.execute("SELECT job,record FROM local_deletions").fetchall():
-            if row["job"] not in ids:
-                record = json.loads(row["record"])
-                rows.append({"id": row["job"], "session": record["snapshot"]["trees"][0]["path"]})
-        for row in rows:
-            job = row["id"]
+    @staticmethod
+    def _pending_removal(job, record):
+        if record["job"] != job or record["status"] == "trashed":
+            return None
+        cancelling = record["status"] == "cancelling"
+        return {"job": job, "title": record["title"], "revision": record["revision"], "available": True,
+                "interrupted": not cancelling, "cancelling": cancelling,
+                "detail": ("Stopping processing… This meeting will move to Trash automatically." if cancelling else
+                           "Removal paused. Processing is stopped; the remaining files are still recoverable.")}
+
+    def _option(self, job, session):
+        previous = self._get(job)
+        if previous:
+            return self._pending_removal(job, previous)
+        try:
+            # The revision binds only the original capture. Prepare and confirm
+            # perform the full duplicate-job, queued-copy and writer checks.
+            snapshot = self._snapshot(job, include_related=False)
+            return {"job": job, "title": snapshot["title"], "revision": _revision(snapshot), "available": True}
+        except Exception as error:
+            return {"job": job, "title": Path(session).name[:180], "revision": "unavailable",
+                    "available": False, "detail": str(error)[:250]}
+
+    def options(self, job=None):
+        if job is not None:
             previous = self._get(job)
             if previous:
-                if previous["job"] != job:
-                    continue
-                if previous["status"] != "trashed":
-                    items.append({"job": job, "title": previous["title"], "revision": previous["revision"],
-                                  "available": True, "interrupted": previous["status"] != "cancelling",
-                                  "cancelling": previous["status"] == "cancelling",
-                                  "detail": ("Stopping processing… This meeting will move to Trash automatically."
-                                             if previous["status"] == "cancelling" else
-                                             "Removal paused. Processing is stopped; the remaining files are still recoverable.")})
+                option = self._pending_removal(job, previous)
+            else:
+                row = self.queue.db.execute("SELECT session FROM jobs WHERE id=?", (job,)).fetchone()
+                if row:
+                    option = self._option(job, row["session"])
+                else:
+                    try:
+                        source = self._source(job)
+                    except (OSError, ValueError, WorkflowError):
+                        return []
+                    option = self._option(job, source)
+            return [option] if option else []
+
+        rows = {row["id"]: row["session"] for row in self.queue.db.execute(
+            "SELECT id,session FROM jobs ORDER BY created DESC")}
+        rows.update(self._local_sources(exclude=self._known_sources()))
+        for (removed_job,) in self.queue.db.execute("SELECT job FROM local_deletions"):
+            rows.setdefault(removed_job, "")
+        return [option for job, session in rows.items() if (option := self._option(job, session))]
+
+    def summaries(self, stopped):
+        """List local meetings and stop states, without preparing deletion or reading their content."""
+        removals, cancellations = [], []
+        removed = set()
+        for row in self.queue.db.execute(
+                "SELECT job,json_extract(record,'$.job'),json_extract(record,'$.status'),"
+                "json_extract(record,'$.title'),json_extract(record,'$.revision') FROM local_deletions"):
+            job, primary, status, title, revision = row
+            removed.add(job)
+            item = self._pending_removal(job, {"job": primary, "title": title, "status": status, "revision": revision})
+            if item:
+                removals.append(item)
+        config = load_config(self.config_path)
+        root = Path(config.get("recordings_root", Path.home() / "Recordings")).expanduser().resolve()
+        paths = {}
+        for row in self.queue.db.execute("SELECT j.id,j.session,n.destination FROM jobs j "
+                                         "LEFT JOIN local_names n ON n.job=j.id"):
+            job = row["id"]
+            if job in removed:
+                continue
+            source = Path(row["destination"] or row["session"])
+            if row["destination"] and not os.path.lexists(source):
+                source = Path(row["session"])
+            paths[job] = source
+        if root.is_dir():
+            paths.update(self._local_sources(exclude=self._known_sources()))
+        for job, source in paths.items():
+            if job in removed:
                 continue
             try:
-                snapshot = self._snapshot(job)
-                items.append({"job": job, "title": snapshot["title"], "revision": _revision(snapshot), "available": True})
-            except Exception as error:
-                # A bad individual source must not hide other meetings. The
-                # confirmation revalidates all evidence; no paths come from UI.
-                items.append({"job": job, "title": Path(row["session"]).name[:180], "revision": "unavailable",
-                              "available": False, "detail": str(error)[:250]})
-        return items
+                if source.parent != root:
+                    continue
+                _directory(source)
+                if os.path.lexists(source / MARKER):
+                    continue
+                # Only finished local folders supply rows. Permission for a
+                # particular action is always evaluated on the detail page.
+                meta = read_json(source / "meta.json", 100000)
+                if not isinstance(meta, dict) or not meta.get("started") or not meta.get("ended"):
+                    continue
+                removals.append({"job": job, "title": source.name, "available": True})
+                if (job in stopped or os.path.lexists(source / CANCEL_MARKER)
+                        or meta.get("transcription_requested") is True and not (source / "transcript.json").is_file()):
+                    item = self._cancel_preview(job, root, source, [])
+                    if item:
+                        cancellations.append(item)
+            except (OSError, ValueError, TypeError, KeyError, WorkflowError, RecordingSafetyHold):
+                continue
+        listed = {item["job"] for item in cancellations}
+        for job in stopped - removed - listed:
+            if job in paths:
+                cancellations.append({"job": job, "title": paths[job].name, "state": "cancelled"})
+        return removals, cancellations
 
     def prepare(self, job, revision):
         previous = self._get(job)

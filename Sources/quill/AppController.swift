@@ -454,19 +454,17 @@ final class AppController {
         do {
             let target = requestedScreenVideo ? try await resolveCaptureTarget() : nil
             try validatePendingStart()
-            let newSession = try RecordingSession(root: root,
-                                                 speakerIdentificationRequested: Config.speakerIdentificationEnabled())
-            session = newSession
             // A manual recording may use context from one unambiguous joined
             // call, but remains manually owned. Multiple calls supply none.
             let signals = meetingAutomation.joinedSignals()
             let contextSignal = automaticMeeting.flatMap { meetingAutomation.signal(for: $0) }
                 ?? (automaticMeeting == nil && signals.count == 1 ? signals.first : nil)
+            let newSession = try RecordingSession(root: root,
+                speakerIdentificationRequested: Config.speakerIdentificationEnabled(),
+                initialMeetingSignal: contextSignal, remoteMicrophoneOwner: Config.remoteMicrophoneOwner())
+            session = newSession
             contextMeeting = contextSignal?.meeting
             contextSource = contextSignal?.source
-            if let contextSignal {
-                newSession.observeMeetingSignal(contextSignal)
-            }
             let now = RecordingSafetyClock.now
             safetyStartedAt = now
             safety = RecordingSafety(sessionID: pendingStartID ?? UUID(), owner: automaticMeeting == nil ? .manual : .automatic,

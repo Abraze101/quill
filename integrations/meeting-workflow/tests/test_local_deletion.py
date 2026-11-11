@@ -94,6 +94,22 @@ class LocalDeletionTests(unittest.TestCase):
         self.assertEqual(self.moved, [])
         self.assertEqual(deleted_jobs(self.queue.state), set())
 
+    def test_selected_deletion_option_does_not_resolve_unrelated_meeting_folders(self):
+        neighbor = self.source.parent / "Neighbor"
+        shutil.copytree(self.source, neighbor)
+        other = self.queue.enqueue(neighbor, self.config)
+        from quill_workflow.local_deletion import session_path
+        checked = []
+        def resolve(queue, job):
+            checked.append(job)
+            return session_path(queue, job)
+        with patch("quill_workflow.local_deletion.session_path", side_effect=resolve):
+            item, = self.deletion.options(self.job)
+        self.assertEqual(set(checked), {self.job})
+        self.assertTrue(item["available"])
+        self.assertEqual(self.deletion.prepare(self.job, item["revision"])["revision"], item["revision"])
+        self.assertFalse(deleted_jobs(self.queue.state, other))
+
     def test_entire_original_and_queue_copies_go_to_trash_receipts_stay_auditable(self):
         item = self.prepared()
         record = self.confirm(item)
