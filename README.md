@@ -88,6 +88,10 @@ The script retains its existing name but always builds and packages the release
 configuration. **About Quill…** in the feather menu shows the custom app's version
 and build number from `Sources/quill/Info.plist`.
 
+Choose **Check for Updates…** in Quill to compare your installed build with this
+repository. When a newer build is available, you can download its source and
+open its [installation instructions](docs/updating-local-source.md#install-the-update-shown-in-quill).
+
 See the [setup guide](docs/meeting-workflow.md) for signing, installation,
 permissions, and the Chrome extension. The installer rejects ad hoc signatures
 and unreviewed identity changes. Keep the existing bundle ID and signing identity
@@ -106,9 +110,9 @@ Quill reads `~/.config/quill/config.json`. A minimal opt-in starting point is:
 }
 ```
 
-Settings and the feather menu control recording options. Screen video requires
-an explicit window or display selection. For window video, keep the meeting in
-its own Chrome window; the selected window's visible content is what is captured.
+To record one monitor, open **Settings**, turn on **Include screen video**, set
+**Capture** to **One display**, and choose the monitor by name. For window video,
+choose **Meeting window** and keep the meeting in its own Chrome window.
 
 Configure postprocessing separately using
 [`workflow.example.json`](integrations/meeting-workflow/workflow.example.json).

@@ -62,6 +62,7 @@ final class MenuBarController {
     var onSkipMeeting: (() -> Void)?
     var onRetryMeeting: ((String) -> Void)?
     var onSettings: (() -> Void)?
+    var onCheckForUpdates: (() -> Void)?
     var onReviewMeetings: (() -> Void)?
     var onRetryTranscriptions: (() -> Void)?
     var onCancelTranscription: ((String, UUID) -> Void)?
@@ -168,6 +169,8 @@ final class MenuBarController {
 
         let about = NSMenuItem(title: "About Quill…", action: #selector(aboutClicked), keyEquivalent: "")
         menu.addItem(about)
+        let updates = NSMenuItem(title: "Check for Updates…", action: #selector(checkForUpdatesClicked), keyEquivalent: "")
+        menu.addItem(updates)
 
         menu.addItem(.separator())
 
@@ -178,7 +181,7 @@ final class MenuBarController {
         )
         menu.addItem(quit)
 
-        for item in [processingItem, showControls, warningHistory, automaticItem, screenVideoItem, toggleItem, pauseItem, skipItem, retryItem, openFolder, reviewItem, transcriptionRetryItem, cancelTranscriptionItem, settings, about, quit] {
+        for item in [processingItem, showControls, warningHistory, automaticItem, screenVideoItem, toggleItem, pauseItem, skipItem, retryItem, openFolder, reviewItem, transcriptionRetryItem, cancelTranscriptionItem, settings, about, updates, quit] {
             item.target = self
         }
 
@@ -187,7 +190,7 @@ final class MenuBarController {
             // Both receive the same callbacks and state from AppController.
             menu.removeAllItems()
             let sections: [(String, [NSMenuItem])] = [
-                ("Quill", [about, settings, .separator(), quit]),
+                ("Quill", [about, updates, .separator(), settings, .separator(), quit]),
                 ("Recording", [toggleItem, pauseItem, .separator(), automaticItem, screenVideoItem,
                                skipItem, retryItem, .separator(), showControls]),
                 ("Meetings", [transcriptionLabel, cancelTranscriptionItem, reviewItem, openFolder, transcriptionRetryItem, .separator(), warningHistory])
@@ -376,6 +379,7 @@ final class MenuBarController {
         onRetryMeeting?(meeting)
     }
     @objc private func settingsClicked() { onSettings?() }
+    @objc private func checkForUpdatesClicked() { onCheckForUpdates?() }
     @objc private func warningHistoryClicked() { onWarningHistory?() }
     @objc private func aboutClicked() {
         NSApp.orderFrontStandardAboutPanel(nil)

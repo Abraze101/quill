@@ -1,12 +1,29 @@
+import AppKit
+import ColorSync
 import CoreGraphics
 import Foundation
 import ScreenCaptureKit
 
-/// A specific user-selected window or display. A window selection is never
-/// widened to an application or display if it disappears.
+/// A specific user-selected window or display. macOS can give a reconnected
+/// monitor a different numeric ID, including one previously used by another.
 enum ScreenCaptureTarget: Codable, Hashable, Sendable {
     case window(id: UInt32, ownerPID: Int32)
-    case display(id: UInt32)
+    case display(id: UInt32, uuid: UUID? = nil)
+
+    var identifier: String {
+        switch self {
+        case .window(let id, let ownerPID): return "window:\(id):\(ownerPID)"
+        case .display(let id, let uuid): return "display:\(uuid?.uuidString ?? String(id))"
+        }
+    }
+
+    func matchesSelection(_ selection: String) -> Bool {
+        if selection == identifier { return true }
+        // Older preferences stored the current numeric ID. Resolve them against
+        // today's choices so the selected target carries its UUID into capture.
+        guard case .display(let id, _) = self else { return false }
+        return selection == "display:\(id)"
+    }
 }
 
 struct ScreenCaptureBounds: Codable, Equatable, Sendable {
@@ -29,6 +46,49 @@ struct ScreenCaptureChoice: Sendable {
     let bounds: ScreenCaptureBounds
 }
 
+/// Uses the same global display coordinates that ScreenCaptureKit supplies.
+struct ScreenCaptureDisplay {
+    let id: UInt32
+    let uuid: UUID?
+    let name: String
+    let frame: CGRect
+    let isMain: Bool
+
+    var target: ScreenCaptureTarget { .display(id: id, uuid: uuid) }
+
+    static func choices(from displays: [Self]) -> [ScreenCaptureChoice] {
+        let ordered = displays.sorted {
+            ($0.frame.minX, $0.frame.minY, $0.id) < ($1.frame.minX, $1.frame.minY, $1.id)
+        }
+        let byName = Dictionary(grouping: ordered, by: \.name)
+        return ordered.map { display in
+            var label = display.name
+            if let peers = byName[display.name], peers.count > 1,
+               let index = peers.firstIndex(where: { $0.id == display.id }) {
+                var position = "\(index + 1) of \(peers.count)"
+                if peers.count == 2 {
+                    let other = peers[1 - index].frame
+                    let dx = display.frame.midX - other.midX
+                    let dy = display.frame.midY - other.midY
+                    if abs(dx) >= abs(dy) && dx != 0 { position = dx < 0 ? "Left" : "Right" }
+                    else if dy != 0 { position = dy < 0 ? "Top" : "Bottom" }
+                }
+                label += " (\(position))"
+            }
+            if display.isMain { label += " · Main" }
+            label += " · \(Int(display.frame.width)) × \(Int(display.frame.height))"
+            return ScreenCaptureChoice(target: display.target, title: label, bounds: ScreenCaptureBounds(display.frame))
+        }
+    }
+
+    static func id(for target: ScreenCaptureTarget, in displays: [Self]) -> UInt32? {
+        // Match the identity the user chose, even when building a new stream
+        // after Pause. Never fall back to its old number if a UUID is missing.
+        let matches = displays.filter { $0.target.identifier == target.identifier }
+        return matches.count == 1 ? matches[0].id : nil
+    }
+}
+
 enum ScreenVideoError: Error, LocalizedError, Sendable {
     case permissionRequired
     case microphonePermissionRequired
@@ -46,7 +106,7 @@ enum ScreenVideoError: Error, LocalizedError, Sendable {
     var errorDescription: String? {
         switch self {
         case .permissionRequired:
-            return "Allow Quill to record the screen in System Settings, then choose the meeting window again."
+            return "Allow Quill to record the screen in System Settings, then choose the window or display again."
         case .microphonePermissionRequired:
             return "Allow Quill to use the microphone before recording video with audio."
         case .targetUnavailable:
@@ -64,7 +124,7 @@ enum ScreenVideoError: Error, LocalizedError, Sendable {
         case .startTimedOut:
             return "Screen recording did not start in time."
         case .contentQueryTimedOut:
-            return "macOS did not return the available recording windows in time. Try again in Settings."
+            return "macOS did not return the available windows and displays in time. Try again in Settings."
         case .finalizationTimedOut:
             return "The screen recording has not finished saving. Its file will not be sent for processing."
         case .emptyRecording:
@@ -84,14 +144,7 @@ enum ScreenCaptureCatalog {
                 bounds: ScreenCaptureBounds(window.frame)
             )
         }.sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
-        let displays = content.displays.sorted { $0.displayID < $1.displayID }.enumerated().map { index, display in
-            ScreenCaptureChoice(
-                target: .display(id: display.displayID),
-                title: "Entire screen \(index + 1) (\(display.width) × \(display.height))",
-                bounds: ScreenCaptureBounds(display.frame)
-            )
-        }
-        return windows + displays
+        return windows + ScreenCaptureDisplay.choices(from: displayInventory(content))
     }
 
     static func contentFilter(for target: ScreenCaptureTarget) async throws -> SCContentFilter {
@@ -102,8 +155,9 @@ enum ScreenCaptureCatalog {
                 $0.windowID == id && $0.owningApplication?.processID == ownerPID && isChromeWindow($0)
             }) else { throw ScreenVideoError.targetUnavailable }
             return SCContentFilter(desktopIndependentWindow: window)
-        case .display(let id):
-            guard let display = content.displays.first(where: { $0.displayID == id }) else {
+        case .display:
+            guard let id = ScreenCaptureDisplay.id(for: target, in: displayInventory(content)),
+                  let display = content.displays.first(where: { $0.displayID == id }) else {
                 throw ScreenVideoError.targetUnavailable
             }
             // Exclude the whole running app so new/collapsed indicator windows
@@ -114,6 +168,24 @@ enum ScreenCaptureCatalog {
                 throw ScreenVideoError.captureFailed("Quill could not exclude its recording controls from the screen video. Try starting again.")
             }
             return SCContentFilter(display: display, excludingApplications: ownApplications, exceptingWindows: [])
+        }
+    }
+
+    private static func displayInventory(_ content: SCShareableContent) -> [ScreenCaptureDisplay] {
+        var names: [UInt32: String] = [:]
+        for screen in NSScreen.screens {
+            if let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber {
+                names[number.uint32Value] = screen.localizedName
+            }
+        }
+        let main = CGMainDisplayID()
+        return content.displays.map { display in
+            let id = display.displayID
+            let uuid = CGDisplayCreateUUIDFromDisplayID(id)?.takeRetainedValue()
+            return ScreenCaptureDisplay(
+                id: id, uuid: uuid.flatMap { UUID(uuidString: CFUUIDCreateString(nil, $0) as String) },
+                name: names[id] ?? "Display", frame: display.frame, isMain: id == main
+            )
         }
     }
 

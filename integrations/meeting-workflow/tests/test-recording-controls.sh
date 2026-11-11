@@ -10,6 +10,7 @@ xcrun swiftc -swift-version 6 -target "$(uname -m)-apple-macosx15.0" \
   Sources/quill/RecordingStatusHeartbeat.swift \
   Sources/quill/UI/MenuBarController.swift \
   Sources/quill/UI/SettingsWindowController.swift \
+  Sources/quill/QuillUpdateChecker.swift \
   Sources/quill/LoginItemController.swift \
   Tests/RecordingControlChecks/RecordingControlChecks.swift \
   -o "$test_directory/recording-controls-checks"

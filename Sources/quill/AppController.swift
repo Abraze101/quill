@@ -76,6 +76,7 @@ final class AppController {
     private var systemInterruptionNotified = false
     private var captureChoices: [ScreenCaptureChoice] = []
     private var captureLoading = false
+    private var captureRefreshPending = false
     private var captureDetail: String?
     private let driveAccountSetup = DriveAccountSetup()
     private var driveAccountBusy = false
@@ -135,7 +136,9 @@ final class AppController {
         settings.onCaptureTargetChange = { [weak self] target in
             self?.savePreference { try Config.setScreenCaptureSelection(target) }
         }
-        settings.onRefreshCaptureTargets = { [weak self] in self?.refreshCaptureTargets(requestPermission: true) }
+        settings.onRefreshCaptureTargets = { [weak self] requestPermission in
+            self?.refreshCaptureTargets(requestPermission: requestPermission)
+        }
         settings.onTranscriptionChange = { [weak self] enabled in
             self?.savePreference {
                 if !enabled, (try? WorkflowPreferences(url: Config.workflowSettingsURL()))?.notesActive == true {
@@ -210,6 +213,7 @@ final class AppController {
         }
         menu.onQuit = { [weak self] in self?.shutdown() }
         menu.onSettings = { [weak self] in self?.showSettings() }
+        menu.onCheckForUpdates = { [weak self] in self?.settings.showUpdates() }
         menu.onShowControls = { [weak self] in self?.showRecordingControls() }
         menu.onWarningHistory = { [weak self] in self?.showWarningHistory() }
         menu.onReviewMeetings = { [weak self] in self?.reviewMeetings() }
@@ -721,11 +725,14 @@ final class AppController {
         captureChoices = choices
         let selected = Config.screenCaptureSelection()
         if Config.screenCaptureScope() == "display" {
-            guard let choice = choices.first(where: { identifier($0.target) == selected }),
-                  case .display = choice.target else {
-                throw CaptureSelectionError("Choose a display in Settings before recording the entire screen.")
+            guard selected != "automatic" else {
+                throw CaptureSelectionError("Choose a display in Quill Settings before recording.")
             }
-            return choice.target
+            guard let target = selectedDisplay(in: choices, selection: selected) else {
+                throw CaptureSelectionError("The selected display is unavailable. Reconnect it or choose another display in Quill Settings.")
+            }
+            try Config.pinScreenCaptureDisplay(selected, to: target.identifier)
+            return target
         }
         // Chrome window IDs and CGWindowIDs are not interchangeable. Bounds
         // may corroborate an explicit selection, but cannot authorize one.
@@ -733,7 +740,7 @@ final class AppController {
             throw CaptureSelectionError("Choose the meeting's Chrome window in Settings before including screen video. Automatic window selection is not enabled yet.")
         }
         if automaticMeeting == nil {
-            guard let choice = choices.first(where: { identifier($0.target) == selected }),
+            guard let choice = choices.first(where: { $0.target.identifier == selected }),
                   case .window = choice.target else { throw ScreenVideoError.targetUnavailable }
             return choice.target
         }
@@ -744,7 +751,7 @@ final class AppController {
         let candidates = choices.compactMap { choice -> MeetingWindowMatcher.Candidate? in
             guard case .window = choice.target else { return nil }
             let b = choice.bounds
-            return .init(identifier: identifier(choice.target), left: b.left, top: b.top, width: b.width, height: b.height)
+            return .init(identifier: choice.target.identifier, left: b.left, top: b.top, width: b.width, height: b.height)
         }
         guard let signal, let window = signal.browserWindow else {
             throw CaptureSelectionError("The meeting window is not confirmed. Keep the meeting tab selected in its Chrome window and try again.")
@@ -756,7 +763,7 @@ final class AppController {
         }
         guard let matched,
               selected == matched,
-              let choice = choices.first(where: { identifier($0.target) == matched }) else {
+              let choice = choices.first(where: { $0.target.identifier == matched }) else {
             throw CaptureSelectionError("Quill could not identify one meeting window. Keep the meeting in its own Chrome window, or choose a window in Settings for a manual recording.")
         }
         captureMeeting = signal.meeting
@@ -924,11 +931,14 @@ final class AppController {
             case .window: return state.captureScope == .meetingWindow
             case .display: return state.captureScope == .entireScreen
             }
-        }.map { .init(identifier: identifier($0.target), label: $0.title) }
+        }.map { .init(identifier: $0.target.identifier, label: $0.title) }
+        let selection = Config.screenCaptureSelection()
         if state.captureScope == .meetingWindow {
             state.captureTargets.insert(.init(identifier: "automatic", label: "Choose meeting window…"), at: 0)
+            state.selectedCaptureTargetID = selection
+        } else if selection != "automatic" {
+            state.selectedCaptureTargetID = selectedDisplay(in: captureChoices, selection: selection)?.identifier ?? selection
         }
-        state.selectedCaptureTargetID = Config.screenCaptureSelection()
         state.captureTargetsLoading = captureLoading
         state.captureTargetDetail = captureDetail
         state.localTranscription = Config.transcriptionEnabled()
@@ -994,20 +1004,39 @@ final class AppController {
     }
 
     private func refreshCaptureTargets(requestPermission: Bool) {
-        guard !captureLoading, phase == .idle else { return }
+        guard phase == .idle, Config.screenVideoEnabled() else { return }
+        if captureLoading {
+            captureRefreshPending = true
+            return
+        }
         if !requestPermission && !CGPreflightScreenCaptureAccess() {
-            captureDetail = "Screen access is needed to list windows. Click Refresh to request it, then allow Quill in System Settings."
+            captureChoices = []
+            captureDetail = "Screen access is needed to list windows and displays. Click Refresh to request it, then allow Quill in System Settings."
             refreshUI()
             return
         }
         captureLoading = true
         captureDetail = nil
+        let displaySelection = Config.screenCaptureScope() == "display" ? Config.screenCaptureSelection() : nil
         refreshUI()
         Task {
-            do { captureChoices = try await ScreenCaptureCatalog.availableChoices(requestPermission: requestPermission) }
-            catch { captureDetail = error.localizedDescription }
+            do {
+                captureChoices = try await ScreenCaptureCatalog.availableChoices(requestPermission: requestPermission)
+                if !captureRefreshPending, phase == .idle, let displaySelection,
+                   let selected = selectedDisplay(in: captureChoices, selection: displaySelection) {
+                    try Config.pinScreenCaptureDisplay(displaySelection, to: selected.identifier)
+                }
+            }
+            catch {
+                captureChoices = []
+                captureDetail = error.localizedDescription
+            }
             captureLoading = false
             refreshUI()
+            if captureRefreshPending {
+                captureRefreshPending = false
+                refreshCaptureTargets(requestPermission: false)
+            }
         }
     }
 
@@ -1542,11 +1571,16 @@ final class AppController {
         }
     }
 
-    private func identifier(_ target: ScreenCaptureTarget) -> String {
-        switch target {
-        case .window(let id, let pid): return "window:\(id):\(pid)"
-        case .display(let id): return "display:\(id)"
+    private func selectedDisplay(in choices: [ScreenCaptureChoice], selection: String) -> ScreenCaptureTarget? {
+        let matches = choices.filter {
+            guard case .display = $0.target else { return false }
+            return $0.target.matchesSelection(selection)
         }
+        guard matches.count == 1 else { return nil }
+        let target = matches[0].target
+        if target.identifier != selection,
+           choices.filter({ $0.target.identifier == target.identifier }).count != 1 { return nil }
+        return target
     }
 
     private func openFolder() {

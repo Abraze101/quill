@@ -79,7 +79,7 @@ final class SettingsWindowController: NSWindowController {
     var onIncludeScreenVideoChange: ((Bool) -> Void)?
     var onCaptureScopeChange: ((QuillCaptureScope) -> Void)?
     var onCaptureTargetChange: ((String) -> Void)?
-    var onRefreshCaptureTargets: (() -> Void)?
+    var onRefreshCaptureTargets: ((_ requestPermission: Bool) -> Void)?
     var onTranscriptionChange: ((Bool) -> Void)?
     var onSpeakerIdentificationChange: ((Bool) -> Void)?
     var onSetupConnection: ((QuillConnection) -> Void)?
@@ -129,8 +129,18 @@ final class SettingsWindowController: NSWindowController {
     private let checkInPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let dockSwitch = NSButton(checkboxWithTitle: "Show Quill in Dock", target: nil, action: nil)
     private let loginSettingsButton = NSButton(title: "Open Login Items…", target: nil, action: nil)
+    private let updatesSection = NSStackView()
+    private let updateButton = NSButton(title: "Check for Updates…", target: nil, action: nil)
+    private let updateStatus = NSTextField(wrappingLabelWithString: "")
+    private let updateActions = NSStackView()
+    private let lookupUpdate: @MainActor () async throws -> QuillUpdateChecker.Result
+    private let openUpdateURL: @MainActor (URL) -> Bool
+    private var availableUpdate: (source: URL, guide: URL)?
 
-    init() {
+    init(lookupUpdate: @escaping @MainActor () async throws -> QuillUpdateChecker.Result = { try await QuillUpdateChecker.check() },
+         openUpdateURL: @escaping @MainActor (URL) -> Bool = { NSWorkspace.shared.open($0) }) {
+        self.lookupUpdate = lookupUpdate
+        self.openUpdateURL = openUpdateURL
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 500, height: 660),
             styleMask: [.titled, .closable, .miniaturizable],
@@ -143,6 +153,8 @@ final class SettingsWindowController: NSWindowController {
         buildContent()
         update(state)
         window.center()
+        NotificationCenter.default.addObserver(self, selector: #selector(displayConfigurationChanged),
+            name: NSApplication.didChangeScreenParametersNotification, object: nil)
     }
 
     required init?(coder: NSCoder) { nil }
@@ -151,6 +163,54 @@ final class SettingsWindowController: NSWindowController {
         showWindow(nil)
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
+    }
+
+    func showUpdates() {
+        show()
+        checkForUpdates()
+        scrollToUpdates()
+    }
+
+    private func scrollToUpdates() {
+        window?.contentView?.layoutSubtreeIfNeeded()
+        updatesSection.scrollToVisible(updatesSection.bounds)
+    }
+
+    @objc private func checkForUpdates() {
+        guard updateButton.isEnabled else { return }
+        updateButton.isEnabled = false
+        availableUpdate = nil
+        updateActions.isHidden = true
+        updateStatus.stringValue = "Checking GitHub for a newer version…"
+        updateStatus.isHidden = false
+        Task {
+            do {
+                switch try await lookupUpdate() {
+                case .current(let version):
+                    updateStatus.stringValue = "Quill \(version) is up to date."
+                case .localNewer(let installed, let published):
+                    updateStatus.stringValue = "This Mac has Quill \(installed). GitHub has \(published). Your version is newer."
+                case .available(let installed, let published, let source, let guide):
+                    availableUpdate = (source, guide)
+                    updateStatus.stringValue = "Quill \(published) is available. This Mac has \(installed). Follow the guide to build and install the update from source."
+                }
+            } catch {
+                updateStatus.stringValue = "Couldn’t check for updates. \(error.localizedDescription)"
+            }
+            let wasVisible = window?.isVisible == true && !updatesSection.visibleRect.isEmpty
+            updateActions.isHidden = availableUpdate == nil
+            updateButton.isEnabled = true
+            if wasVisible { scrollToUpdates() }
+        }
+    }
+
+    @objc private func openUpdateGuide() { openUpdateLink(availableUpdate?.guide) }
+    @objc private func downloadUpdateSource() { openUpdateLink(availableUpdate?.source) }
+
+    private func openUpdateLink(_ url: URL?) {
+        if let url, !openUpdateURL(url) {
+            updateStatus.stringValue = "Your browser couldn’t open the link. Try again."
+        }
     }
 
     func update(_ state: QuillSettingsState) {
@@ -240,12 +300,15 @@ final class SettingsWindowController: NSWindowController {
     }
 
     private func updateCaptureTargets() {
+        let byID = Dictionary(grouping: state.captureTargets, by: \.identifier)
+        let selectedMatches = state.selectedCaptureTargetID.flatMap { byID[$0] } ?? []
         let placeholder: String
         if state.captureTargetsLoading {
             placeholder = "Loading available targets…"
-        } else if let selected = state.selectedCaptureTargetID,
-                  !state.captureTargets.contains(where: { $0.identifier == selected }) {
-            placeholder = "Selected target is unavailable"
+        } else if selectedMatches.count > 1 {
+            placeholder = "Displays share the same identifier"
+        } else if state.selectedCaptureTargetID != nil && selectedMatches.isEmpty {
+            placeholder = state.captureScope == .entireScreen ? "Selected display is unavailable" : "Selected window is unavailable"
         } else {
             placeholder = state.captureScope == .meetingWindow ? "Select a Chrome window…" : "Select a display…"
         }
@@ -260,12 +323,13 @@ final class SettingsWindowController: NSWindowController {
             for target in state.captureTargets {
                 let item = NSMenuItem(title: target.label, action: nil, keyEquivalent: "")
                 item.representedObject = target.identifier
-                item.toolTip = target.label
+                item.isEnabled = byID[target.identifier]?.count == 1
+                item.toolTip = item.isEnabled ? target.label : "macOS reports the same identifier for multiple displays."
                 targetPopup.menu?.addItem(item)
             }
         }
-        if let selected = state.selectedCaptureTargetID,
-           let item = targetPopup.itemArray.first(where: { $0.representedObject as? String == selected }) {
+        if selectedMatches.count == 1,
+           let item = targetPopup.itemArray.first(where: { $0.representedObject as? String == selectedMatches[0].identifier }) {
             if targetPopup.selectedItem !== item { targetPopup.select(item) }
         } else if targetPopup.indexOfSelectedItem != 0 {
             targetPopup.selectItem(at: 0)
@@ -331,7 +395,7 @@ final class SettingsWindowController: NSWindowController {
         apps.textColor = .secondaryLabelColor
         add(row(label: "Automatic detection", control: apps), to: root)
 
-        scopePopup.addItems(withTitles: ["Meeting window", "Entire screen"])
+        scopePopup.addItems(withTitles: ["Meeting window", "One display"])
         scopePopup.target = self
         scopePopup.action = #selector(scopeChanged)
         scopePopup.setAccessibilityLabel("Screen capture scope")
@@ -435,6 +499,22 @@ final class SettingsWindowController: NSWindowController {
         loginSettingsButton.target = self
         loginSettingsButton.action = #selector(loginSettingsClicked)
         add(loginSettingsButton, to: root)
+        add(separator(), to: root)
+        updatesSection.orientation = .vertical
+        updatesSection.alignment = .leading
+        updatesSection.spacing = 6
+        updateButton.target = self
+        updateButton.action = #selector(checkForUpdates)
+        updateButton.setAccessibilityIdentifier("quill-check-for-updates")
+        add(row(label: "Software updates", control: updateButton), to: updatesSection)
+        updateStatus.setAccessibilityIdentifier("quill-update-status")
+        add(detail(updateStatus), to: updatesSection)
+        updateStatus.isHidden = true
+        updateActions.addArrangedSubview(NSButton(title: "Installation Guide", target: self, action: #selector(openUpdateGuide)))
+        updateActions.addArrangedSubview(NSButton(title: "Download Source", target: self, action: #selector(downloadUpdateSource)))
+        updatesSection.addArrangedSubview(updateActions)
+        updateActions.isHidden = true
+        add(updatesSection, to: root)
     }
 
     private func add(_ view: NSView, to stack: NSStackView) {
@@ -484,14 +564,19 @@ final class SettingsWindowController: NSWindowController {
 
     @objc private func targetChanged() {
         guard state.includeScreenVideo, !state.isRecording, !state.isPaused, !state.captureTargetsLoading,
-              let target = targetPopup.selectedItem?.representedObject as? String else { return }
+              let item = targetPopup.selectedItem, item.isEnabled, let target = item.representedObject as? String else { return }
         onCaptureTargetChange?(target)
         update(state)
     }
 
     @objc private func refreshClicked() {
         guard state.includeScreenVideo, !state.isRecording, !state.isPaused, !state.captureTargetsLoading else { return }
-        onRefreshCaptureTargets?()
+        onRefreshCaptureTargets?(true)
+    }
+
+    @objc private func displayConfigurationChanged() {
+        guard window?.isVisible == true, state.includeScreenVideo, !state.isRecording, !state.isPaused else { return }
+        onRefreshCaptureTargets?(false)
     }
 
     @objc private func screenVideoChanged() {

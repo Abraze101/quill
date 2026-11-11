@@ -427,17 +427,9 @@ def _identity_form(server, record):
     return body
 
 
-def _folder_label(company):
-    viewer_count = len(company.get("drive_reader_emails", []))
-    if viewer_count:
-        noun = "viewer" if viewer_count == 1 else "viewers"
-        return f'{company["name"]} ({viewer_count} {noun})'
-    return company["name"]
-
-
 def _folder_body(server, record, index):
     suggestion = record["suggestion"]
-    suggested = next((_folder_label(company) for company in record["companies"]
+    suggested = next((company["name"] for company in record["companies"]
                       if company["id"] == suggestion["company_id"]), "Needs your choice")
     body = '<div class="suggestion"><p class="suggestion-title"><strong>Suggested folder:</strong> ' + _escape(suggested) + '</p>'
     body += '<p>' + _escape(suggestion["reason"]) + '</p></div>'
@@ -447,7 +439,7 @@ def _folder_body(server, record, index):
     body += '<label for="company-' + str(index) + '">Meeting folder</label>'
     body += '<select required name="company_id" id="company-' + str(index) + '"><option value="">Choose a folder…</option>'
     for company in record["companies"]:
-        body += '<option value="' + _escape(company["id"]) + '">' + _escape(_folder_label(company)) + '</option>'
+        body += '<option value="' + _escape(company["id"]) + '">' + _escape(company["name"]) + '</option>'
     body += '</select><div><button name="action" value="approve">Use this folder</button>'
     body += '<button name="action" value="skip" formnovalidate>Keep local</button></div></form>'
     body += '<p class="muted">Keep local saves this meeting on your Mac without filing it in Drive.</p>'

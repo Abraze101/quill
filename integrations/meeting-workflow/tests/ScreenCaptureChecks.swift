@@ -4,7 +4,8 @@ import Foundation
 enum ScreenCaptureChecks {
     @MainActor
     static func main() async throws {
-        for target in [ScreenCaptureTarget.window(id: 123, ownerPID: 456), .display(id: 789)] {
+        try displaySelection()
+        for target in [ScreenCaptureTarget.window(id: 123, ownerPID: 456), .display(id: 789), .display(id: 789, uuid: UUID())] {
             let encoded = try JSONEncoder().encode(target)
             let decoded = try JSONDecoder().decode(ScreenCaptureTarget.self, from: encoded)
             precondition(decoded == target)
@@ -152,7 +153,37 @@ enum ScreenCaptureChecks {
             precondition(!ScreenVideoIntegrity.coversRecording(duration: invalid, videoStart: 0, videoDuration: 149))
             precondition(!ScreenVideoIntegrity.coversRecording(duration: 149, videoStart: 0, videoDuration: invalid))
         }
-        print("20 screen-capture checks passed (no capture or permission requests)")
+        print("Screen-capture checks passed, including multiple displays and reconnects (no capture or permission requests)")
+    }
+
+    static func displaySelection() throws {
+        let frame = CGRect(x: 0, y: 0, width: 1920, height: 1080)
+        let selected = ScreenCaptureDisplay(id: 3, uuid: UUID(), name: "Studio Display",
+                                           frame: frame.offsetBy(dx: -1920, dy: 0), isMain: false)
+        let other = ScreenCaptureDisplay(id: 5, uuid: UUID(), name: "Studio Display", frame: frame, isMain: true)
+        let choices = ScreenCaptureDisplay.choices(from: [other, selected])
+        precondition(choices.map(\.target) == [selected.target, other.target])
+        precondition(choices.map(\.title) == ["Studio Display (Left) · 1920 × 1080",
+                                             "Studio Display (Right) · Main · 1920 × 1080"])
+        precondition(choices[0].bounds.left == -1920)
+        precondition(selected.target.matchesSelection(selected.target.identifier))
+        precondition(selected.target.matchesSelection("display:3"))
+        precondition(!other.target.matchesSelection("display:3"))
+        precondition(!selected.target.matchesSelection(other.target.identifier))
+
+        let reconnected = ScreenCaptureDisplay(id: 8, uuid: selected.uuid, name: selected.name,
+                                               frame: frame.offsetBy(dx: 200, dy: 1080), isMain: false)
+        let reusedID = ScreenCaptureDisplay(id: 3, uuid: other.uuid, name: other.name, frame: frame, isMain: true)
+        let reconfigured = [reconnected, reusedID]
+        precondition(ScreenCaptureDisplay.id(for: selected.target, in: reconfigured) == 8)
+        precondition(ScreenCaptureDisplay.id(for: selected.target, in: [reusedID]) == nil)
+        precondition(ScreenCaptureDisplay.id(for: selected.target, in: [selected, reconnected]) == nil)
+        let stacked = ScreenCaptureDisplay.choices(from: reconfigured)
+        precondition(stacked.map(\.title) == ["Studio Display (Top) · Main · 1920 × 1080",
+                                             "Studio Display (Bottom) · 1920 × 1080"])
+        let legacy = try JSONDecoder().decode(ScreenCaptureTarget.self, from: Data(#"{"display":{"id":3}}"#.utf8))
+        precondition(legacy.identifier == "display:3" && selected.target.matchesSelection(legacy.identifier))
+        precondition(ScreenCaptureTarget.window(id: 3, ownerPID: 9).identifier == "window:3:9")
     }
 }
 

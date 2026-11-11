@@ -184,6 +184,43 @@ extension AppController {
         }
     }
 
+    static func chosenDisplayFollowsManualAndAutomaticStarts() async throws {
+        try await withFixture { app in
+            let builtIn = UUID(), external = UUID()
+            let firstTarget = ScreenCaptureTarget.display(id: 2, uuid: external)
+            Fixture.screenEnabled = true
+            Fixture.screenSelection = "display:2"
+            Fixture.displays = [.display(id: 1, uuid: builtIn), firstTarget]
+            app.requestStart()
+            try await waitFor { app.phase == .recording }
+            precondition(Fixture.screenRecorders.last?.startedTarget == firstTarget)
+            precondition(Fixture.screenSelection == firstTarget.identifier,
+                         "A previous numeric selection must be pinned to the matched display")
+            app.requestStop(manually: true)
+            try await waitFor { app.phase == .idle }
+
+            let reconnected = ScreenCaptureTarget.display(id: 9, uuid: external)
+            Fixture.displays = [.display(id: 2, uuid: builtIn), reconnected]
+            app.meetingAutomation.join("external-display-meeting")
+            try await waitFor { app.phase == .recording }
+            precondition(Fixture.screenRecorders.last?.startedTarget == reconnected)
+            app.requestStop(manually: true)
+            try await waitFor { app.phase == .idle }
+
+            Fixture.displays = [.display(id: 2, uuid: builtIn)]
+            app.requestStart()
+            try await waitFor { app.phase == .idle && app.screenError != nil }
+            precondition(Fixture.screenRecorders.count == 2 && Fixture.micStarts == 2,
+                         "An unrelated display must not stand in for the missing selection")
+
+            Fixture.screenSelection = "display:2"
+            app.refreshCaptureTargets(requestPermission: true)
+            try await waitFor { !app.captureLoading }
+            precondition(Fixture.screenSelection == Fixture.displays[0].identifier,
+                         "Listing displays in Settings must pin an existing selection before recording")
+        }
+    }
+
     static func recoveredSystemAudioNeedsReview() async throws {
         try await withFixture { app in
             app.requestStart()
@@ -667,6 +704,7 @@ private struct AppSleepChecks {
         try await AppController.meetingContextIsBoundToRecording()
         try await AppController.ambiguousMeetingContextIsOmitted()
         try await AppController.contextFreeRemoteMicrophoneOwner()
+        try await AppController.chosenDisplayFollowsManualAndAutomaticStarts()
         try await AppController.warningHistoryDoesNotControlCapture()
         try await AppController.warningHistoryIncludesFailedStartup()
         try await AppController.crashCheckpointAndRestartReview()
@@ -699,7 +737,7 @@ private struct AppSleepChecks {
         try await AppController.failedAutomaticStartCanBeManuallyStartedAfterAutomationDisabled()
         try await AppController.transcriptionRetryRequestGuards()
         try await AppController.transcriptionRetrySuppressesLateAlerts()
-        print("App sleep/recovery/pause/reminder/retry/warning integration checks passed (35 production-coordinator scenarios; no devices, UI, user configuration, or external processing).")
+        print("App display selection, sleep, recovery, pause, reminders, retries, and warning checks passed using isolated fixtures.")
     }
 }
 

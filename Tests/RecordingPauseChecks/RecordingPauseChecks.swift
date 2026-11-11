@@ -140,13 +140,15 @@ private enum RecordingPauseChecks {
             return 100
         })
         let url = root.appendingPathComponent("transition.mp4")
-        try await recorder.start(target: .display(id: 0), writingTo: url, timeline: timeline)
+        let selectedDisplay = ScreenCaptureTarget.display(id: 4, uuid: UUID())
+        try await recorder.start(target: selectedDisplay, writingTo: url, timeline: timeline)
         precondition(recorder.isRecording)
         timeline.pause(at: 102)
         try await recorder.pause()
         precondition(!recorder.isRecording && !recorder.needsCleanup && joins == 0)
         precondition(segments[0].stopCount == 1)
         try await recorder.resume()
+        precondition(segments.map(\.target) == [selectedDisplay, selectedDisplay], "Resume must keep the chosen display's UUID")
         precondition(recorder.isRecording && timeline.isPaused, "Audio resumed before UI coordinator committed resume")
         timeline.resume(at: 105)
         timeline.pause(at: 107)
@@ -280,6 +282,7 @@ private enum RecordingPauseChecks {
 
 @MainActor
 private final class FakeSegment: ScreenVideoSegmentCapture {
+    var target: ScreenCaptureTarget?
     var onFailure: ((String) -> Void)?
     var onCleanup: (() -> Void)?
     var isRecording = false
@@ -293,6 +296,7 @@ private final class FakeSegment: ScreenVideoSegmentCapture {
     private var waiting: CheckedContinuation<Void, Never>?
     private var url: URL?
     func start(target: ScreenCaptureTarget, writingTo url: URL, validateStart: (() throws -> Void)?) async throws {
+        self.target = target
         self.url = url
         needsCleanup = true
         if blockStart { await withCheckedContinuation { waiting = $0 } }

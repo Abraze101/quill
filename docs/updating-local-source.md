@@ -5,6 +5,43 @@ completion workflow. Keep reviewed source in Git, and save the working software
 before an update. A source commit alone does not preserve the signed installed
 app, browser host or local configuration.
 
+## Install the update shown in Quill
+
+Choose **Check for Updates…** to compare your installed version and build with
+the version on `Abraze101/quill`’s `main` branch. When an update is available,
+the source ZIP and the guide in the result both point to the exact commit Quill
+checked.
+
+1. Finish any recording and processing, quit Quill, and close the Processing
+   Center. Open Terminal in the original Quill source folder. The installed app,
+   completion worker and Chrome extension use that folder. You can unpack the
+   ZIP elsewhere to inspect it.
+2. Run `git status --short --branch` and [save a recovery checkpoint](#save-the-working-installation-first).
+   If you have local edits or commits of your own, [review the changes in a separate checkout](#prepare-an-update-without-changing-the-working-copy).
+3. For a clean checkout of this fork on `main`, copy the 40-character commit ID
+   from the ZIP name or from the guide’s address after `/blob/`. Run the
+   commands below, replacing `COMMIT_ID` with that value. If Git reports a
+   conflict or cannot fast-forward, use the separate-checkout procedure above.
+
+   ```sh
+   quill_revision=COMMIT_ID
+   git fetch https://github.com/Abraze101/quill.git "$quill_revision" &&
+     git merge --ff-only "$quill_revision"
+   ```
+
+4. From the same folder, build and install using your existing signing
+   certificate. The installer retains the previous signed app. Open **About
+   Quill…** to confirm the version and build.
+
+   ```sh
+   sh scripts/build-preview-app.sh &&
+     sh scripts/install-app.sh &&
+     open /Applications/Quill.app
+   ```
+
+If the update changes Chrome or the completion workflow, see the
+[component-specific steps](#prepare-an-update-without-changing-the-working-copy).
+
 ## Save the working installation first
 
 Inspect `git status --short` and recent commits. Preserve tracked edits and
@@ -54,8 +91,11 @@ processing. Keep the existing certificate, bundle identifier and installed app
 path. The [packaging and installation guide](meeting-workflow.md#opening-and-updating-the-installed-app)
 explains the guarded app replacement.
 
-Before packaging a changed native app, increment `CFBundleVersion` in
-`Sources/quill/Info.plist`. Use `CFBundleShortVersionString` for the derivative's
+Before publishing an update that should appear in **Check for Updates…**,
+increment `CFBundleVersion` in `Sources/quill/Info.plist`. This also applies
+when the only changes are in the workflow or Chrome extension. Commits with
+the same version and build produce the same update result. Use
+`CFBundleShortVersionString` for the derivative's
 feature or maintenance version; the first explicitly versioned release build is
 **0.1.0 (2)**. Packaging requires a numeric `major.minor.patch` version and a
 positive build number, and always compiles with `-c release`. Check the installed

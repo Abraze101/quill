@@ -13,6 +13,8 @@ enum Fixture {
     static var stopGate = Gate(open: true)
     static var screenEnabled = false
     static var captureCatalogUnavailable = false
+    static var screenSelection = "display:1"
+    static var displays = [ScreenCaptureTarget.display(id: 1)]
     static var automationEnabled = true
     static var screenPauseGate = Gate(open: true)
     static var screenResumeGate = Gate(open: true)
@@ -45,6 +47,8 @@ enum Fixture {
         startGate = Gate(open: true)
         stopGate = Gate(open: true)
         screenEnabled = false; captureCatalogUnavailable = false; automationEnabled = true
+        screenSelection = "display:1"
+        displays = [.display(id: 1)]
         screenPauseGate = Gate(open: true); screenResumeGate = Gate(open: true)
         screenRecorders = []
         micStarts = 0; micStops = 0; systemStarts = 0; systemStops = 0
@@ -215,6 +219,7 @@ final class MenuBarController {
     var onRetryTranscriptions: (() -> Void)?
     var onCancelTranscription: ((String, UUID) -> Void)?
     var onSettings: (() -> Void)?
+    var onCheckForUpdates: (() -> Void)?
     var onReviewMeetings: (() -> Void)?
     var onShowControls: (() -> Void)?
     var onWarningHistory: (() -> Void)?
@@ -234,7 +239,7 @@ final class SettingsWindowController {
     var onIncludeScreenVideoChange: ((Bool) -> Void)?
     var onCaptureScopeChange: ((QuillCaptureScope) -> Void)?
     var onCaptureTargetChange: ((String) -> Void)?
-    var onRefreshCaptureTargets: (() -> Void)?
+    var onRefreshCaptureTargets: ((Bool) -> Void)?
     var onTranscriptionChange: ((Bool) -> Void)?
     var onSpeakerIdentificationChange: ((Bool) -> Void)?
     var onSetupConnection: ((QuillConnection) -> Void)?
@@ -251,6 +256,7 @@ final class SettingsWindowController {
     var window: NSWindow? { nil }
     func update(_ state: QuillSettingsState) {}
     func show() { preconditionFailure("Unexpected settings UI") }
+    func showUpdates() { preconditionFailure("Unexpected update check") }
     func chooseDriveAccount(_ accounts: [DriveAccountChoice], currentEmail: String?, completion: @escaping (DriveAccountChoice?) -> Void) {
         preconditionFailure("Sleep checks must not open account setup")
     }
@@ -341,13 +347,16 @@ enum Config {
     static func completionWorkerCommand() -> [String]? { nil }
     static func meetingReviewCommand() -> [String]? { nil }
     static func screenCaptureScope() -> String { Fixture.screenEnabled ? "display" : "window" }
-    static func screenCaptureSelection() -> String { Fixture.screenEnabled ? "display:1" : "automatic" }
+    static func screenCaptureSelection() -> String { Fixture.screenEnabled ? Fixture.screenSelection : "automatic" }
     static func setRecordingCheckInHours(_ value: Int) throws { preconditionFailure("Unexpected setting change") }
     static func setShowInDock(_ value: Bool) throws { preconditionFailure("Unexpected setting change") }
     static func setMeetingAutomationEnabled(_ value: Bool) throws { preconditionFailure("Unexpected setting change") }
     static func setScreenVideoEnabled(_ value: Bool) throws { preconditionFailure("Unexpected setting change") }
     static func setScreenCaptureScope(_ value: String) throws { preconditionFailure("Unexpected setting change") }
     static func setScreenCaptureSelection(_ value: String) throws { preconditionFailure("Unexpected setting change") }
+    static func pinScreenCaptureDisplay(_ selection: String, to identifier: String) throws {
+        if Fixture.screenEnabled, Fixture.screenSelection == selection { Fixture.screenSelection = identifier }
+    }
     static func setTranscriptionEnabled(_ value: Bool) throws { preconditionFailure("Unexpected setting change") }
     static func setSpeakerIdentificationEnabled(_ value: Bool) throws { preconditionFailure("Unexpected setting change") }
 }
@@ -453,9 +462,6 @@ final class MeetingAutomationController {
     }
 }
 
-enum ScreenCaptureTarget { case window(id: UInt32, ownerPID: Int32), display(id: UInt32) }
-struct ScreenCaptureBounds { let left, top, width, height: Double }
-struct ScreenCaptureChoice { let target: ScreenCaptureTarget; let title: String; let bounds: ScreenCaptureBounds }
 enum ScreenVideoError: Error { case cancelled, targetUnavailable }
 @MainActor
 enum ScreenCaptureCatalog {
@@ -465,8 +471,8 @@ enum ScreenCaptureCatalog {
                 userInfo: [NSLocalizedDescriptionKey: "The selected display is unavailable."])
         }
         precondition(Fixture.screenEnabled, "Unexpected screen capture discovery")
-        return [ScreenCaptureChoice(target: .display(id: 1), title: "Synthetic display",
-            bounds: ScreenCaptureBounds(left: 0, top: 0, width: 640, height: 480))]
+        return Fixture.displays.map { ScreenCaptureChoice(target: $0, title: "Synthetic display",
+            bounds: ScreenCaptureBounds(CGRect(x: 0, y: 0, width: 640, height: 480))) }
     }
 }
 @MainActor
@@ -475,6 +481,7 @@ final class ScreenVideoRecorder {
     var onCleanup: (() -> Void)?
     private(set) var isRecording = false
     private(set) var didStart = false
+    private(set) var startedTarget: ScreenCaptureTarget?
     private(set) var needsCleanup = false
     private(set) var startedAt: Date?
     private(set) var pauses = 0
@@ -491,6 +498,7 @@ final class ScreenVideoRecorder {
                validateStart: () throws -> Void) async throws {
         precondition(Fixture.screenEnabled, "Unexpected screen recording")
         try validateStart()
+        startedTarget = target
         destination = url
         try Data("synthetic screen fixture".utf8).write(to: url)
         startedAt = Date()

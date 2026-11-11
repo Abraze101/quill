@@ -27,6 +27,10 @@ for name, marker in [
     prefix, found, _ = source.partition(marker)
     assert found and prefix.rstrip().endswith('@MainActor'), name
     models.append(prefix.rsplit('@MainActor', 1)[0])
+catalog = Path('Sources/quill/ScreenCapture/ScreenCaptureCatalog.swift').read_text()
+capture_models, found, _ = catalog.partition('enum ScreenVideoError:')
+assert found
+models.append(capture_models)
 (out / 'DisplayModels.swift').write_text('\n'.join(models))
 (out / 'AppControllerChecks.swift').write_text(
     Path('Sources/quill/AppController.swift').read_text() + '\n' +

@@ -187,19 +187,23 @@ class ReviewServerTests(unittest.TestCase):
         self.assertEqual(self.reviews.get("test-job")["approved_route"]["drive_folder_id"],
                          "folder-general-001")
 
-    def test_shared_destination_shows_viewer_count_before_filing(self):
+    def test_shared_destination_uses_only_the_folder_name_before_filing(self):
         sales = {"id": "sales", "name": "Agency / Sales", "drive_folder_id": "folder-sales-001",
                  "drive_folder_path": [{"name": "Agency", "drive_folder_id": "folder-agency-001"},
                                        {"name": "Sales", "drive_folder_id": "folder-sales-001"}],
                  "drive_reader_emails": ["viewer1@example.com", "viewer2@example.com"]}
-        self.reviews.propose("sales-job", self.transcript, self.companies + [sales],
-                             dict(self.suggestion, company_id="sales"))
+        record = self.reviews.propose("sales-job", self.transcript, self.companies + [sales],
+                                     dict(self.suggestion, company_id="sales"))
         status, _, body = self.detail("sales-job")
         self.assertEqual(status, 200)
-        self.assertIn("Suggested folder:</strong> Agency / Sales (2 viewers)", body)
-        self.assertIn('<option value="sales">Agency / Sales (2 viewers)</option>', body)
+        self.assertIn("Suggested folder:</strong> Agency / Sales</p>", body)
+        self.assertIn('<option value="sales">Agency / Sales</option>', body)
         self.assertIn("Drive files inherit folder access.", body)
         self.assertNotIn("viewer1@example.com", body)
+        status, _, _ = self.decide(job="sales-job", revision=record["revision"], company_id="sales")
+        self.assertEqual(status, 303)
+        self.assertEqual(self.reviews.get("sales-job")["approved_route"]["drive_reader_emails"],
+                         sales["drive_reader_emails"])
 
     def test_post_requires_exact_host_and_origin(self):
         body = urlencode({"job": "test-job", "revision": self.record["revision"], "company_id": "health", "action": "approve"})

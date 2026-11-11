@@ -123,7 +123,8 @@ enum Config {
 
     static func screenCaptureSelection() -> String {
         let settings = load()?["screen_recording"] as? [String: Any]
-        return settings?[screenCaptureScope() == "display" ? "display" : "window"] as? String ?? "automatic"
+        let scope = settings?["scope"] as? String == "display" ? "display" : "window"
+        return settings?[scope] as? String ?? "automatic"
     }
 
     static func setMeetingAutomationEnabled(_ enabled: Bool) throws {
@@ -140,6 +141,13 @@ enum Config {
 
     static func setScreenCaptureSelection(_ selection: String) throws {
         try update(section: "screen_recording", values: [screenCaptureScope(): selection])
+    }
+
+    static func pinScreenCaptureDisplay(_ selection: String, to identifier: String) throws {
+        guard selection != identifier else { return }
+        // Discovery is asynchronous. A later user choice always wins.
+        try update(section: "screen_recording", values: ["display": identifier],
+                   ifMatching: ["scope": "display", "display": selection])
     }
 
     static func setTranscriptionEnabled(_ enabled: Bool) throws {
@@ -172,7 +180,7 @@ enum Config {
 
     /// Preserve unrelated settings; never replace malformed configuration with
     /// fresh defaults. UI actions report failures and reload the actual state.
-    private static func update(section: String, values: [String: Any]) throws {
+    private static func update(section: String, values: [String: Any], ifMatching expected: [String: String] = [:]) throws {
         let fm = FileManager.default
         var json: [String: Any] = [:]
         if fm.fileExists(atPath: path.path) {
@@ -183,6 +191,7 @@ enum Config {
             json = parsed
         }
         var settings = json[section] as? [String: Any] ?? [:]
+        guard expected.allSatisfy({ settings[$0.key] as? String == $0.value }) else { return }
         settings.merge(values) { _, new in new }
         json[section] = settings
         try fm.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)

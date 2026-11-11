@@ -3,7 +3,7 @@ import AppKit
 @main
 struct RecordingControlChecks {
     @MainActor
-    static func main() {
+    static func main() async {
         let app = NSApplication.shared
         app.setActivationPolicy(.prohibited)
         checkMeetingReminder()
@@ -12,6 +12,7 @@ struct RecordingControlChecks {
         checkTranscriptionCancellationMenus()
         checkWarningHistoryMenu()
         checkApplicationMenus()
+        await checkUpdateControls()
         let suiteName = "com.digimata.quill.control-tests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -263,6 +264,59 @@ struct RecordingControlChecks {
             "Warning recovery and action revisions must update immediately")
         expect(pause.isEnabled && stop.isEnabled && !panel.isVisible,
             "Clock checks must preserve functional controls without displaying a window")
+    }
+
+    @MainActor
+    static func checkUpdateControls() async {
+        let source = URL(string: "https://example.org/quill.zip")!
+        let guide = URL(string: "https://example.org/guide")!
+        var calls = 0, opened: [URL] = []
+        let settings = SettingsWindowController(lookupUpdate: {
+            calls += 1
+            switch calls {
+            case 1: return .available(installed: "0.1.15 (18)", published: "0.1.17 (20)", source: source, guide: guide)
+            case 2: throw URLError(.notConnectedToInternet)
+            case 3: return .current(version: "0.1.17 (20)")
+            default: return .localNewer(installed: "0.1.18 (21)", published: "0.1.17 (20)")
+            }
+        }, openUpdateURL: { opened.append($0); return true })
+        let content = settings.window!.contentView!
+        let check = allViews(content).compactMap { $0 as? NSButton }.first { $0.title == "Check for Updates…" }!
+        var state = QuillSettingsState()
+        state.isRecording = true
+        settings.update(state)
+        expect(calls == 0 && check.isEnabled, "Updates must remain user-initiated and accessible while recording")
+        for index in 1...4 {
+            check.performClick(nil)
+            check.performClick(nil)
+            expect(!check.isEnabled, "A pending check must coalesce repeated clicks")
+            for _ in 0..<100 where !check.isEnabled { await Task.yield() }
+            expect(check.isEnabled && calls == index, "Each completed check must permit another check")
+            let views = allViews(content)
+            let status = views.compactMap { $0 as? NSTextField }.first { $0.accessibilityIdentifier() == "quill-update-status" }!
+            if index == 1 {
+                expect(status.stringValue.contains("0.1.17 (20) is available") && status.stringValue.contains("source"),
+                       "Describe the source update and its version")
+                for title in ["Installation Guide", "Download Source"] {
+                    views.compactMap { $0 as? NSButton }.first { $0.title == title }!.performClick(nil)
+                }
+                expect(opened == [guide, source], "Open only the requested guide or source URL")
+            } else {
+                let expected = ["Couldn’t check for updates.", "up to date", "Your version is newer."]
+                expect(status.stringValue.contains(expected[index - 2]), "Distinguish failed, current, and locally newer checks")
+                expect(!views.contains { ($0 as? NSButton)?.title == "Download Source" && !$0.isHiddenOrHasHiddenAncestor },
+                       "An earlier download must disappear when there is no available update")
+            }
+        }
+        for layout in [MenuBarController.Layout.statusItem, .application] {
+            let controller = MenuBarController(layout: layout)
+            let menu = layout == .statusItem ? controller.menu : controller.menu.item(withTitle: "Quill")!.submenu!
+            let item = menu.item(withTitle: "Check for Updates…")!
+            var invoked = 0
+            controller.onCheckForUpdates = { invoked += 1 }
+            expect(NSApp.sendAction(item.action!, to: item.target, from: item) && invoked == 1,
+                   "Both menus must dispatch Check for Updates")
+        }
     }
 
     @MainActor
@@ -690,6 +744,33 @@ struct RecordingControlChecks {
         precondition(changedVideo && screen.state == .on)
         precondition(scope.isEnabled && target.isEnabled && refresh.isEnabled)
         precondition(record.title == "Start audio + screen")
+
+        state.captureTargets = [.init(identifier: "display:built-in", label: "Built-in Display · Main"),
+                                .init(identifier: "display:desk", label: "Desk Display")]
+        state.selectedCaptureTargetID = nil
+        controller.update(state)
+        precondition(scope.selectedItem?.title == "One display" && target.title == "Select a display…")
+        var selectedDisplays: [String] = []
+        controller.onCaptureTargetChange = { id in
+            selectedDisplays.append(id)
+            state.selectedCaptureTargetID = id
+            controller.update(state)
+        }
+        target.selectItem(withTitle: "Desk Display")
+        precondition(NSApp.sendAction(target.action!, to: target.target, from: target))
+        precondition(selectedDisplays == ["display:desk"] && target.title == "Desk Display")
+
+        state.captureTargets.removeLast()
+        controller.update(state)
+        precondition(target.title == "Selected display is unavailable")
+        precondition(selectedDisplays == ["display:desk"], "Unplugging must never select a replacement")
+        state.captureTargets.insert(.init(identifier: "display:desk", label: "Desk Display"), at: 0)
+        controller.update(state)
+        precondition(target.title == "Desk Display", "Reconnect must restore the chosen display regardless of list order")
+        state.captureTargets.append(.init(identifier: "display:desk", label: "Second Desk Display"))
+        controller.update(state)
+        precondition(target.title == "Displays share the same identifier")
+        precondition(target.itemArray.filter { $0.representedObject as? String == "display:desk" }.allSatisfy { !$0.isEnabled })
 
         // A failed settings save must render the persisted state again; it
         // cannot leave a checked control that never took effect.

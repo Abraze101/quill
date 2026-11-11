@@ -228,6 +228,12 @@ changes to Cancel during startup and Stop after capture is confirmed. Capture
 choices lock during recording. Pause keeps one session and excludes paused time
 from saved media; final video joining can extend the saving phase.
 
+To record one monitor on a multi-display Mac, open **Settings**, enable
+**Include screen video**, set **Capture** to **One display**, and pick a monitor
+under **Display**. Quill remembers the choice for manual and automatic recordings.
+If the selected monitor is unavailable before a recording, reconnect it or choose
+another display in Settings.
+
 Window capture requires an explicitly selected native Chrome window. Automatic
 starts also check that selection against the detected meeting window. Geometry
 alone never selects a target. Keep the meeting in its own Chrome window so other
