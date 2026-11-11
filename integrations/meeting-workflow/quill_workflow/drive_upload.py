@@ -297,8 +297,11 @@ class DriveUploader:
         return media and self.large_upload is not None
 
     def _call(self, name, arguments):
-        from .codex_drive_transport import DriveTimeoutError
         self.guard()
+        return self._invoke(name, arguments)
+
+    def _invoke(self, name, arguments):
+        from .codex_drive_transport import DriveTimeoutError
         try:
             result = self.invoke(name, arguments)
         except DriveTimeoutError as error:
@@ -543,6 +546,20 @@ class DriveUploader:
                 meeting["owner"] = journal["owner"]
                 atomic_json(meeting_path, meeting)
 
+            def dispatch(operation, tool, arguments):
+                # A local guard rejection cannot have sent a Drive request.
+                # Persist the intent only after it passes, before any remote I/O.
+                self.guard()
+                operation.update(state="dispatched", dispatched_at=time.time())
+                save()
+                try:
+                    return self._invoke(tool, arguments)
+                except Exception as error:
+                    if getattr(error, "outcome_unknown", True) is False:
+                        operation["state"] = "planned"
+                        save()
+                    raise
+
             self.guard()
             root = self._metadata(self.root_id)
             owner = self._verify_access(root, meeting["owner"] or journal["owner"], mime=FOLDER_MIME)
@@ -617,18 +634,8 @@ class DriveUploader:
                 validate_ancestors()
                 self._verify(known, op["parent"], op["name"], owner, DOCUMENT_MIME,
                              reader_emails=reader_emails)
-                fill.update(state="dispatched", dispatched_at=time.time())
-                save()
-                try:
-                    self._call("batch_update_document", {"document_id": known, "requests": fill["requests"],
-                               "write_control": {"requiredRevisionId": fill["revision"]}})
-                except Exception as error:
-                    if getattr(error, "outcome_unknown", True) is False:
-                        fill["state"] = "planned"
-                        save()
-                    # Keep the saved ID and plan. The next attempt must read
-                    # back this exact document before deciding whether to edit.
-                    raise
+                dispatch(fill, "batch_update_document", {"document_id": known, "requests": fill["requests"],
+                             "write_control": {"requiredRevisionId": fill["revision"]}})
                 fill.update(state="acknowledged", acknowledged_at=time.time())
                 save()
                 actual = self._call("get_document", {"document_id": known})
@@ -713,6 +720,11 @@ class DriveUploader:
                     if needs_remote_id:
                         raise UploadNeedsReview(unknown_message)
                     if not ids:
+                        if key == "stage":
+                            raise UploadRetryable(
+                                f'Drive has not confirmed the "{name}" folder. After automatic retries finish, '
+                                f'check the meeting folder at https://drive.google.com/drive/folders/{parent}. '
+                                f'If "{name}" is missing, create it there, then retry this meeting.')
                         raise UploadRetryable("Waiting to confirm a previous Drive write; it will not be blindly repeated")
                     known = ids[0]
                     op.update(id=known, reconciled=True)
@@ -740,15 +752,10 @@ class DriveUploader:
                     # Searches and hashing can take time. Check the chain again
                     # immediately before dispatching the mutation.
                     validate_ancestors()
-                    op.update(state="dispatched", dispatched_at=time.time())
-                    save()
                     try:
-                        result = self._call(tool, arguments)
+                        result = dispatch(op, tool, arguments)
                     except Exception as error:
-                        if getattr(error, "outcome_unknown", True) is False:
-                            op["state"] = "planned"
-                            save()
-                        elif needs_remote_id:
+                        if needs_remote_id and op["state"] == "dispatched":
                             raise UploadNeedsReview(unknown_message) from error
                         raise
                     if result.get("success") is not True or not result.get("id"):

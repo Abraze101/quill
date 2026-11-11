@@ -386,12 +386,27 @@ class _RPC:
         self.dispatched = False
         self.done = False
         self.outgoing = bytearray()
+        self.bytes_before_tool_call = None
         self.queue({"id": 1, "method": "initialize", "params": {
             "clientInfo": {"name": "quill_drive_transport", "version": "0.1.0"},
             "capabilities": {"experimentalApi": True}}})
 
     def queue(self, message):
+        if message.get("method") == "mcpServer/tool/call":
+            self.bytes_before_tool_call = len(self.outgoing)
         self.outgoing.extend((_json(message) + "\n").encode("utf-8"))
+
+    def write_pending(self, descriptor):
+        # Keep any pending setup bytes in a separate write. A queued tool
+        # call is still unsent until its own first pipe write is attempted.
+        limit = min(8192, self.bytes_before_tool_call) if self.bytes_before_tool_call else 8192
+        data = self.outgoing[:limit]
+        if self.bytes_before_tool_call == 0:
+            self.dispatched = True  # A partial or interrupted write is uncertain.
+        count = os.write(descriptor, data)
+        del self.outgoing[:count]
+        if self.bytes_before_tool_call:
+            self.bytes_before_tool_call -= count
 
     def consume(self, line):
         try:
@@ -442,9 +457,6 @@ class _RPC:
                 "threadId": self.thread, "server": "codex_apps",
                 "tool": "google_drive." + self.tool, "arguments": self.arguments}})
             self.expected_id = 3
-            # Mark before writing the request to the pipe. Interrupted pipe
-            # writes can still reach the server and cannot be blindly retried.
-            self.dispatched = True
         else:
             self.result = _native_result(result, self.tool, self.arguments)
             self.done = True
@@ -530,10 +542,9 @@ def _stream(process, rpc, timeout, max_output_bytes, cancelled=None):
                 pipe, label = key.fileobj, key.data
                 if label == "stdin":
                     try:
-                        count = os.write(pipe.fileno(), rpc.outgoing[:8192])
+                        rpc.write_pending(pipe.fileno())
                     except BrokenPipeError as error:
                         raise DriveOperationError("Codex app-server closed its request stream") from error
-                    del rpc.outgoing[:count]
                     if not rpc.outgoing:
                         selector.unregister(pipe)
                         writing = False

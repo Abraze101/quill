@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from quill_workflow.codex_drive_transport import (
     CONNECTOR, CodexDriveTransport, DriveOperationError, DriveProtocolError,
-    DriveTimeoutError, DriveTransportError, _native_result, command, invoke, validate_arguments,
+    DriveTimeoutError, DriveTransportError, _RPC, _native_result, command, invoke, validate_arguments,
 )
 from quill_workflow.codex_file_upload import _UploadEvents, request, run_upload, upload_command
 
@@ -444,6 +444,51 @@ class CodexDriveTransportTests(unittest.TestCase):
         with self.assertRaises(DriveProtocolError) as caught:
             invoke("create_folder", args, executable=self.fake(thread={"thread": {"id": "persistent", "ephemeral": False}}))
         self.assertFalse(caught.exception.outcome_unknown)
+
+    def test_cancel_after_tool_request_is_queued_but_before_pipe_write_is_known_unsent(self):
+        queued = False
+        original = _RPC.queue
+
+        def observe_queue(rpc, message):
+            nonlocal queued
+            original(rpc, message)
+            if message.get("method") == "mcpServer/tool/call":
+                queued = True
+
+        transport = CodexDriveTransport(executable=self.fake(), cancelled=lambda: queued)
+        with patch.object(_RPC, "queue", observe_queue), self.assertRaises(DriveOperationError) as caught:
+            transport.invoke("create_folder", {"name": "Meeting", "parent_folder": "folder123"})
+        self.assertTrue(queued)
+        self.assertFalse(caught.exception.outcome_unknown)
+        self.assertEqual([request["method"] for request in self.requests()], ["initialize", "initialized", "thread/start"])
+
+    def test_tool_dispatch_starts_on_its_own_pipe_write_even_if_that_write_fails(self):
+        for first_count in (0, 7):
+            with self.subTest(first_count=first_count):
+                rpc = _RPC(self.root, "create_folder", {"name": "Meeting", "parent_folder": "folder123"})
+                rpc.consume(b'{"id":1,"result":{}}')
+                rpc.consume(b'{"id":2,"result":{"thread":{"id":"synthetic"}}}')
+                chunks = []
+
+                def write(descriptor, data):
+                    chunks.append(bytes(data))
+                    if len(chunks) == 1:
+                        return len(data)
+                    if len(chunks) == 2 and first_count:
+                        return first_count
+                    raise BrokenPipeError()
+
+                with patch("quill_workflow.codex_drive_transport.os.write", write):
+                    rpc.write_pending(1)
+                    self.assertFalse(rpc.dispatched)
+                    self.assertNotIn(b"mcpServer/tool/call", chunks[0])
+                    if first_count:
+                        rpc.write_pending(1)
+                        self.assertTrue(rpc.dispatched)
+                    with self.assertRaises(BrokenPipeError):
+                        rpc.write_pending(1)
+                    self.assertIn(b"mcpServer/tool/call", chunks[1])
+                    self.assertTrue(rpc.dispatched)
 
     def test_output_bounds_duplicate_json_and_malformed_json_fail_closed(self):
         for output in ("x" * 10000, '{"id":3,"id":4}\n', '{"id":3,"value":NaN}\n', "not-json\n"):

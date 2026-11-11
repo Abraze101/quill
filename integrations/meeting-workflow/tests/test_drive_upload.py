@@ -965,6 +965,51 @@ class DriveUploadTests(unittest.TestCase):
         self.upload()
         self.assertEqual(sum(item["title"] == self.folder_name for item in self.drive.items.values()), 1)
 
+    def test_local_guard_stops_before_notes_folder_is_marked_dispatched(self):
+        meeting = self.upload()["meeting_folder_id"]
+        searched_notes = False
+
+        def stop():
+            raise UploadNeedsReview("Local filing settings changed")
+
+        def arm_guard(tool, arguments):
+            nonlocal searched_notes
+            if tool == "search" and self.drive.search_target(arguments)[:2] == (meeting, "Notes"):
+                searched_notes = True
+            if searched_notes and tool == "get_file_metadata" and arguments["fileId"] == meeting:
+                self.uploader.guard = stop
+
+        self.drive.before = arm_guard
+        with self.assertRaisesRegex(UploadNeedsReview, "Local filing settings changed"):
+            self.upload("publish")
+        self.assertFalse(any(item["title"] == "Notes" for item in self.drive.items.values()))
+        self.drive.before = None
+        self.uploader.guard = lambda: None
+        self.assertEqual(self.upload("publish")["meeting_folder_id"], meeting)
+        self.assertEqual(sum(item["title"] == "Notes" for item in self.drive.items.values()), 1)
+
+    def test_missing_notes_folder_reports_its_parent_and_reconciles_after_repair(self):
+        meeting = self.upload()["meeting_folder_id"]
+
+        def lost_response(tool, arguments):
+            if tool == "create_folder" and arguments["name"] == "Notes":
+                self.drive.before = None
+                raise SimulatedTransportFailure()
+
+        self.drive.before = lost_response
+        with self.assertRaises(SimulatedTransportFailure):
+            self.upload("publish")
+        writes = list(self.drive.writes)
+        with self.assertRaises(UploadRetryable) as failure:
+            self.upload("publish")
+        self.assertIn('If "Notes" is missing', str(failure.exception))
+        self.assertIn("https://drive.google.com/drive/folders/" + meeting, str(failure.exception))
+        self.assertEqual(self.drive.writes, writes)
+        repaired = self.drive.add("restored_notes_123", "Notes", meeting, FOLDER_MIME)
+        receipt = self.upload("publish")
+        self.assertEqual(receipt["folder_id"], repaired)
+        self.assertEqual(sum(item["title"] == "Notes" for item in self.drive.items.values()), 1)
+
     def test_duplicate_matches_across_pages_require_review(self):
         def pages(parent, name, folder, arguments):
             if name != self.folder_name:

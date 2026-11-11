@@ -174,6 +174,12 @@ For legacy meeting names containing the full job ID, and for raw files within a 
 
 Folder discovery uses paginated exact-name searches, bounded at ten pages. File discovery lists the direct contents of the saved folder and matches the exact filename locally, covering JSON and media that the search connector can omit. It does not fetch file contents or recurse into subfolders. This listing has a 100-item cap and no pagination parameter, so 100 returned items require review rather than an assumption that the result is complete. Invalid listings and incomplete or repeated folder-search tokens also stop progress.
 
+If Quill cannot confirm creation of a `Notes` or `Recordings` subfolder, the
+processing message gives the expected name and the Drive URL of its parent
+meeting folder. Check that folder in Drive. If the subfolder is missing, create it there
+with the exact name and retry the meeting. Quill verifies the single matching
+subfolder, including its parent and permissions, before continuing.
+
 Ordinary connector failures use a maximum of six attempts, with waits of 30, 60, 120, 240, and 480 seconds between attempts. Transient media-transfer failures with a saved, reserved Drive ID keep retrying beyond that limit, with backoff capped at one hour while Quill is running. A review-required failure is held immediately. Worker termination unwinds the connector process and releases locks; the next worker recovers the interrupted task and consults its journal. Repeated worker crashes retain their separate bounded recovery policy. Completed stages retain their receipts and do not upload again merely because the worker restarts.
 
 Each receipt records local file sizes and SHA-256 hashes alongside Drive IDs, URLs when returned, and verification time. Raw-file readback checks the filename, parent, MIME type, size, and owner-only permissions. The connector's normalized metadata omits remote checksums, so raw-file receipts use `verification: "metadata"`; local hashes do not establish remote checksum equality. Native Google Docs have no meaningful DOCX byte-size equivalence. Their verification checks the native MIME type and permissions, then reads the full document and compares its text, in order, with every rendered paragraph after whitespace normalization. Missing notes or transcript text holds the stage for review. These receipts use `verification: "metadata_and_document_text"`. A reconciled response is marked in the file receipt. Cached completion receipts describe the verification performed at that time, not a fresh permission audit.
