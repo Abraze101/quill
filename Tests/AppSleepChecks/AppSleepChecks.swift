@@ -776,11 +776,15 @@ private func speakerActivitySessionChecks() async throws {
     defer { try? FileManager.default.removeItem(at: root) }
     Fixture.reset(root: root)
     Fixture.micCaptureOrigin = 0.5
-    Fixture.systemCaptureOrigin = 0.25
+    let systemOrigin = 0.25
+    Fixture.systemCaptureOrigin = systemOrigin
     let session = try RecordingSession(root: root, speakerIdentificationRequested: true)
     try await session.start()
-    let wall = Date()
-    let mono = RecordingCaptureTimeline.now
+    // Timestamp the synthetic browser samples and pauses from the same
+    // recording origin as the audio fixtures, regardless of startup latency.
+    let firstSystemBuffer = Fixture.systemRecorders.last!.firstBufferAt!
+    let wall = firstSystemBuffer.addingTimeInterval(-systemOrigin)
+    let mono = session.captureTimeline.startedAt
     let context = MeetingContext(provider: "google-meet", key: "abc-defg-hij", participants: [
         .init(name: "Jamie Rivera", isSelf: true)])
     func signal(name: String = "Jamie Rivera", source: String = "tab-A", key: String = "abc-defg-hij",
