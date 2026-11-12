@@ -74,9 +74,24 @@ def _directory(path, row, queue=None):
 def _verify_files(queue, job, path):
     from .drive_upload import file_identity
     manifest = read_json(queue.state / "recordings" / job / "manifest.json")
+    archive = queue.db.execute("SELECT settings FROM tasks WHERE job=? AND stage='archive'", (job,)).fetchone()
+    if archive and json.loads(archive["settings"]).get("deferred_transcript_inventory") is True:
+        completed = read_json(queue.state / "results" / job / "archive-input/manifest.json")
+        if (not isinstance(completed, dict) or "transcript.json" not in completed
+                or completed.keys() - manifest.keys() - {"transcript.json", "transcript.md"}
+                or any(completed.get(name) != expected for name, expected in manifest.items())):
+            raise WorkflowError("Completed archive inventory no longer matches the recording; naming needs review")
+        manifest = completed
     for name, expected in manifest.items():
         if file_identity(safe_member(path, name)) != expected:
             raise WorkflowError("Local recording changed since completion; naming needs review")
+    if "transcript.json" not in manifest and queue.db.execute(
+            "SELECT 1 FROM recording_handoffs WHERE job=? AND settled=1", (job,)).fetchone():
+        # A two-phase recording acquired its final transcript after the media
+        # snapshot. Its original must still agree with the source used for notes.
+        attached = queue.state / "results" / job / "input/transcript.json"
+        if read_json(safe_member(path, "transcript.json")) != read_json(attached):
+            raise WorkflowError("Local transcript changed since completion; naming needs review")
 
 
 def session_path(queue, job):

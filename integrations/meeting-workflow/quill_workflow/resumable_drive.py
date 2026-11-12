@@ -1,4 +1,4 @@
-"""Bounded, journaled Drive media uploads. Never edits permissions or existing files.
+"""Bounded, journaled Drive media uploads. Only staged uploads can change parent.
 
 Protocol: https://developers.google.com/workspace/drive/api/guides/manage-uploads
 Reserved IDs make a lost final response recoverable without another Drive file.
@@ -21,6 +21,7 @@ from .drive_upload import UploadNeedsReview, UploadRetryable, verified_permissio
 from .pipeline import NeedsConfiguration
 
 CHUNK_BYTES = 8 * 1024 * 1024
+CHUNK_ALIGNMENT = 256 * 1024
 MAX_RESPONSE_BYTES = 1024 * 1024
 API = "https://www.googleapis.com/drive/v3/files"
 UPLOAD_API = "https://www.googleapis.com/upload/drive/v3/files"
@@ -145,7 +146,8 @@ class ResumableDriveUploader:
             raise UploadRetryable("Google Drive upload was interrupted; it will resume later")
         raise UploadNeedsReview("Google Drive rejected the resumable upload; review its saved state")
 
-    def upload(self, *, source, file, parent, name, mime, owner, operation, save, guard, reader_emails=()):
+    def upload(self, *, source, file, parent, name, mime, owner, operation, save, guard, reader_emails=(),
+               prepare_only=False, staging_parent=None, before_filing=None):
         source = Path(source).absolute()
         _id(parent)
         if (not isinstance(file, dict) or type(file.get("size")) is not int or file["size"] <= 0
@@ -158,11 +160,16 @@ class ResumableDriveUploader:
                 or not isinstance(reader_emails, (list, tuple))
                 or any(not isinstance(email, str) for email in reader_emails)):
             raise UploadNeedsReview("The resumable upload identity is invalid")
+        upload_parent = _id(staging_parent) if staging_parent is not None else parent
+        if (prepare_only and (reader_emails or staging_parent is not None)
+                or staging_parent is not None and (parent == staging_parent or not callable(before_filing))):
+            raise UploadNeedsReview("Staged recordings require a private upload root and a separate approved destination")
         identity = {"source": str(source), "size": file["size"], "sha256": file["sha256"],
-                    "parent": parent, "name": name, "mime": mime, "owner": owner.casefold()}
+                    "parent": upload_parent, "name": name, "mime": mime, "owner": owner.casefold()}
         if reader_emails:
             reader_emails = sorted(email.casefold() for email in reader_emails)
-            identity["reader_emails"] = reader_emails
+            if staging_parent is None:
+                identity["reader_emails"] = reader_emails
         deadline = self.clock() + self.deadline_seconds
         guard()
         try:
@@ -249,16 +256,25 @@ class ResumableDriveUploader:
             metadata_url = API + "/" + reserved + "?" + urlencode({"fields": FIELDS})
             properties = {"quillUpload": state["marker"], "quillSha256": file["sha256"]}
 
-            def verify_parent():
-                response = call("GET", API + "/" + parent + "?" + urlencode({"fields": FIELDS}))
+            def verify_parent(folder, readers):
+                response = call("GET", API + "/" + folder + "?" + urlencode({"fields": FIELDS}))
                 if response.status == 404:
                     raise UploadNeedsReview("The Drive upload folder is unavailable")
                 if response.status != 200:
                     self._failure(response)
                 item = _json(response)
-                if item.get("id") != parent or item.get("mimeType") != "application/vnd.google-apps.folder":
+                if item.get("id") != folder or item.get("mimeType") != "application/vnd.google-apps.folder":
                     raise UploadNeedsReview("Drive returned a different upload folder")
-                _verify_access(item, owner, reader_emails)
+                _verify_access(item, owner, readers)
+
+            def verify_content(item, folder, readers):
+                _verify_access(item, owner, readers)
+                if (item.get("id") != reserved or item.get("name") != name
+                        or item.get("parents") != [folder] or item.get("mimeType") != mime
+                        or item.get("appProperties") != properties
+                        or str(item.get("size")) != str(file["size"])
+                        or item.get("md5Checksum") != checksum):
+                    raise UploadNeedsReview("The reserved Drive file does not match this recording upload")
 
             def complete_if_present(required=False):
                 response = call("GET", metadata_url)
@@ -269,20 +285,37 @@ class ResumableDriveUploader:
                 if response.status != 200:
                     self._failure(response)
                 item = _json(response)
-                _verify_access(item, owner, reader_emails)
-                if (item.get("id") != reserved or item.get("name") != name
-                        or item.get("parents") != [parent] or item.get("mimeType") != mime
-                        or item.get("appProperties") != properties
-                        or str(item.get("size")) != str(file["size"])
-                        or item.get("md5Checksum") != checksum):
-                    raise UploadNeedsReview("The reserved Drive file does not match this recording upload")
-                verify_parent()
+                if prepare_only:
+                    raise UploadNeedsReview("The reserved recording unexpectedly exists before folder selection")
+                if staging_parent is not None and item.get("parents") == [staging_parent]:
+                    verify_content(item, staging_parent, ())
+                    verify_parent(staging_parent, ())
+                    verify_parent(parent, reader_emails)
+                    before_filing()
+                    # The reserved ID and content marker survive a lost PATCH response.
+                    # On retry, read its current parent before attempting another move.
+                    move = API + "/" + reserved + "?" + urlencode({
+                        "addParents": parent, "removeParents": staging_parent, "fields": "id"})
+                    moved = call("PATCH", move, b"{}", {"Content-Type": "application/json"})
+                    if moved.status != 200:
+                        self._failure(moved)
+                    response = call("GET", metadata_url)
+                    if response.status == 404:
+                        raise UploadRetryable("Waiting to verify the filed recording in its approved folder")
+                    if response.status != 200:
+                        self._failure(response)
+                    item = _json(response)
+                verify_content(item, parent, reader_emails)
+                verify_parent(parent, reader_emails)
                 state.update(complete=True, offset=file["size"])
                 operation["id"] = reserved  # Only a verified complete file reaches the outer receipt.
                 save()
                 return True
 
-            verify_parent()
+            upload_readers = () if staging_parent is not None else reader_emails
+            verify_parent(upload_parent, upload_readers)
+            if staging_parent is not None:
+                verify_parent(parent, reader_emails)
             if complete_if_present():
                 return {"success": True, "id": reserved}
             offset = 0
@@ -307,7 +340,7 @@ class ResumableDriveUploader:
                 else:
                     self._failure(response)
             if not session:
-                payload = json.dumps({"id": reserved, "name": name, "parents": [parent],
+                payload = json.dumps({"id": reserved, "name": name, "parents": [upload_parent],
                                       "mimeType": mime, "appProperties": properties}).encode()
                 response = call("POST", UPLOAD_API + "?uploadType=resumable", payload,
                                 {"Content-Type": "application/json; charset=UTF-8",
@@ -322,11 +355,21 @@ class ResumableDriveUploader:
                 state["session_uri"] = session
                 state["offset"] = 0
                 save()  # Persist the bearer-like session before sending media.
-            while offset < file["size"]:
-                verify_parent()
+            # Drive commits when the final byte arrives. While the destination
+            # is undecided, leave a final chunk and keep only a resumable session.
+            limit = file["size"] - 1 if prepare_only else file["size"]
+            while offset < limit:
+                verify_parent(upload_parent, upload_readers)
                 stable()
                 handle.seek(offset)
-                block = handle.read(min(CHUNK_BYTES, file["size"] - offset))
+                length = min(CHUNK_BYTES, limit - offset)
+                if prepare_only:
+                    # A partially acknowledged request may resume off an aligned
+                    # offset. Keep each unfinished request a multiple of 256 KiB.
+                    length -= length % CHUNK_ALIGNMENT
+                    if not length:
+                        break
+                block = handle.read(length)
                 if not block:
                     raise UploadNeedsReview("The recording changed during resumable upload")
                 response = call("PUT", session, block,
@@ -347,6 +390,8 @@ class ResumableDriveUploader:
                 offset = next_offset
                 state["offset"] = offset
                 save()
+            if prepare_only:
+                return {"prepared_bytes": offset}
             # A 308 claiming all bytes is not a completion receipt.
             complete_if_present(required=True)
             return {"success": True, "id": reserved}

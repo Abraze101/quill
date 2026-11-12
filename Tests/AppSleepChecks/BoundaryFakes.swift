@@ -365,6 +365,7 @@ enum Config {
     static func recordingCheckInHours() -> Int { 2 }
     static func onStop() -> String? { "test-only-spy-never-executed" }
     static func onStopMaxAttempts() -> Int { 1 }
+    static func recordingReadyHook(for command: String) -> String? { nil }
     static func workflowSettingsURL() -> URL { Fixture.root.appendingPathComponent("missing-workflow.json") }
     static func completionStatusURL() -> URL { Fixture.root.appendingPathComponent("missing-status.json") }
     static func completionWorkerCommand() -> [String]? { nil }
@@ -410,6 +411,7 @@ final class TranscriptionCoordinator {
         return Fixture.retryResult
     }
     func enqueue(_ session: URL, completion: String?) async { Fixture.enqueued.append(session) }
+    func wakeCompletionDelivery() async {}
 }
 
 // The boundary supplies synthetic signals but uses the actual state machine;

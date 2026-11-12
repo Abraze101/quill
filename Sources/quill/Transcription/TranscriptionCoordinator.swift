@@ -239,9 +239,9 @@ actor TranscriptionCoordinator {
                     title: "quill — transcription failed",
                     body: "\(dir.lastPathComponent) — see transcribe.log"
                 )
-                // The raw recording can still be archived; notes remain held
-                // by the external worker when no usable transcript exists.
-                runHook(completion: activeCompletion, for: dir)
+                // Deliver the raw-only outcome while retaining this workflow's
+                // transcript handoff for a successful native transcription retry.
+                runHook(completion: activeCompletion, for: dir, transcriptionFailed: true)
             }
         }
         await engine?.release()
@@ -397,15 +397,23 @@ actor TranscriptionCoordinator {
         return engine
     }
 
-    /// Fires the configured on_stop shell command with the session directory
-    /// as its sole argument, after the transcript exists (or immediately after
-    /// recording when transcription is disabled).
-    private func runHook(completion: String?, for dir: URL) {
+    func wakeCompletionDelivery() async { await delivery.resume() }
+
+    private func runHook(completion: String?, for dir: URL, transcriptionFailed: Bool = false) {
         guard let completion,
               let lease = try? RecordingReviewGate.acquireProcessingLease(session: dir) else { return }
         defer { withExtendedLifetime(lease) {} }
         do {
-            try journal.ready(completion)
+            if transcriptionFailed,
+               let jobs = try? journal.jobs().filter({ $0.session == dir }),
+               let final = jobs.first(where: { $0.id == completion }),
+               let early = Config.recordingReadyHook(for: final.command),
+               jobs.contains(where: { $0.command == early }) {
+                let unavailable = String(early.dropLast("--recording-ready".count)) + "--transcription-unavailable"
+                _ = try journal.register(session: dir, command: unavailable, waitingForTranscript: false, maxAttempts: final.maxAttempts)
+            } else {
+                try journal.ready(completion)
+            }
             Task { [delivery] in await delivery.resume() }
         } catch {
             log(dir, "on_stop handoff could not be marked ready: \(error)")

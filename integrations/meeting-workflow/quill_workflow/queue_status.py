@@ -5,8 +5,9 @@ from pathlib import Path
 
 from .worker_supervision import health
 
-STAGE_LABELS = {"notes": "Writing notes", "route": "Choosing a company",
-                "archive": "Uploading recording", "publish": "Uploading notes"}
+STAGE_LABELS = {"notes": "Writing notes", "route": "Checking the filing destination",
+                "archive": "Filing recording", "publish": "Uploading notes",
+                "prepare_media": "Uploading recording privately"}
 INTENTIONAL_HOLDS = {"Stage disabled in current configuration", "Required routing is disabled",
                      "Choose this meeting's company in the routing review"}
 
@@ -45,12 +46,16 @@ def meetings(queue, job=None, *, summary_tasks=None, stopped=None, skipped=None)
         if task["job"] not in removed:
             grouped.setdefault(task["job"], []).append(task)
     summaries = []
-    for job, saved in grouped.items():
-        running = next((task for task in saved if task["status"] == "running"), None)
-        failed = next((task for task in saved if task["status"] in ("failed", "safety_held")
-                       or task["status"] == "held" and task["error"]
-                       and task["error"] not in INTENTIONAL_HOLDS), None)
-        retry = next((task for task in saved if task["status"] == "retry"), None)
+    for job, all_tasks in grouped.items():
+        saved = [task for task in all_tasks if job not in skipped or task["stage"] == "notes"]
+        running_tasks = [task for task in saved if task["status"] == "running"]
+        running = next(iter(running_tasks), None)
+        failed = next((task for task in saved if task["stage"] != "prepare_media" and
+                       (task["status"] in ("failed", "safety_held") or task["status"] == "held" and task["error"]
+                        and task["error"] not in INTENTIONAL_HOLDS and task["error"] != "Transcribing on this Mac")), None)
+        retry = next((task for task in saved if task["stage"] != "prepare_media" and task["status"] == "retry"), None)
+        transcribing = any(task["stage"] == "notes" and task["status"] == "held"
+                           and task["error"] == "Transcribing on this Mac" for task in saved)
         company = any(task["stage"] == "route" and task["status"] == "held"
                       and task["error"] == "Choose this meeting's company in the routing review" for task in saved)
         pending = any(task["status"] == "pending" for task in saved)
@@ -58,23 +63,25 @@ def meetings(queue, job=None, *, summary_tasks=None, stopped=None, skipped=None)
         chosen = running or failed or retry
         if job in cancelled:
             state, detail = "idle", "Processing cancelled"
-        elif job in skipped:
-            state, detail = "idle", "Kept local"
         elif running:
-            state, detail = "running", STAGE_LABELS[running["stage"]]
+            state, detail = "running", " · ".join(STAGE_LABELS[task["stage"]] for task in running_tasks)
         elif failed:
             state, detail = "needs_attention", failed["error"] or "Processing needs attention"
         elif retry:
             state, detail = "retrying", retry["error"] or "Retrying processing"
+        elif transcribing:
+            state, detail = "queued", "Waiting for local transcription"
         elif company:
-            state, detail = "waiting_for_company", "Choose this meeting's company folder"
+            state, detail = "waiting_for_company", "Choose a Drive folder to finish filing"
         elif pending:
             state, detail = "queued", "Waiting for an earlier step"
-        retryable = summary_tasks is None and job not in cancelled and job not in skipped and not running and not any(task["status"] == "safety_held" for task in saved) and any(task["status"] in ("failed", "retry")
+        elif job in skipped:
+            state, detail = "idle", "Kept local"
+        retryable = summary_tasks is None and job not in cancelled and not running and not any(task["status"] == "safety_held" for task in saved) and any(task["stage"] != "prepare_media" and task["status"] in ("failed", "retry")
                                        and task["receipt"] is None for task in saved)
         summaries.append({"job": job, "title": titles.get(job, "Meeting"), "state": state,
                           "detail": str(detail)[:500], "retryable": retryable,
-                          "revision": retry_revision(saved) if summary_tasks is None else None,
+                          "revision": retry_revision(all_tasks) if summary_tasks is None else None,
                           "stage": chosen["stage"] if chosen else None})
     return summaries
 
@@ -83,7 +90,7 @@ def compact_status(queue):
     jobs = meetings(queue)
     worker = health(queue.state)
     priority = {"running": 0, "needs_attention": 1, "retrying": 2,
-                "waiting_for_company": 3, "queued": 4, "idle": 5}
+                "queued": 3, "waiting_for_company": 4, "idle": 5}
     chosen = min(jobs, key=lambda item: priority[item["state"]]) if jobs else None
     state = chosen["state"] if chosen else "idle"
     labels = {"idle": "Meeting processing is up to date", "queued": "Waiting for processing",

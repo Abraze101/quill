@@ -27,9 +27,10 @@ class ProcessingBusy(WorkflowError):
 
 
 @contextmanager
-def job_lock(state, job):
+def job_lock(state, job, *, shared=False):
     from .processing_lease import lease_context
-    with _lock(Path(state) / ("processing-" + hashlib.sha256(job.encode()).hexdigest() + ".lock")) as handle:
+    with _lock(Path(state) / ("processing-" + hashlib.sha256(job.encode()).hexdigest() + ".lock"),
+               shared=shared) as handle:
         with lease_context(handle.fileno()):
             yield handle
 
@@ -189,7 +190,7 @@ def _tree(path, changing=False):
 
 
 @contextmanager
-def _lock(path):
+def _lock(path, *, shared=False):
     fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     with os.fdopen(fd, "a") as handle:
         info = os.fstat(handle.fileno())
@@ -197,7 +198,7 @@ def _lock(path):
                 or Path(path).name == LEASE and info.st_mode & 0o077):
             raise WorkflowError("The local meeting lock is invalid")
         try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(handle, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise ProcessingBusy("Stopping processing before moving this meeting to Trash.") from error
         yield handle

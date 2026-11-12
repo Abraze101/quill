@@ -1,15 +1,20 @@
+import http.client
 import json
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
+from urllib.parse import urlencode
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from quill_workflow.pipeline import (ConnectorRunner, NeedsConfiguration, Queue,
                                      WorkflowError, atomic_json, route_settings)
 from quill_workflow.routing import RoutingReviews
-from quill_workflow.queue_status import retry_revision
+from quill_workflow.review_library import early_folder_choice
+from quill_workflow.review_server import create_server, _selection
+from quill_workflow.queue_status import meetings, retry_revision
 
 
 class PipelineRoutingTests(unittest.TestCase):
@@ -78,6 +83,87 @@ class PipelineRoutingTests(unittest.TestCase):
         self.assertEqual(set(self.states(job)), {"archive", "notes", "publish"})
         with self.assertRaisesRegex(WorkflowError, "cannot add stages"):
             self.queue.release(job, "route", self.config)
+
+    def test_manual_folder_before_transcript_survives_notes_and_files_once(self):
+        (self.session / "transcript.json").unlink()
+        self.config["archive"]["enabled"] = False
+        job = self.queue.enqueue(self.session, self.config, recording_ready=True)
+        early = early_folder_choice(self.queue.state, job)
+        self.assertIsNone(self.reviews.get(job), "Opening an early picker must be read-only")
+        server = create_server(self.queue.state, processing_options=lambda selected=None: [{
+            "job": job, "state": "running", "detail": "Transcribing the recording"}])
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        thread.start()
+        connection = http.client.HTTPConnection(*server.server_address, timeout=5)
+        try:
+            connection.request("GET", server.review_path + "?meeting=" + _selection(job))
+            page = connection.getresponse().read().decode()
+            self.assertIn("Transcribing the recording", page)
+            self.assertIn(early["revision"], page)
+            fields = {"action": "approve", "job": job, "company_id": "acme", "revision": early["revision"]}
+            connection.request("POST", server.review_path + "decision", urlencode(fields),
+                               {"Origin": server.review_origin, "Content-Type": "application/x-www-form-urlencoded"})
+            response = connection.getresponse()
+            self.assertEqual(response.status, 303)
+            response.read()
+        finally:
+            connection.close()
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+        approved = self.reviews.get(job)
+        self.assertIsNone(approved["transcript_sha256"])
+        self.assertEqual(self.reviews.approve(job, "acme", early["revision"]), approved)
+        atomic_json(self.session / "transcript.json", self.transcript)
+        self.assertEqual(self.queue.enqueue(self.session, self.config, handoff=True), job)
+        self.queue.run_ready(self.runner)
+        self.assertEqual(self.calls, ["notes", "publish"])
+        self.assertEqual(self.states(job), {"archive": "held", "publish": "succeeded", "route": "succeeded", "notes": "succeeded"})
+        self.assertTrue(self.reviews.get(job)["transcript_sha256"])
+        self.assertEqual(self.queue.run_ready(self.runner), 0)
+
+    def test_manual_choice_wins_if_model_writes_a_suggestion_or_fails_mid_decision(self):
+        job = self.enqueue()
+        early = early_folder_choice(self.queue.state, job)
+        def choose_in_model(argv, cwd, timeout):
+            if argv[0] == "route":
+                self.reviews.skip(job, early["revision"])
+                raise WorkflowError("The suggestion process failed after the decision")
+            return self.execute(argv, cwd, timeout)
+        self.runner.execute = choose_in_model
+        self.queue.run_ready(self.runner)
+        self.assertEqual(self.calls, ["notes"])
+        self.assertEqual(self.reviews.get(job)["status"], "skipped")
+        receipt = json.loads((self.queue.state / "results" / job / "notes-receipt.json").read_text())
+        self.assertEqual(self.reviews.get(job)["transcript_sha256"], receipt["input_sha256"])
+        self.assertIsNone(self.reviews.get(job)["approved_route"])
+
+    def test_early_form_remains_valid_when_suggestion_arrives_first(self):
+        job = self.enqueue()
+        early = early_folder_choice(self.queue.state, job)
+        self.queue.run_ready(self.runner)
+        self.assertEqual(self.reviews.get(job)["status"], "pending")
+        decision = self.reviews.approve(job, "acme", early["revision"])
+        self.assertEqual(decision["decision_source"], "user")
+        self.assertEqual(self.reviews.approve(job, "acme", early["revision"]), decision)
+
+    def test_optional_preparation_failure_does_not_mask_allocation_or_local_notes(self):
+        job = self.enqueue()
+        with self.queue.db:
+            self.queue.db.execute("INSERT INTO tasks(job,stage,status,settings,error) "
+                                  "VALUES (?,'prepare_media','failed','{}','Temporary upload stopped')", (job,))
+        self.queue.run_ready(self.runner)
+        status = meetings(self.queue, job)[0]
+        self.assertEqual(status["state"], "waiting_for_company")
+        self.assertFalse(status["retryable"])
+        self.reviews.skip(job, self.reviews.get(job)["revision"])
+        with self.queue.db:
+            self.queue.db.execute("UPDATE tasks SET status='failed',receipt=NULL,error='Notes failed' "
+                                  "WHERE job=? AND stage='notes'", (job,))
+        status = meetings(self.queue, job)[0]
+        self.assertEqual(status["detail"], "Notes failed")
+        self.assertTrue(status["retryable"])
+        self.assertEqual(self.queue.retry_failed(job, status["revision"], self.config), ["notes"])
 
     def test_review_holds_external_work_without_worker_spin_or_reclassification(self):
         job = self.enqueue()

@@ -71,8 +71,8 @@ Settings provides two independent choices:
 - **Upload audio and video to Drive** controls `archive.enabled`.
 
 For notes-only filing, enable the first and leave the second off. Recording-only
-uploads are also supported, but still require local transcription, notes generation
-and routing to establish the destination. Each option validates its own adapter;
+uploads can start while transcription and notes are running. For eligible jobs,
+the direct Drive connection prepares the media while the folder choice is open. Each option validates its own adapter;
 an unused adapter need not be configured. If both are enabled, their Meetings roots
 must match. A conflicting second choice is rejected without changing either setting.
 
@@ -132,7 +132,7 @@ uploads disabled:
 }
 ```
 
-With `text_format: "combined_google_doc_v1"` on both stages, `archive` uploads audio and optional video. `publish` imports one native Google Doc containing the reviewed notes followed by the full transcript. JSON, Markdown, recording metadata, and separate transcript files stay local. Neither stage sends messages or grants access to other people. Both require a saved, enabled, succeeded `route` stage with an approval matching the current transcript and frozen company map. Configure [company routing](company-routing.md) and [Codex notes](codex-notes.md) too. A legacy job without a routing stage cannot use this adapter.
+With `text_format: "combined_google_doc_v1"` on both stages, `archive` uploads audio and optional video. `publish` imports one native Google Doc containing the reviewed notes followed by the full transcript. JSON, Markdown, recording metadata, and separate transcript files stay local. Neither stage sends messages or grants access to other people. Final filing requires a saved, enabled, succeeded `route` stage with an approval matching the current transcript and frozen company map. Configure [company routing](company-routing.md) and [Codex notes](codex-notes.md) too. A legacy job without a routing stage cannot use this adapter.
 
 Set `publish.notes_layout` to `"clean"` to omit repeated source lines and timestamp citations from the notes. The full transcript keeps its timestamps, and local JSON retains the validated evidence. Omitted values or `"sources"` preserve the original annotated layout.
 
@@ -166,7 +166,7 @@ The company folder sits directly under the Meetings root. A configured subfolder
 
 The Codex file-transfer bridge has a 512 MiB (536,870,912-byte) limit per file in the source revision matching the installed build. The uploader checks the selected files before creating upload state or making Drive changes. By default, a larger file holds that stage for review; it is not silently omitted or split. The optional direct uploader below handles oversized audio and video. Text and document imports retain the existing limit. See the [version-matched Codex file limit](https://github.com/openai/codex/blob/fcbdb57851be70192fd0c21faa9e529146e93ff1/codex-rs/codex-api/src/files.rs#L18).
 
-Before each mutation, the uploader checks the saved routing decision and the known Drive folder chain. Company, meeting, and stage folders must have their expected parent, name, and type. The master folder and company must be private and owned by the connected account. Private filing checks for owner-only access throughout. A configured shared subfolder and filed items must have exactly the owner and the individual readers listed in its route. See [company subfolders](company-routing.md#company-subfolders). Shared-drive destinations and incomplete permission metadata stop the upload for review. The initial checks also require the root and company to appear in searches excluding trashed items. These are checks at the time of each operation; they cannot make subsequent external permission changes impossible.
+Before creating final folders or filing content, the uploader checks the saved routing decision and the known Drive folder chain. Company, meeting, and stage folders must have their expected parent, name, and type. The master folder and company must be private and owned by the connected account. Private filing checks for owner-only access throughout. A configured shared subfolder and filed items must have exactly the owner and the individual readers listed in its route. See [company subfolders](company-routing.md#company-subfolders). Shared-drive destinations and incomplete permission metadata stop the upload for review. The initial checks also require the root and company to appear in searches excluding trashed items. These are checks at the time of each operation; they cannot make subsequent external permission changes impossible.
 
 The worker records each planned operation, dispatch, returned ID, and verified result in private journals under `~/.local/state/quill/workflow/results/JOB_ID/`. A per-job lock coordinates recording and notes uploads. Matching files and destinations reuse saved IDs. If creating a descriptive meeting folder may have succeeded but its Drive ID was not saved, the stage stops for review. One matching name is insufficient: it could belong to another job with the same time and title. A saved ID allows verification and retry without creating another folder.
 
@@ -212,7 +212,7 @@ automatically.
 
 This uploader requires its own Desktop OAuth client and consent. It cannot reuse the Codex connector's login. In a Google Cloud project, enable the Google Drive API, configure the OAuth consent screen, then create a **Desktop app** client under Google Auth platform → Clients and download its JSON. Keep that file outside the checkout. Follow Google's [Desktop OAuth setup](https://developers.google.com/identity/protocols/oauth2/native-app) and [credential creation instructions](https://developers.google.com/workspace/guides/create-credentials).
 
-The setup requests `https://www.googleapis.com/auth/drive`, which permits reading, creating, changing and deleting Drive files. This scope is needed by this implementation to inspect the existing folders created through the other connection. The uploader itself only reads metadata and creates the approved recording files; it contains no sharing or deletion operation. Sign in as the owner of the existing Meetings folder. Setup verifies that account before saving credentials.
+The setup requests `https://www.googleapis.com/auth/drive`, which permits reading, creating, changing and deleting Drive files. This scope is needed by this implementation to inspect the existing folders created through the other connection. Quill uses this access to verify folders, prepare recording uploads and move its own completed recording files into the chosen folder. Viewers inherit access from that folder. Sign in as the owner of the existing Meetings folder. Setup verifies that account before saving credentials.
 
 Run from the checkout, substituting the client path and exact owning email:
 
@@ -244,9 +244,26 @@ The local credential check must pass before new folders are created. Live access
 
 ### Resume and verify
 
+### Uploading while the folder choice is open
+
+For new media-only archives using the direct Google connection, Quill can send
+audio and video immediately after capture finishes. It verifies the private
+Meetings root and the owner of the direct upload account. Each file larger than
+256 KiB starts a resumable session there. Quill leaves the final chunk unsent
+until the destination is approved. **Keep local** leaves the session uncommitted.
+No recording file appears in Drive during preparation.
+
+At filing time Quill resumes the reserved IDs, verifies the completed files,
+and moves them from the private root into the approved Recordings folder on
+Drive. It checks that each file has the expected parent, content and viewers.
+If the move response is lost, it reads back that same ID before retrying.
+Google can expire an unused session after a week. Quill can then retransmit
+the bytes using the same reserved ID. Small files, connector-only uploads and
+historical archives follow their existing filing path. [Google Drive resumable upload protocol](https://developers.google.com/workspace/drive/api/guides/manage-uploads) · [Moving a Drive file](https://developers.google.com/workspace/drive/api/guides/folder#move-files)
+
 Before sending media, the worker reserves a Drive file ID and saves it in the existing private operation journal. It then saves the upload session and acknowledged offset. Retries check the exact file ID and ask Google for the current offset. Expired sessions reuse the reserved ID; a lost final response is reconciled against that same file. A same-name file with a different ID requires review.
 
-Each chunk checks current routing/settings and the immediate parent folder's ownership and privacy. The existing connector checks the full folder chain before and after transfer. The source must remain unchanged. Completion verifies the remote size and MD5 against the source, as well as ID, name, parent, MIME type, ownership and approved viewer access. Direct media files receive `verification: "metadata_and_checksum"`; archive receipts containing them use `verification: "per_file"`.
+Each chunk checks the current upload policy and the immediate parent folder's ownership and access. Final filing also checks the approved route. The existing connector checks the full folder chain before and after transfer. The source must remain unchanged. Completion verifies the remote size and MD5 against the source, as well as ID, name, parent, MIME type, ownership and approved viewer access. Direct media files receive `verification: "metadata_and_checksum"`; archive receipts containing them use `verification: "per_file"`.
 
 The worker saves its transport choice before dispatch. An existing resumable
 operation continues through the same connection regardless of size. Old

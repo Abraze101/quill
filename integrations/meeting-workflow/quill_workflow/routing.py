@@ -380,6 +380,20 @@ def _route(companies, company_id):
     raise RoutingError("Choose a company from the frozen folder allowlist")
 
 
+def early_review(job, settings):
+    """An unsubmitted picker derives only from this recording's frozen routing task."""
+    companies = validate_companies(settings["companies"])
+    company_hash = _digest(companies)
+    required = settings.get("review_required", True)
+    explicit = settings.get("auto_file_explicit_companies", False)
+    return {"schema_version": 1, "job": _job(job), "status": "unassigned",
+            "revision": "early-" + _digest([job, company_hash, required, explicit]),
+            "transcript_sha256": None, "company_map_sha256": company_hash, "companies": companies,
+            "suggestion": None, "approved_route": None, "review_required": required,
+            "auto_file_explicit_companies": explicit, "automatic_basis": None,
+            "decision_source": None, "decision_from_revision": None}
+
+
 class RoutingReviews:
     """Durable reviews with atomic decisions and revision-checked retries."""
 
@@ -426,6 +440,27 @@ class RoutingReviews:
                         (record["job"], _json(record)))
         return record
 
+    def _bind_decision(self, record, transcript_hash, company_hash):
+        if (record["status"] not in ("approved", "skipped") or record["decision_source"] != "user"
+                or record["company_map_sha256"] != company_hash):
+            raise StaleReviewError("The early folder choice no longer matches this recording's folder options")
+        record.update(transcript_sha256=transcript_hash, updated_at=time.time())
+        return self._save(record)
+
+    def bind_early_decision(self, job, transcript, companies):
+        """Bind a human decision made before transcription once, to the verified input."""
+        record = self.get(job)
+        if not record or record["transcript_sha256"] is not None:
+            return record
+        transcript_hash, _ = transcript_identity(transcript)
+        company_hash = _digest(validate_companies(companies))
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            record = self.get(job)
+            if record and record["transcript_sha256"] is None:
+                return self._bind_decision(record, transcript_hash, company_hash)
+            return record
+
     def propose(self, job, transcript, companies, suggestion, review_required=True,
                 auto_file_explicit_companies=False):
         job = _job(job)
@@ -440,6 +475,11 @@ class RoutingReviews:
         self.db.execute("BEGIN IMMEDIATE")
         try:
             previous = self.get(job)
+            if previous and previous["transcript_sha256"] is None:
+                # A user can choose a folder while the model is generating a suggestion.
+                record = self._bind_decision(previous, transcript_hash, company_hash)
+                self.db.commit()
+                return record
             same_provenance = previous and (previous["transcript_sha256"], previous["company_map_sha256"]) == (
                 transcript_hash, company_hash)
             # Model retries cannot overrule a human decision or release a held
@@ -472,17 +512,27 @@ class RoutingReviews:
 
     def _decide(self, job, expected_revision, company_id=None, skip=False):
         from .local_deletion import stopped_jobs
-        if job in stopped_jobs(self.state.absolute()):
+        if job in stopped_jobs(self.state.absolute(), job):
             raise RoutingError("Processing stopped for this meeting; its routing review is closed")
         self.db.execute("BEGIN IMMEDIATE")
         try:
             record = self.get(job)
+            if record is None and isinstance(expected_revision, str) and expected_revision.startswith("early-"):
+                from .review_library import early_folder_choice
+                record = early_folder_choice(self.state, job)
+                if record:
+                    record["created_at"] = time.time()
             if record is None:
                 raise RoutingError("Review does not exist")
             status = "skipped" if skip else "approved"
             duplicate = (record["status"] == status and
                          (skip or record["approved_route"]["company_id"] == company_id))
             accepted_revisions = [record["revision"]]
+            if (record["status"] == "pending" and isinstance(expected_revision, str)
+                    and expected_revision.startswith("early-")):
+                # A suggestion can arrive while this picker is open. A manual
+                # decision made against the same recording and folder map still applies.
+                accepted_revisions.append(early_review(job, record)["revision"])
             if duplicate and record["decision_from_revision"] is not None:
                 accepted_revisions.append(record["decision_from_revision"])
             if not isinstance(expected_revision, str) or expected_revision not in accepted_revisions:
@@ -490,13 +540,13 @@ class RoutingReviews:
             if duplicate:
                 self.db.commit()
                 return record
-            if record["status"] != "pending":
+            if record["status"] not in ("pending", "unassigned"):
                 raise RoutingError("This review already has a decision")
             companies = validate_companies(record["companies"])
             if _digest(companies) != record["company_map_sha256"]:
                 raise StaleReviewError("The frozen company mapping has changed")
             record["approved_route"] = None if skip else _route(companies, company_id)
-            record.update(status=status, decision_source="user", decision_from_revision=record["revision"],
+            record.update(status=status, decision_source="user", decision_from_revision=expected_revision,
                           revision=uuid.uuid4().hex, updated_at=time.time())
             self._save(record)
             self.db.commit()

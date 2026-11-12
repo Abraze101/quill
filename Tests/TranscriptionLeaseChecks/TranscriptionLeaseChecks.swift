@@ -7,6 +7,9 @@ enum Config {
     static func transcriptionEnabled() -> Bool { settings.enabled() }
     static func setTranscriptionEnabled(_ enabled: Bool) { settings.setEnabled(enabled) }
     static func transcriptionEngine() -> String { "parakeet" }
+    static func recordingReadyHook(for command: String) -> String? {
+        command == "exec /usr/bin/true" ? command + " --recording-ready" : nil
+    }
 }
 
 private final class TestSettings: @unchecked Sendable {
@@ -327,6 +330,7 @@ struct TranscriptionLeaseChecks {
         try await checkCanonicalSpeakers(root: root, coordinator: coordinator)
         try await checkRemoteMicrophoneOwner(root: root, coordinator: coordinator)
         try await checkFailedWritesRemainPending(root: root, coordinator: coordinator)
+        try await checkRetriedWorkflowHandoff(root: root.appendingPathComponent("two-phase-check"))
         try await checkCaptureQuality(root: root, coordinator: coordinator)
         try await checkManualRetry(root: root.appendingPathComponent("retry-checks"))
         try await checkCancellationBoundaries(root: root.appendingPathComponent("cancellation-boundaries"))
@@ -557,6 +561,31 @@ struct TranscriptionLeaseChecks {
         precondition(callsAfter == callsBefore + 4)
         let jobs = try journal.jobs()
         precondition(jobs.isEmpty, "Unregistered retries acquired completion hooks")
+    }
+
+    private static func checkRetriedWorkflowHandoff(root: URL) async throws {
+        let recordings = root.appendingPathComponent("recordings")
+        let dir = try fixture("meeting", root: recordings)
+        let obstruction = dir.appendingPathComponent("transcript.md")
+        try FileManager.default.createDirectory(at: obstruction, withIntermediateDirectories: false)
+        let journal = CompletionJournal(directory: root.appendingPathComponent("hooks"))
+        let coordinator = TranscriptionCoordinator(journal: journal)
+        let final = try journal.register(session: dir, command: "exec /usr/bin/true", waitingForTranscript: true)
+        _ = try journal.register(session: dir, command: "exec /usr/bin/true --recording-ready", waitingForTranscript: false)
+        await coordinator.wakeCompletionDelivery()
+        await coordinator.enqueue(dir, completion: final)
+        try await waitUntil("Failed transcript was not reported separately") {
+            (try? journal.jobs())?.contains { $0.command.hasSuffix(" --transcription-unavailable") && $0.state == .delivered } == true
+        }
+        let failed = try journal.jobs()
+        precondition(failed.first(where: { $0.id == final })?.state == .waitingForTranscript)
+        try FileManager.default.removeItem(at: obstruction)
+        let retried = await coordinator.retryPending(root: recordings)
+        precondition(retried == .queued(1))
+        try await waitUntil("Native retry failed to deliver the completed transcript") {
+            (try? journal.jobs())?.first { $0.id == final }?.state == .delivered
+        }
+        precondition(FileManager.default.fileExists(atPath: dir.appendingPathComponent("transcript.json").path))
     }
 
     private static func checkFailedWritesRemainPending(root: URL, coordinator: TranscriptionCoordinator) async throws {

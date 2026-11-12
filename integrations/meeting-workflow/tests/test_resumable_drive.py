@@ -7,16 +7,17 @@ import re
 import sys
 import tempfile
 import unittest
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from quill_workflow.drive_upload import UploadNeedsReview, UploadRetryable, file_identity
 from quill_workflow.pipeline import NeedsConfiguration
-from quill_workflow.resumable_drive import CHUNK_BYTES, HTTPResponse, ResumableDriveUploader
+from quill_workflow.resumable_drive import CHUNK_ALIGNMENT, CHUNK_BYTES, HTTPResponse, ResumableDriveUploader
 
 OWNER = 'owner@example.test'
 READERS = ['sales-one@example.test', 'sales-two@example.test']
 PARENT = 'parent_folder_123'
+FINAL_PARENT = 'final_recordings_123'
 FILE_ID = 'reserved_file_123'
 SESSION = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&upload_id=synthetic'
 
@@ -36,6 +37,7 @@ class FakeDrive:
     def __init__(self):
         self.calls = []
         self.parent = private(PARENT, 'application/vnd.google-apps.folder')
+        self.final_parent = private(FINAL_PARENT, 'application/vnd.google-apps.folder')
         self.item = None
         self.metadata = None
         self.offset = 0
@@ -63,8 +65,17 @@ class FakeDrive:
             return response(value={'ids': [FILE_ID]})
         if method == 'GET' and path.endswith('/' + PARENT):
             return response(value=self.parent)
+        if method == 'GET' and path.endswith('/' + FINAL_PARENT):
+            return response(value=self.final_parent)
         if method == 'GET' and path.endswith('/' + FILE_ID):
             return response(value=self.item) if self.item else response(404)
+        if method == 'PATCH' and path.endswith('/' + FILE_ID):
+            changes = parse_qs(urlsplit(url).query)
+            assert changes['removeParents'] == self.item['parents'] == [PARENT]
+            assert changes['addParents'] == [FINAL_PARENT]
+            self.item.update(parents=[FINAL_PARENT], shared=self.final_parent['shared'],
+                             permissions=copy.deepcopy(self.final_parent['permissions']))
+            return response(value={'id': FILE_ID})
         if method == 'POST':
             assert self.saved['resumable']['file_id'] == FILE_ID
             assert 'id' not in self.saved
@@ -144,6 +155,68 @@ class ResumableTests(unittest.TestCase):
         self.upload()
         self.assertTrue(all(call[0] == 'GET' for call in self.drive.calls))
         self.assertEqual(self.drive.starts, 1)
+
+    def test_private_prefix_then_finalize_same_id_in_shared_destination(self):
+        self.drive.final_parent['shared'] = True
+        self.drive.final_parent['permissions'].extend(
+            {'type': 'user', 'role': 'reader', 'emailAddress': email} for email in READERS)
+        prepared = self.upload(prepare_only=True)['prepared_bytes']
+        self.assertGreater(prepared, 0)
+        self.assertLessEqual(self.file['size'] - prepared, CHUNK_ALIGNMENT)
+        self.assertEqual(prepared % CHUNK_ALIGNMENT, 0)
+        self.assertIsNone(self.drive.item)
+        self.assertNotIn('id', self.operation)
+        self.drive.calls.clear()
+        self.assertEqual(self.upload(prepare_only=True), {'prepared_bytes': prepared})
+        self.assertFalse(any(c[0] == 'PUT' and c[3] for c in self.drive.calls))
+        self.drive.calls.clear()
+        guarded = []
+        final = dict(parent=FINAL_PARENT, staging_parent=PARENT,
+                     reader_emails=READERS, before_filing=lambda: guarded.append(True))
+        self.assertEqual(self.upload(**final), {'success': True, 'id': FILE_ID})
+        self.assertEqual(guarded, [True])
+        self.assertEqual(self.drive.item['parents'], [FINAL_PARENT])
+        self.assertEqual(self.drive.item['md5Checksum'], hashlib.md5(self.source.read_bytes()).hexdigest())
+        self.assertEqual(sum(c[3] for c in self.drive.calls if c[0] == 'PUT'), self.file['size'] - prepared)
+        self.assertEqual(self.drive.starts, 1)
+        self.drive.calls.clear()
+        self.upload(**final)
+        self.assertTrue(all(c[0] == 'GET' for c in self.drive.calls))
+
+    def test_uncertain_folder_move_is_reconciled_by_id_without_retransmitting(self):
+        self.upload(prepare_only=True)
+        final = dict(parent=FINAL_PARENT, staging_parent=PARENT, before_filing=lambda: None)
+        def lost_response(method, url, **kwargs):
+            result = self.drive(method, url, **kwargs)
+            if method == 'PATCH':
+                raise OSError('lost response')
+            return result
+        self.uploader.request = lost_response
+        with self.assertRaises(UploadRetryable):
+            self.upload(**final)
+        self.assertEqual(self.drive.item['parents'], [FINAL_PARENT])
+        self.uploader.request = self.drive
+        self.drive.calls.clear()
+        self.assertEqual(self.upload(**final)['id'], FILE_ID)
+        self.assertTrue(all(c[0] == 'GET' for c in self.drive.calls))
+
+    def test_invalid_approved_readers_stop_private_file_move(self):
+        self.upload(prepare_only=True)
+        self.drive.final_parent['permissions'].append(
+            {'type': 'anyone', 'role': 'reader'})
+        self.drive.final_parent['shared'] = True
+        with self.assertRaises(UploadNeedsReview):
+            self.upload(parent=FINAL_PARENT, staging_parent=PARENT, before_filing=lambda: None)
+        self.assertFalse(any(c[0] == 'PATCH' for c in self.drive.calls))
+        self.assertIsNone(self.drive.item)
+
+    def test_expired_preparation_reuses_reserved_id(self):
+        self.upload(prepare_only=True)
+        self.drive.expired = True
+        final = dict(parent=FINAL_PARENT, staging_parent=PARENT, before_filing=lambda: None)
+        self.assertEqual(self.upload(**final)['id'], FILE_ID)
+        self.assertEqual(self.drive.starts, 2)
+        self.assertEqual(len([c for c in self.drive.calls if c[1].endswith('/generateIds')]), 1)
 
     def test_approved_folder_viewers_inherit_on_upload_and_recover_lost_response(self):
         self.set_parent_viewers()

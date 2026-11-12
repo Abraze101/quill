@@ -355,8 +355,9 @@ def authorize(client_path, credentials_path, *, replace_account=False, expected_
         if expected_email:
             parameters["login_hint"] = expected_email
         announce("This setup requests Google Drive access to read, create, modify and delete all Drive files. "
-                 "The broad scope lets Quill use your existing meeting folders; its uploader only files approved recordings "
-                 "and does not share or delete files. No model API is involved.")
+                 "When recording uploads are enabled, Quill can transfer recording data to a private upload session "
+                 "while you choose a folder. It finishes filing in the approved folder, where the recording inherits access. "
+                 "The uploader does not share or delete files. No model API is involved.")
         announce("Open this Google approval URL in your browser and select the same account as your connected Drive:")
         announce(AUTH_URI + "?" + urllib.parse.urlencode(parameters))
         code = receiver.wait()

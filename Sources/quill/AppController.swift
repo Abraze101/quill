@@ -1265,9 +1265,16 @@ final class AppController {
         guard !RecordingReviewGate.blocksProcessing(session: dir) else { return }
         var completion: String?
         if let command = Config.onStop() {
+            let transcribe = Config.transcriptionEnabled()
             do {
-                completion = try CompletionJournal().register(session: dir, command: command,
-                    waitingForTranscript: Config.transcriptionEnabled(), maxAttempts: Config.onStopMaxAttempts())
+                let journal = CompletionJournal()
+                let attempts = Config.onStopMaxAttempts()
+                completion = try journal.register(session: dir, command: command,
+                    waitingForTranscript: transcribe, maxAttempts: attempts)
+                if transcribe, let early = Config.recordingReadyHook(for: command) {
+                    _ = try journal.register(session: dir, command: early, waitingForTranscript: false, maxAttempts: attempts)
+                    await transcription.wakeCompletionDelivery()
+                }
             } catch {
                 notifyUser(title: "quill — completion handoff failed",
                     body: "The recording is saved locally. Its completion handoff needs attention.")

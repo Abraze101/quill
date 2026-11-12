@@ -4,6 +4,7 @@ import io
 import json
 from contextlib import redirect_stdout
 from pathlib import Path
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -60,6 +61,165 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(len(self.queue.tasks()), 3)
         after = {file.name: hashlib.sha256(file.read_bytes()).hexdigest() for file in self.session.iterdir()}
         self.assertEqual(before, after)
+
+    def handoff_config(self):
+        self.enable("notes")
+        self.config["route"] = {"enabled": True, "command": ["route"], "companies": [
+            {"id": "studio", "name": "Studio", "drive_folder_id": "studio-folder"}]}
+        config = self.root / "workflow.json"
+        atomic_json(config, self.config)
+        return config
+
+    def test_two_hooks_and_raw_retry_form_one_job_with_exact_late_transcript(self):
+        config = self.handoff_config()
+        def hook(command):
+            with redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(workflow.main(["--state", str(self.queue.state), "--config", str(config),
+                                                command, str(self.session)]), 0)
+            return output.getvalue().strip()
+        path = self.session / "transcript.json"
+        source = b'{"segments":[{"start_ms":0,"text":"Here are the notes."}]}'
+        with patch.object(workflow, "start_worker") as wake:
+            job = hook("recording-ready")
+            notes_state = lambda: next(t for t in self.queue.tasks(job) if t["stage"] == "notes")
+            self.assertEqual(notes_state()["error"], "Transcribing on this Mac")
+            self.assertEqual(hook("recording-ready"), job)
+            self.assertEqual(hook("complete"), job)  # Initial transcription failed.
+            self.assertEqual(notes_state()["status"], "held")
+            snapshot = self.queue.state / "recordings" / job
+            before = (snapshot / "manifest.json").read_bytes()
+            path.write_bytes(source)  # Native retry succeeds.
+            self.assertEqual(hook("complete"), job)
+            self.assertEqual(notes_state()["status"], "pending")
+            self.assertEqual((self.queue.state / "results" / job / "input/transcript.json").read_bytes(), source)
+            self.assertEqual((snapshot / "manifest.json").read_bytes(), before)
+            self.assertFalse((snapshot / "transcript.json").exists())
+            self.assertEqual(hook("recording-ready"), job)
+            self.assertEqual(hook("complete"), job)
+            self.assertEqual(wake.call_count, 6)
+            self.assertEqual(self.queue.db.execute("SELECT count(*) FROM jobs").fetchone()[0], 1)
+
+    def test_final_hook_winning_race_keeps_completed_snapshot(self):
+        self.handoff_config()
+        self.enable("archive")
+        atomic_json(self.session / "transcript.json", {"segments": [{"text": "Complete"}]})
+        (self.session / "transcript.md").write_bytes(b"Transcript\r\n")
+        job = self.queue.enqueue(self.session, self.config, handoff=True)
+        self.assertEqual(self.queue.enqueue(self.session, self.config, recording_ready=True), job)
+        recording = self.queue.state / "recordings" / job
+        self.assertEqual(set(json.loads((recording / "manifest.json").read_bytes())), {p.name for p in self.session.iterdir()})
+        for member in self.session.iterdir():
+            self.assertEqual((recording / member.name).read_bytes(), member.read_bytes())
+        self.assertFalse((self.queue.state / "results" / job / "input/transcript.json").exists())
+        archive = next(t for t in self.queue.tasks(job) if t["stage"] == "archive")
+        self.assertNotIn("deferred_transcript_inventory", json.loads(archive["settings"]))
+        self.assertEqual(archive["status"], "pending")
+        self.assertEqual(self.queue.db.execute("SELECT count(*) FROM jobs").fetchone()[0], 1)
+
+    def test_legacy_archive_queues_early_then_seals_exact_transcript_inventory(self):
+        config = self.handoff_config()
+        self.enable("archive")
+        atomic_json(config, self.config)
+        def hook(command):
+            with patch.object(workflow, "start_worker"), redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(workflow.main(["--state", str(self.queue.state), "--config", str(config),
+                                                command, str(self.session)]), 0)
+            return output.getvalue().strip()
+        job = hook("recording-ready")
+        self.assertTrue(job)
+        self.assertEqual(next(t for t in self.queue.tasks(job) if t["stage"] == "archive")["attempts"], 0)
+        with self.assertRaisesRegex(NeedsConfiguration, "transcript inventory"):
+            self.queue.release(job, "archive", self.config)
+        recording = self.queue.state / "recordings" / job
+        raw_manifest = (recording / "manifest.json").read_bytes()
+        original = b'{"segments":[{"text":"Complete"}]}\n'
+        (self.session / "transcript.json").write_bytes(original)
+        (self.session / "transcript.md").write_bytes(b"# Original Markdown\r\n")
+        self.assertEqual(hook("complete"), job)
+        self.assertEqual(hook("recording-ready"), job)
+        self.assertEqual(hook("complete"), job)
+        archive = self.queue.state / "results" / job / "archive-input"
+        manifest = json.loads((archive / "manifest.json").read_bytes())
+        self.assertEqual(set(manifest), set(json.loads(raw_manifest)) | {"transcript.md", "transcript.json"})
+        for name, attrs in manifest.items():
+            data = (self.session / name).read_bytes()
+            self.assertEqual((archive / name).read_bytes(), data)
+            self.assertEqual(attrs, {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+        self.assertTrue((archive / "mic.caf").samefile(recording / "mic.caf"))
+        self.assertEqual((recording / "manifest.json").read_bytes(), raw_manifest)
+        self.assertEqual(next(t for t in self.queue.tasks(job) if t["stage"] == "archive")["status"], "pending")
+
+    def test_manual_attachment_seals_legacy_inventory_but_requires_release(self):
+        self.handoff_config()
+        self.config["archive"] = {"enabled": True, "type": "rclone", "remote": "drive", "folder": "recordings"}
+        job = self.queue.enqueue(self.session, self.config, recording_ready=True)
+        source = self.session / "transcript.json"
+        atomic_json(source, {"segments": [{"text": "Repaired"}]})
+        self.queue.attach_transcript(job, source)
+        self.assertEqual(self.queue.enqueue(self.session, self.config, handoff=True), job)
+        archive = self.queue.state / "results" / job / "archive-input"
+        self.assertEqual((archive / "transcript.json").read_bytes(), source.read_bytes())
+        self.assertFalse((archive / "transcript.md").exists())
+        for t in self.queue.tasks(job):
+            if t["stage"] in ("notes", "archive"):
+                self.assertEqual((t["status"], t["error"]), ("held", "Transcript attached; release required"))
+                self.queue.release(job, t["stage"], self.config)
+
+    def test_legacy_inventory_published_before_interrupted_commit_is_reused(self):
+        self.handoff_config()
+        self.enable("archive")
+        job = self.queue.enqueue(self.session, self.config, recording_ready=True)
+        atomic_json(self.session / "transcript.json", {"segments": [{"text": "Complete"}]})
+        self.queue.db.execute("CREATE TEMP TRIGGER fail_once BEFORE UPDATE OF settled ON recording_handoffs "
+                              "BEGIN SELECT RAISE(ABORT, 'injected interruption'); END")
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "injected interruption"):
+            self.queue.enqueue(self.session, self.config, handoff=True)
+        archive = self.queue.state / "results" / job / "archive-input"
+        files = {p.name: p.stat().st_ino for p in archive.iterdir()}
+        self.assertEqual(self.queue.db.execute("SELECT settled FROM recording_handoffs WHERE job=?", (job,)).fetchone()[0], 0)
+        self.queue.db.execute("DROP TRIGGER fail_once")
+        original = (self.session / "transcript.json").read_bytes()
+        (self.session / "transcript.json").write_bytes(original + b"\n")
+        with self.assertRaisesRegex(WorkflowError, "bytes changed"):
+            self.queue.enqueue(self.session, self.config, handoff=True)
+        (self.session / "transcript.json").write_bytes(original)
+        self.assertEqual(self.queue.enqueue(self.session, self.config, handoff=True), job)
+        self.assertEqual({p.name: p.stat().st_ino for p in archive.iterdir()}, files)
+        self.assertEqual(next(t for t in self.queue.tasks(job) if t["stage"] == "archive")["status"], "pending")
+
+    def test_disabled_archive_keeps_its_hold_and_sealed_input_for_future_release(self):
+        self.handoff_config()
+        job = self.queue.enqueue(self.session, self.config, recording_ready=True)
+        atomic_json(self.session / "transcript.json", {"segments": [{"text": "Finished"}]})
+        self.assertEqual(self.queue.enqueue(self.session, self.config, handoff=True), job)
+        task = next(t for t in self.queue.tasks(job) if t["stage"] == "archive")
+        self.assertEqual((task["status"], task["attempts"]), ("held", 0))
+        self.assertTrue((self.queue.state / "results" / job / "archive-input/transcript.json").is_file())
+        self.enable("archive")
+        self.queue.release(job, "archive", self.config)
+        task = next(t for t in self.queue.tasks(job) if t["stage"] == "archive")
+        self.assertTrue(json.loads(task["settings"])["deferred_transcript_inventory"])
+        self.assertEqual(task["status"], "pending")
+
+    def test_different_sealed_legacy_inventory_and_started_upload_are_never_overwritten(self):
+        self.handoff_config()
+        self.enable("archive")
+        job = self.queue.enqueue(self.session, self.config, recording_ready=True)
+        atomic_json(self.session / "transcript.json", {"segments": [{"text": "Ready"}]})
+        prepared = self.queue.state / "results" / job / "archive-input"
+        prepared.mkdir(parents=True)
+        unrelated = prepared / "unrelated"
+        unrelated.write_text("keep")
+        with self.assertRaisesRegex(WorkflowError, "differs"):
+            self.queue.enqueue(self.session, self.config, handoff=True)
+        self.assertEqual(unrelated.read_text(), "keep")
+        unrelated.unlink()
+        prepared.rmdir()
+        with self.queue.db:
+            self.queue.db.execute("UPDATE tasks SET attempts=1 WHERE stage='archive' AND job=?", (job,))
+        with self.assertRaisesRegex(WorkflowError, "already begun"):
+            self.queue.enqueue(self.session, self.config, handoff=True)
+        self.assertFalse(prepared.exists())
 
     def test_active_recordings_outside_roots_and_symlinks_are_rejected(self):
         metadata = json.loads((self.session / "meta.json").read_text())

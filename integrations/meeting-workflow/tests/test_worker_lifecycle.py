@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -52,6 +53,42 @@ class WorkerLifecycleTests(unittest.TestCase):
 
     def tasks(self, job):
         return {task["stage"]: task for task in self.queue.tasks(job)}
+
+    def test_new_meeting_notes_run_while_an_earlier_meeting_is_transferring(self):
+        from quill_workflow.pipeline import NeedsConfiguration, PREPARE_MEDIA
+        self.enable_stages()
+        first = self.queue.enqueue(self.session, self.config)
+        with self.queue.db:
+            self.queue.db.execute("INSERT INTO tasks(job,stage,status,settings) VALUES (?,?,'pending',?)",
+                                  (first, PREPARE_MEDIA, json.dumps(self.config["archive"])))
+        atomic_json(self.config_path, self.config)
+        uploading, second_notes = threading.Event(), threading.Event()
+        overlap = []
+        next_session = self.session.parent / "new-while-uploading"
+        shutil.copytree(self.session, next_session)
+
+        def connector(stage, job, settings):
+            if stage == PREPARE_MEDIA:
+                uploading.set()
+                self.queue.enqueue(next_session, self.config)
+                overlap.append(second_notes.wait(4))
+            elif stage == "notes":
+                if job == first:
+                    overlap.append(uploading.wait(4))
+                else:
+                    second_notes.set()
+            elif stage == "route":
+                raise NeedsConfiguration("Choose this meeting's company in the routing review")
+            else:
+                self.fail("Final Drive filing ran without allocation")
+            return {"job": job, "stage": stage}
+
+        with patch.object(workflow, "ConnectorRunner", return_value=connector):
+            self.assertEqual(workflow.main(self.args[:-1]), 0)
+        self.assertEqual(overlap, [True, True])
+        self.assertEqual(self.tasks(first)["notes"]["status"], "succeeded")
+        self.assertEqual(self.tasks(first)["route"]["status"], "held")
+        self.assertEqual(self.tasks(first)[PREPARE_MEDIA]["status"], "succeeded")
 
     def test_worker_reloads_settings_after_notes_and_never_releases_old_holds(self):
         old = self.queue.enqueue(self.session, self.config)

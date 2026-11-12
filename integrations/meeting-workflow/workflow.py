@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Quill on_stop entry point and durable worker. No global installation."""
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
 import fcntl
 import hashlib
@@ -10,6 +11,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+from threading import Event
 import time
 
 from quill_workflow.pipeline import (ConnectorRunner, Queue, WorkflowError, configured,
@@ -203,7 +205,9 @@ def review_action_summaries(config_path, state):
                     resume[job] = stages
         with closing(SharingReviews(queue.state, config_path)) as sharing:
             cards = sharing.summaries(removed, stopped)
-        return {"routing": routing, "resume": resume, "processing": _processing_cards(processing, state),
+        folder_catalog = [{key: company[key] for key in ("id", "name", "drive_folder_id", "drive_folder_path")
+                           if key in company} for company in current.get("route", {}).get("companies", [])]
+        return {"routing": routing, "folder_catalog": folder_catalog, "resume": resume, "processing": _processing_cards(processing, state),
                 "sharing": cards, "cancellation": cancellations, "deletion": removals}
 
 
@@ -332,6 +336,66 @@ def acquire_worker_lock(lock, state):
             return False
         fcntl.flock(lock, fcntl.LOCK_EX)
     return True
+
+
+def process_work(queue, config_path, lock_fd, once):
+    """One worker owns the lock; local notes can progress throughout a Drive transfer."""
+    from quill_workflow.local_naming import name_pending
+    from quill_workflow.pipeline import PREPARE_MEDIA
+
+    skill = Path(__file__).parent / "skills/call-summary/SKILL.md"
+    stopped = Event()
+    local_stages = ("notes", "route")
+    drive_stages = ("archive", "publish", PREPARE_MEDIA)
+
+    def enabled():
+        return enabled_stages(config_path)
+
+    def check_worker():
+        if stopped.is_set():
+            # Bypass task retry handling and unwind the adapter's process group.
+            raise SystemExit(143)
+
+    def process_local():
+        with closing(Queue(queue.state)) as local:
+            runner = ConnectorRunner(queue.state, skill, lock_fd, config_path=config_path, check_worker=check_worker)
+            while not stopped.is_set():
+                processed = 0
+                if local.has_work(stages=local_stages):
+                    processed = local.run_ready(runner, enabled=enabled, stages=local_stages)
+                if once:
+                    return processed
+                stopped.wait(1)
+
+    drive = ConnectorRunner(queue.state, skill, lock_fd, config_path=config_path)
+    def process_drive():
+        queue.run_ready(drive, enabled=enabled, stages=drive_stages,
+                        on_completed=lambda stage, job, receipt: completion_autosuggest(
+                            stage, job, receipt, config_path, queue.state))
+
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="quill-notes") as executor:
+        local = executor.submit(process_local)
+        try:
+            while True:
+                if local.done():
+                    local.result()
+                if reconcile_deletions(config_path, queue.state):
+                    start_deletion_worker(config_path, queue.state)
+                reconcile_approved_reviews(queue, load_config(config_path))
+                reconcile_automatic_suggestions(queue, config_path)
+                process_drive()
+                if once and local.result():
+                    # An overlapping notes/route pass can make final filing ready.
+                    process_drive()
+                name_pending(queue, load_config(config_path))
+                queue.write_status()
+                reconcile_approved_reviews(queue, load_config(config_path))
+                reconcile_automatic_suggestions(queue, config_path)
+                if once or (not queue.has_work() and not pending_automatic_suggestions(config_path, queue.state)):
+                    break
+                time.sleep(5)
+        finally:
+            stopped.set()
 
 
 def enabled_stages(config_path):
@@ -483,7 +547,7 @@ def main(argv=None):
     drive_select.add_argument("--revision", required=True)
     drive_select.add_argument("--profile-id", required=True)
     drive_select.add_argument("--email", required=True)
-    for name in ("enqueue", "complete"):
+    for name in ("enqueue", "recording-ready", "complete"):
         child = sub.add_parser(name)
         child.add_argument("session")
     worker = sub.add_parser("work")
@@ -550,11 +614,14 @@ def main(argv=None):
     config = load_config(args.config)
     queue = Queue(args.state)
     try:
-        if args.command in ("enqueue", "complete"):
-            print(queue.enqueue(args.session, config))
-            queue.write_status()
-            if args.command == "complete":
-                start_worker(args.config, queue.state)
+        if args.command in ("enqueue", "recording-ready", "complete"):
+            job = queue.enqueue(args.session, config, recording_ready=args.command == "recording-ready",
+                                handoff=args.command == "complete")
+            if job is not None:
+                print(job)
+                queue.write_status()
+                if args.command != "enqueue":
+                    start_worker(args.config, queue.state)
         elif args.command == "status":
             # Deliberately omit command arguments and settings, which can
             # contain user-supplied connection information.
@@ -679,26 +746,7 @@ def main(argv=None):
                 try:
                     queue.recover()
                     queue.write_status()
-                    runner = ConnectorRunner(queue.state, Path(__file__).parent / "skills/call-summary/SKILL.md",
-                                             lock.fileno(), config_path=args.config)
-                    while True:
-                        deletion_pending = reconcile_deletions(args.config, queue.state)
-                        if deletion_pending:
-                            start_deletion_worker(args.config, queue.state)
-                        current = load_config(args.config)
-                        reconcile_approved_reviews(queue, current)
-                        reconcile_automatic_suggestions(queue, args.config)
-                        queue.run_ready(runner, enabled=lambda: enabled_stages(args.config),
-                                        on_completed=lambda stage, job, receipt: completion_autosuggest(
-                                            stage, job, receipt, args.config, queue.state))
-                        from quill_workflow.local_naming import name_pending
-                        name_pending(queue, load_config(args.config))
-                        queue.write_status()
-                        reconcile_approved_reviews(queue, load_config(args.config))
-                        reconcile_automatic_suggestions(queue, args.config)
-                        if args.once or (not queue.has_work() and not pending_automatic_suggestions(args.config, queue.state)):
-                            break
-                        time.sleep(5)
+                    process_work(queue, args.config, lock.fileno(), args.once)
                 except BaseException as error:
                     worker_event(queue.state, "failed", str(error) or type(error).__name__)
                     raise

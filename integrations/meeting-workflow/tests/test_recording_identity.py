@@ -60,6 +60,21 @@ class RecordingIdentityTests(unittest.TestCase):
             for table in ("recording_safety_bindings", "local_names"):
                 self.queue.db.execute("UPDATE " + table + " SET device=? WHERE job=?", (self.old_device, self.job))
 
+    def test_two_phase_handoff_after_remount_reuses_only_verified_native_session(self):
+        self.config["route"] = {"enabled": True, "companies": [{"id": "studio", "name": "Studio", "drive_folder_id": "test-studio-id"}]}
+        self.job = self.queue.enqueue(self.session, self.config, recording_ready=True)
+        self.simulate_device_renumber()
+        with self.queue.db:
+            self.queue.db.execute("UPDATE recording_handoffs SET device=? WHERE job=?", (self.old_device, self.job))
+        atomic_json(self.session / "transcript.json", {"segments": [{"text": "Finished"}]})
+        self.probe.return_value = "another-volume"
+        with self.assertRaises(RecordingSafetyHold):
+            self.queue.enqueue(self.session, self.config, handoff=True)
+        self.probe.return_value = self.saved()["volume"]
+        self.assertEqual(self.queue.enqueue(self.session, self.config, handoff=True), self.job)
+        self.assertEqual(self.queue.db.execute("SELECT count(*) FROM jobs").fetchone()[0], 1)
+        self.assertEqual(self.stored_device(), self.session.stat().st_dev)
+
     def test_new_identity_records_volume_session_inode_and_manifest(self):
         self.enqueue()
         saved = self.saved()

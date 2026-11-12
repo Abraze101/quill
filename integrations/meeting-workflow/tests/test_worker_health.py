@@ -241,7 +241,7 @@ class WorkerHealthTests(unittest.TestCase):
         with self.assertRaises(NeedsConfiguration):
             self.queue.retry_failed(self.job, retry_revision(self.queue.tasks(self.job)), disabled)
 
-    def test_skipped_company_is_not_waiting_or_retryable(self):
+    def test_skipped_filing_is_not_retryable_but_local_notes_still_are(self):
         reviews = RoutingReviews(self.queue.state)
         try:
             record = reviews.propose(self.job, (self.session / "transcript.json").read_bytes(),
@@ -251,11 +251,18 @@ class WorkerHealthTests(unittest.TestCase):
             reviews.skip(self.job, record["revision"])
         finally:
             reviews.close()
-        self.set_task("failed")
+        self.set_task("succeeded", stage="notes")
+        self.set_task("failed", stage="archive")
         summary = meetings(self.queue)[0]
         self.assertEqual((summary["state"], summary["retryable"]), ("idle", False))
         with self.assertRaises(WorkflowError):
             self.queue.retry_failed(self.job, summary["revision"], self.config)
+        self.set_task("failed", stage="notes")
+        summary = meetings(self.queue)[0]
+        self.assertEqual((summary["state"], summary["retryable"]), ("needs_attention", True))
+        self.assertEqual(self.queue.retry_failed(self.job, summary["revision"], self.config), ["notes"])
+        self.assertEqual(next(task["status"] for task in self.queue.tasks(self.job)
+                              if task["stage"] == "archive"), "failed")
 
     def test_repeated_crash_at_sixth_attempt_does_not_allow_seventh(self):
         self.set_task("running", attempts=6)

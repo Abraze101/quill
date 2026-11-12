@@ -81,6 +81,27 @@ def by_class(document, name):
 
 
 class NotesPresentationTests(unittest.TestCase):
+    def test_sidebar_groups_by_drive_identity_and_expands_selected_ancestors(self):
+        group = {"name": "Studio", "drive_folder_id": "drive-studio"}
+        team = {"name": "Team", "drive_folder_id": "drive-studio-team"}
+        child = {"name": "Notes", "drive_folder_id": "drive-team-notes"}
+        other = {"name": "Studio", "drive_folder_id": "drive-other-studio"}
+        companies = [
+            dict(group, id="studio"),
+            dict(child, id="notes", name="Studio / Team / Notes", drive_folder_path=[group, team, child]),
+            dict(other, id="other"),
+            {"id": "legacy", "name": "Name / with slash"},
+        ]
+        nav = parsed(workspace([], "/", folder="notes", companies=companies)).find("nav")[0]
+        outer, inner = nav.find("details")
+        self.assertEqual([b.find("summary")[0].text for b in (outer, inner)], ["Studio", "Team"])
+        self.assertTrue(all("open" in b.attributes for b in (outer, inner)))
+        self.assertEqual(inner.find("a")[0].attributes["aria-current"], "page")
+        self.assertEqual(outer.find("a", href="/?folder=studio")[0].text, "This folder (Studio)")
+        self.assertEqual(nav.find("a", href="/?folder=other")[0].text, "Studio")
+        self.assertEqual(nav.find("a", href="/?folder=legacy")[0].text, "Name / with slash")
+        self.assertFalse(outer.find("a", href="/?folder=other"))
+
     def test_saved_headings_lists_and_emphasis_remain_readable(self):
         document = parsed(notes_html(
             "# Planning meeting\n\n## Decisions\n"
@@ -252,18 +273,18 @@ class ReviewPresentationTests(unittest.TestCase):
         self.assertEqual(len(document.find("button", value="approve")), 1)
         self.assertEqual(len(document.find("button", value="skip")), 1)
         self.assertTrue(document.find("input", name="revision", value=record["revision"]))
-        self.assertTrue(document.find("select", name="company_id"))
+        self.assertTrue(document.find("input", type="radio", name="company_id"))
         self.assertIn("Review the budget.", document.text)
         self.assertEqual(self.calls, [])
 
-    def test_processing_failure_has_one_recovery_action_and_hides_stale_folder_choice(self):
+    def test_processing_failure_keeps_folder_allocation_separate_from_retry(self):
         record = self.folder_review()
         self.processing = [self.processing_item(
             "needs_attention", job=record["job"], retryable=True,
             detail="The saved processing attempt needs review.")]
         document, _ = self.page(record["job"])
         self.assertIn("The saved processing attempt needs review.", document.text)
-        self.assertFalse(document.find("button", value="approve"))
+        self.assertTrue(document.find("button", value="approve"))
         self.assertFalse(document.find("button", value="resume"))
         retry = next(form for form in document.find("form", method="post")
                      if form.find("button", value="retry"))

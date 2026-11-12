@@ -9,7 +9,19 @@ with attendees requires separate approval after filing.
 
 The completion worker can ask the authenticated Codex CLI to suggest a filing category for a completed meeting. Categories can represent companies or General. The model receives the transcript and configured category names, descriptions, and aliases. It does not receive Drive folder IDs. The worker resolves a category against a fixed folder list and saves a durable review. Quill only displays the pending count and opens the review page. Internal configuration and CLI fields retain their existing company names for compatibility.
 
-New jobs with a `route` configuration run notes, then routing, then recording/notes uploads. The older three-stage jobs retain their original stages and holds. Declaring or enabling routing never migrates or releases those jobs.
+With the standard Quill workflow, a finished recording can enter the Processing
+Center while local transcription is running. Choose its destination then, while
+notes are being written, or after the notes are ready. Open **Choose folder**,
+hover over or expand a parent folder to see its children, select the destination,
+and click **Use this folder**. A saved choice takes precedence over a later
+suggestion. Existing decisions and filing receipts keep their original destinations.
+
+When direct recording uploads are enabled for the combined notes-and-transcript
+format, Quill starts the large media transfers independently of transcription,
+notes, and folder review. Google receives the bytes in private resumable sessions.
+Quill completes and files the recording after it has the meeting title and an
+approved destination. **Keep local** stops further transfer and leaves the
+meeting outside Drive folders. [Drive filing](codex-drive.md)
 
 For a new installation, add a `route` object to `~/.config/quill/workflow.json` after supplying real folder IDs. This example leaves routing disabled:
 

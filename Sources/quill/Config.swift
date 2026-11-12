@@ -1,3 +1,4 @@
+import CoreData
 import Foundation
 
 /// Optional user config at ~/.config/quill/config.json:
@@ -37,6 +38,41 @@ enum Config {
     /// Our durable queue hook explicitly opts into six attempts in its setup.
     static func onStopMaxAttempts() -> Int {
         min(6, max(1, load()?["on_stop_max_attempts"] as? Int ?? 1))
+    }
+
+    /// Only Quill's two-phase hook accepts the early notification. A custom
+    /// on_stop command still receives exactly one completed session.
+    static func recordingReadyHook(for command: String, workerCommand: [String]? = completionWorkerCommand()) -> String? {
+        let scripts: URL
+        if let worker = workerCommand?.last, worker.hasPrefix("/"),
+           URL(fileURLWithPath: worker).lastPathComponent == "quill-workflow-worker.sh" {
+            scripts = URL(fileURLWithPath: worker).deletingLastPathComponent()
+        } else {
+            // The worker supervisor is optional. The installed app also
+            // records its owning checkout inside its signed bundle.
+            guard let marker = Bundle.main.url(forResource: "quill-local-preview", withExtension: "json"),
+                  let data = try? Data(contentsOf: marker),
+                  let info = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  info["schema"] as? String == "quill-local-preview-v1",
+                  let checkout = info["checkout"] as? String, checkout.hasPrefix("/") else { return nil }
+            scripts = URL(fileURLWithPath: checkout).appendingPathComponent("scripts")
+        }
+        let hook = scripts.appendingPathComponent("quill-workflow-hook.sh").path
+        let quoted = "'" + hook.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        // Double quotes allow shell expansion; bare paths also allow word splitting.
+        var forms = [quoted]
+        if hook.rangeOfCharacter(from: CharacterSet(charactersIn: "\"$`\\\n")) == nil {
+            forms.append("\"" + hook + "\"")
+        }
+        if hook.unicodeScalars.allSatisfy({ CharacterSet.alphanumerics.contains($0) || "/._-".unicodeScalars.contains($0) }) {
+            forms.append(hook)
+        }
+        for prefix in ["exec sh ", "exec /bin/sh ", "/bin/sh ", "sh ", "exec ", ""] {
+            if forms.contains(where: { command == prefix + $0 }) {
+                return "exec /bin/sh " + quoted + " --recording-ready"
+            }
+        }
+        return nil
     }
 
     /// Optional command to resume already queued completion jobs on launch.

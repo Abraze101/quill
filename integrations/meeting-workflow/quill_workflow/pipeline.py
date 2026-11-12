@@ -1,6 +1,7 @@
 """Durable, resumable post-recording pipeline; never scans old recordings."""
 import hashlib
-from contextlib import ExitStack
+import fcntl
+from contextlib import ExitStack, contextmanager
 import json
 import math
 import os
@@ -21,6 +22,9 @@ from quill_workflow.recording_safety import (FILENAME, RecordingSafetyHold, Proc
 
 STAGES = ("archive", "notes", "publish")
 ALL_STAGES = STAGES + ("route",)
+PREPARE_MEDIA = "prepare_media"
+WAITING_TRANSCRIPT = "Transcribing on this Mac"
+NO_TRANSCRIPT = "No transcript is available; transcription approval is required"
 MAX_ATTEMPTS = 6
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS local_deletions (job TEXT PRIMARY KEY, record TEXT NOT NULL);
@@ -29,6 +33,11 @@ CREATE TABLE IF NOT EXISTS processing_cancellations (
 );
 CREATE TABLE IF NOT EXISTS jobs (
  id TEXT PRIMARY KEY, session TEXT NOT NULL, created REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS recording_handoffs (
+ job TEXT PRIMARY KEY REFERENCES jobs(id), path TEXT NOT NULL, device INTEGER NOT NULL,
+ inode INTEGER NOT NULL, started TEXT NOT NULL, settled INTEGER NOT NULL,
+ UNIQUE(path,device,inode,started)
 );
 CREATE TABLE IF NOT EXISTS tasks (
  job TEXT NOT NULL REFERENCES jobs(id), stage TEXT NOT NULL,
@@ -74,20 +83,26 @@ class NeedsConfiguration(WorkflowError):
     pass
 
 
-def atomic_json(path, data):
+@contextmanager
+def atomic_output(path, mode):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=".quill-", dir=path.parent)
     try:
-        with os.fdopen(fd, "w") as handle:
-            json.dump(data, handle, indent=2, ensure_ascii=False, allow_nan=False)
-            handle.write("\n")
+        with os.fdopen(fd, mode) as handle:
+            yield handle
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+
+
+def atomic_json(path, data):
+    with atomic_output(path, "w") as handle:
+        json.dump(data, handle, indent=2, ensure_ascii=False, allow_nan=False)
+        handle.write("\n")
 
 
 def read_json(path, limit=20_000_000):
@@ -181,6 +196,10 @@ def large_files_configured(settings, stage):
 def configured(settings, stage):
     if settings.get("enabled") is not True:
         return False
+    if stage == PREPARE_MEDIA:
+        return (settings.get("type") == "codex_drive" and bool(settings.get("large_files"))
+                and settings.get("text_format") in ("combined_google_doc_v1", "native_template_google_doc_v1")
+                and configured(settings, "archive"))
     if settings.get("type") == "codex_drive":
         root = settings.get("meetings_root_id")
         return (stage in ("archive", "publish") and isinstance(root, str)
@@ -234,7 +253,7 @@ def optional_speaker_timeline(session, metadata):
         return None
 
 
-def snapshot_session(session, recordings_root, destination):
+def snapshot_session(session, recordings_root, destination, *, include_transcript=True):
     """Copy only explicitly completed session files; leave originals untouched."""
     raw = Path(session).expanduser()
     if raw.is_symlink():
@@ -254,9 +273,10 @@ def snapshot_session(session, recordings_root, destination):
     # Optional video must be finalized and copied into this same session first.
     if files.get("screen"):
         names.append(files["screen"])
-    for name in ("transcript.json", "transcript.md"):
-        if (session / name).exists():
-            names.append(name)
+    if include_transcript:
+        for name in ("transcript.json", "transcript.md"):
+            if (session / name).exists():
+                names.append(name)
     if optional_speaker_timeline(session, metadata) is not None:
         names.append("speaker-activity.json")
     members = [safe_member(session, name) for name in dict.fromkeys(names)]
@@ -375,7 +395,7 @@ class Queue:
                     self.db.execute("UPDATE tasks SET status='retry',error=NULL WHERE job=? AND status='safety_held'",
                                     (row["job"],))
 
-    def enqueue(self, session, config, now=None):
+    def enqueue(self, session, config, now=None, *, recording_ready=False, handoff=False):
         from quill_workflow.local_deletion import MARKER
         if os.path.lexists(Path(session).expanduser() / MARKER):
             raise WorkflowError("This local meeting was deleted; completion cannot enqueue it again")
@@ -404,12 +424,48 @@ class Queue:
                 tree = json.loads(row[0])["snapshot"]["trees"][0]
                 if (info.st_dev, info.st_ino) == (tree["device"], tree["inode"]):
                     raise WorkflowError("This local meeting is being deleted; completion cannot enqueue it again")
-            return self._enqueue_locked(session, config, now)
+            binding = None
+            bound = self.db.execute("SELECT 1 FROM recording_handoffs WHERE path=? LIMIT 1", (str(source.resolve()),)).fetchone()
+            if recording_ready or handoff or bound:
+                if source.is_symlink() or source.resolve().parent != Path(config.get(
+                        "recordings_root", str(Path.home() / "Recordings"))).expanduser().resolve():
+                    raise WorkflowError("Expected a recording in the configured root")
+                meta = read_json(safe_member(source, "meta.json"), 100_000)
+                started = meta.get("started") if isinstance(meta, dict) else None
+                if not isinstance(started, str) or not started:
+                    raise WorkflowError("Expected completed recording metadata")
+                binding = (str(source.resolve()), info.st_dev, info.st_ino, started)
+                saved = self.db.execute("SELECT job,settled FROM recording_handoffs WHERE path=? "
+                                        "AND device=? AND inode=? AND started=?", binding).fetchone()
+                if saved is None and bound and safety:
+                    from quill_workflow.recording_identity import verify_directory
+                    candidates = self.db.execute(
+                        "SELECT h.job,h.settled,h.device,h.inode FROM recording_handoffs h "
+                        "JOIN recording_safety_bindings b ON b.job=h.job WHERE h.path=? AND h.started=? "
+                        "AND b.session_id=? COLLATE NOCASE", (binding[0], started, safety["session_id"])).fetchall()
+                    if len(candidates) > 1:
+                        raise WorkflowError("Ambiguous recording handoff after remount; review is required")
+                    if candidates:
+                        saved = candidates[0]
+                        verified = verify_directory(self, saved["job"], source, saved["device"], saved["inode"])
+                        self.db.execute("UPDATE recording_handoffs SET device=? WHERE job=?", (verified.st_dev, saved["job"]))
+                if saved:
+                    self.require_processing(saved["job"])
+                    if not recording_ready and not saved["settled"]:
+                        self._finish_handoff(saved["job"], source, config)
+                    self.db.commit()
+                    return saved["job"]
+                if not handoff and not recording_ready:
+                    binding = None
+                if recording_ready and config.get("route", {}).get("enabled") is not True:
+                    self.db.rollback()
+                    return None
+            return self._enqueue_locked(session, config, now, binding, recording_ready)
         except BaseException:
             self.db.rollback()
             raise
 
-    def _enqueue_locked(self, session, config, now=None):
+    def _enqueue_locked(self, session, config, now=None, binding=None, recording_ready=False):
         now = time.time() if now is None else now
         routing = route_settings(config["route"]) if "route" in config else None
         if routing is not None:
@@ -419,7 +475,8 @@ class Queue:
         temporary = Path(tempfile.mkdtemp(prefix="enqueue-", dir=staging_root)) / "recording"
         try:
             session, manifest = snapshot_session(
-                session, config.get("recordings_root", str(Path.home() / "Recordings")), temporary)
+                session, config.get("recordings_root", str(Path.home() / "Recordings")), temporary,
+                include_transcript=not recording_ready)
             identity = str(session) + "\n" + json.dumps(manifest, sort_keys=True)
             job = hashlib.sha256(identity.encode()).hexdigest()[:24]
             spool = self.state / "recordings" / job
@@ -432,7 +489,14 @@ class Queue:
                     if relocation and (session.stat().st_dev, session.stat().st_ino) != tuple(relocation):
                         raise WorkflowError("The original path was replaced after local naming; review is required")
                     self.require_processing(job)
-                    self.db.rollback()
+                    if binding:
+                        if self.db.execute("SELECT 1 FROM recording_handoffs WHERE job=?", (job,)).fetchone():
+                            raise WorkflowError("The original recording folder changed since its first handoff")
+                        self.db.execute("INSERT INTO recording_handoffs VALUES (?,?,?,?,?,?)",
+                                        (job, *binding, int("transcript.json" in manifest)))
+                        self.db.commit()
+                    else:
+                        self.db.rollback()
                     return job
                 if spool.exists():
                     if read_json(spool / "manifest.json") != manifest:
@@ -440,13 +504,24 @@ class Queue:
                 else:
                     os.replace(temporary, spool)
                 try:
-                    date_zone = recording_timezone(read_json(spool / "meta.json", 100_000))
+                    metadata = read_json(spool / "meta.json", 100_000)
+                    date_zone = recording_timezone(metadata)
                 except ValueError as error:
                     raise WorkflowError(str(error)) from error
                 self.db.execute("INSERT INTO jobs VALUES (?, ?, ?)", (job, str(session), now))
+                waiting = recording_ready and "transcript.json" not in manifest
+                deferred_inventory = (binding and routing and routing["enabled"] and "transcript.json" not in manifest
+                                      and (recording_ready or metadata.get("transcription_requested") is True))
+                if binding:
+                    self.db.execute("INSERT INTO recording_handoffs VALUES (?,?,?,?,?,?)",
+                                    (job, *binding, int("transcript.json" in manifest)))
                 self.require_processing(job)
                 for stage in (ALL_STAGES if routing is not None else STAGES):
                     settings = dict(routing if stage == "route" else config.get(stage, {}))
+                    if stage == "archive":
+                        settings.pop("deferred_transcript_inventory", None)
+                        if deferred_inventory and (settings.get("type") != "codex_drive" or settings.get("text_format", "legacy") == "legacy"):
+                            settings["deferred_transcript_inventory"] = True
                     if stage in ("archive", "publish"):
                         # Managed from recording metadata, not a mutable config
                         # default. Both folder and document use this snapshot.
@@ -457,15 +532,23 @@ class Queue:
                         settings["requires_route"] = True
                     status = "pending" if configured(settings, stage) else "held"
                     setup_error = None
+                    if stage == "notes" and waiting and status == "pending":
+                        status, setup_error = "held", WAITING_TRANSCRIPT
                     if settings.get("type") == "codex_drive" and settings.get("enabled") is True:
                         from quill_workflow.drive_accounts import require_verified_account
                         try:
                             require_verified_account(config, settings)
                         except NeedsConfiguration as error:
                             status, setup_error = "held", str(error)
+                    if stage == "archive" and settings.get("deferred_transcript_inventory") and status == "pending":
+                        status, setup_error = "held", WAITING_TRANSCRIPT
                     self.db.execute(
                         "INSERT INTO tasks(job,stage,status,settings,error) VALUES (?,?,?,?,?)",
                         (job, stage, status, json.dumps(settings, sort_keys=True), setup_error))
+                    if (stage == "archive" and routing and routing.get("enabled") and status == "pending"
+                            and configured(settings, PREPARE_MEDIA)):
+                        self.db.execute("INSERT INTO tasks(job,stage,status,settings) VALUES (?,?,?,?)",
+                                        (job, PREPARE_MEDIA, "pending", json.dumps(settings, sort_keys=True)))
                 from quill_workflow.local_naming import enabled, request_naming
                 if enabled(config):
                     request_naming(self, job, config)
@@ -491,13 +574,16 @@ class Queue:
         if not stored:
             raise WorkflowError("Unknown task; release cannot add stages to legacy jobs")
         previous = json.loads(stored["settings"])
+        if stage == "archive" and previous.get("deferred_transcript_inventory") and self.db.execute(
+                "SELECT 1 FROM recording_handoffs WHERE job=? AND settled=0", (job,)).fetchone():
+            raise NeedsConfiguration("This archive waits for its completed transcript inventory")
         settings = dict(config.get(stage, {}))
         if stage in ("archive", "publish"):
             # A normal retry/release is not a content-format migration. Preserve
             # the exact frozen presence/value, including absent legacy fields,
             # so old upload inventories and receipts remain resumable after a
             # new default format or timezone is configured for future meetings.
-            for key in ("text_format", "document_timezone", "meeting_timezone", "notes_layout", "template_document_id", "template_sha256", "account_link_id"):
+            for key in ("text_format", "document_timezone", "meeting_timezone", "notes_layout", "template_document_id", "template_sha256", "account_link_id", "deferred_transcript_inventory"):
                 if key in previous:
                     settings[key] = previous[key]
                 else:
@@ -524,8 +610,78 @@ class Queue:
         if not changed:
             raise WorkflowError("No held or failed task matched; completed tasks cannot be released again")
 
-    def attach_transcript(self, job, transcript_path):
-        """Explicit repair of a raw-only job. Does not release or rerun a stage."""
+    def _finish_handoff(self, job, session, config):
+        """The normal completion hook settles the original media-only job exactly once."""
+        path = session / "transcript.json"
+        if path.exists() or path.is_symlink():
+            source = self._verified_transcript(job, path)
+            self._store_transcript(job, source)
+            archive = self.db.execute("SELECT * FROM tasks WHERE job=? AND stage='archive'", (job,)).fetchone()
+            if archive and json.loads(archive["settings"]).get("deferred_transcript_inventory") is True:
+                self._seal_archive_input(job, session, source, archive)
+                if configured(config.get("archive", {}), "archive"):
+                    self.db.execute("UPDATE tasks SET status='pending',error=NULL WHERE job=? AND stage='archive' "
+                                    "AND status='held' AND error IN (?,?)", (job, WAITING_TRANSCRIPT, NO_TRANSCRIPT))
+                else:
+                    self.db.execute("UPDATE tasks SET error='Stage disabled in current configuration' WHERE job=? AND stage='archive' "
+                                    "AND status='held' AND error IN (?,?)", (job, WAITING_TRANSCRIPT, NO_TRANSCRIPT))
+            notes = self.db.execute("SELECT settings FROM tasks WHERE job=? AND stage='notes'", (job,)).fetchone()
+            enabled = notes and configured(json.loads(notes["settings"]), "notes") and configured(config.get("notes", {}), "notes")
+            state, error = ("pending", None) if enabled else ("held", "Stage disabled in current configuration")
+            self.db.execute("UPDATE recording_handoffs SET settled=1 WHERE job=?", (job,))
+        else:
+            state, error = "held", NO_TRANSCRIPT
+            self.db.execute("UPDATE tasks SET error=? WHERE job=? AND stage='archive' AND status='held' AND error=?",
+                            (NO_TRANSCRIPT, job, WAITING_TRANSCRIPT))
+        self.db.execute("UPDATE tasks SET status=?, error=? WHERE job=? AND stage='notes' AND status='held' AND error IN (?,?)",
+                        (state, error, job, WAITING_TRANSCRIPT, NO_TRANSCRIPT))
+
+    def _seal_archive_input(self, job, session, transcript, archive):
+        """Complete a legacy archive without changing the media snapshot or its identity."""
+        from quill_workflow.drive_upload import file_identity
+        from quill_workflow.local_naming import _rename_exclusive
+        result = self.state / "results" / job
+        if (archive["attempts"] or archive["receipt"] or archive["status"] not in ("pending", "held", "safety_held")
+                or any(os.path.lexists(result / name) for name in ("archive-receipt.json", "drive-archive.json"))):
+            raise WorkflowError("Archive work has already begun; its inventory cannot change")
+        recording = self.state / "recordings" / job
+        media = read_json(recording / "manifest.json")
+        manifest = dict(media)
+        manifest["transcript.json"] = {"size": len(transcript), "sha256": hashlib.sha256(transcript).hexdigest()}
+        if file_identity(safe_member(result / "input", "transcript.json")) != manifest["transcript.json"]:
+            raise WorkflowError("The transcript bytes changed after attachment; review the original recording")
+        markdown = session / "transcript.md"
+        if os.path.lexists(markdown):
+            manifest["transcript.md"] = file_identity(safe_member(session, markdown.name))
+        sealed = result / "archive-input"
+        if os.path.lexists(sealed):
+            # Files can survive a crash just before the SQLite commit. Accept
+            # that exact inventory only, including file names for rclone/copy.
+            if (sealed.is_symlink() or not sealed.is_dir()
+                    or {p.name for p in sealed.iterdir()} != set(manifest) | {"manifest.json"}
+                    or read_json(sealed / "manifest.json") != manifest
+                    or any(not safe_member(sealed, name).samefile(safe_member(recording, name)) for name in media)
+                    or any(file_identity(safe_member(sealed, name)) != manifest[name] for name in manifest.keys() - media.keys())):
+                raise WorkflowError("Existing archive input differs from this handoff; review is required")
+            return
+        with tempfile.TemporaryDirectory(prefix=".archive-input-", dir=result) as temporary:
+            staged = Path(temporary) / "files"
+            staged.mkdir()
+            for name in media:
+                os.link(safe_member(recording, name), staged / name, follow_symlinks=False)
+            with atomic_output(staged / "transcript.json", "wb") as output:
+                output.write(transcript)
+            if "transcript.md" in manifest:
+                fd = os.open(markdown, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                with os.fdopen(fd, "rb") as source, atomic_output(staged / markdown.name, "wb") as output:
+                    shutil.copyfileobj(source, output)
+                if file_identity(staged / markdown.name) != manifest["transcript.md"]:
+                    raise WorkflowError("Readable transcript changed during handoff; retry the same recording")
+            atomic_json(staged / "manifest.json", manifest)
+            _rename_exclusive(staged, sealed)
+
+    def _verified_transcript(self, job, transcript_path):
+        """Pin the transcript bytes to the original captured sources."""
         row = self.db.execute("SELECT session FROM jobs WHERE id=?", (job,)).fetchone()
         if not row:
             raise WorkflowError("Unknown job")
@@ -535,34 +691,54 @@ class Queue:
         source = Path(transcript_path).expanduser()
         if source.is_symlink() or source.resolve() != (session / "transcript.json").resolve():
             raise WorkflowError("Attach the transcript from this job's original session directory")
-        transcript = read_json(source)
-        if not isinstance(transcript, dict) or not isinstance(transcript.get("segments"), list) or not transcript["segments"]:
-            raise WorkflowError("A nonempty completed transcript is required")
+        safe_member(session, "transcript.json")
+        with os.fdopen(os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as handle:
+            transcript = handle.read(20_000_001)
+        try:
+            transcript_identity(transcript)
+        except RoutingError as error:
+            raise WorkflowError(str(error)) from error
         snapshot = self.state / "recordings" / job
         manifest = read_json(snapshot / "manifest.json")
         # Verify provenance before accepting a later transcript. This only
         # hashes the explicitly selected job's source files; it never decodes audio.
+        from quill_workflow.drive_upload import file_identity
         for name, expected in manifest.items():
             if name.startswith("transcript."):
                 continue
             member = safe_member(session, name)
-            digest = hashlib.sha256()
-            with member.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            if member.stat().st_size != expected["size"] or digest.hexdigest() != expected["sha256"]:
+            if file_identity(member) != expected:
                 raise WorkflowError("Original recording changed; transcript provenance needs review")
+        return transcript
+
+    def _store_transcript(self, job, transcript):
+        target = self.state / "results" / job / "input/transcript.json"
+        if target.exists() or target.is_symlink():
+            # Earlier repairs saved an equivalent JSON serialization. Keep
+            # its exact bytes if prior receipts might already refer to it.
+            if read_json(target) != json.loads(transcript):
+                raise WorkflowError("A different transcript is already attached; create an explicit revision")
+        else:
+            with atomic_output(target, "wb") as handle:
+                handle.write(transcript)
+
+    def attach_transcript(self, job, transcript_path):
+        """Explicit repair of a raw-only job. Does not release or rerun a stage."""
+        transcript = self._verified_transcript(job, transcript_path)
         self.db.execute("BEGIN IMMEDIATE")
         try:
             notes = self.db.execute("SELECT status FROM tasks WHERE job=? AND stage='notes'", (job,)).fetchone()
             if not notes or notes["status"] not in ("held", "failed"):
                 raise WorkflowError("Only a held or failed notes job can receive a transcript")
-            target = self.state / "results" / job / "input/transcript.json"
-            if target.exists():
-                if read_json(target) != transcript:
-                    raise WorkflowError("A different transcript is already attached; create an explicit revision")
-            else:
-                atomic_json(target, transcript)
+            self._store_transcript(job, transcript)
+            if self.db.execute("SELECT 1 FROM recording_handoffs WHERE job=? AND settled=0", (job,)).fetchone():
+                archive = self.db.execute("SELECT * FROM tasks WHERE job=? AND stage='archive'", (job,)).fetchone()
+                if archive and json.loads(archive["settings"]).get("deferred_transcript_inventory") is True:
+                    self._seal_archive_input(job, Path(transcript_path).expanduser().parent, transcript, archive)
+                    self.db.execute("UPDATE tasks SET error='Transcript attached; release required' "
+                                    "WHERE job=? AND stage='archive' AND status='held' AND error IN (?,?)",
+                                    (job, WAITING_TRANSCRIPT, NO_TRANSCRIPT))
+                self.db.execute("UPDATE recording_handoffs SET settled=1 WHERE job=?", (job,))
             self.db.execute("UPDATE tasks SET status='held',error='Transcript attached; release required' "
                             "WHERE job=? AND stage='notes'", (job,))
             self.db.commit()
@@ -589,15 +765,16 @@ class Queue:
             if any(task["status"] in ("running", "safety_held") for task in tasks):
                 raise WorkflowError("This meeting is running or needs a recording review; it cannot be retried here")
             self.require_processing(job)
+            kept_local = False
             if (self.state / "reviews.sqlite3").exists():
                 reviews = RoutingReviews(self.state)
                 try:
                     review = reviews.get(job)
                 finally:
                     reviews.close()
-                if review and review["status"] == "skipped":
-                    raise WorkflowError("This meeting was kept local; retry cannot release it")
-            selected = [task for task in tasks if task["status"] in ("failed", "retry") and task["receipt"] is None]
+                kept_local = review and review["status"] == "skipped"
+            selected = [task for task in tasks if task["status"] in ("failed", "retry") and task["receipt"] is None
+                        and task["stage"] != PREPARE_MEDIA and (not kept_local or task["stage"] == "notes")]
             if not selected:
                 raise WorkflowError("No failed processing matched this meeting")
             for task in selected:
@@ -614,7 +791,7 @@ class Queue:
                         and frozen["account_link_id"] != current.get("account_link_id")):
                     raise NeedsConfiguration("Drive account changed; restore this meeting's saved connection before retrying")
                 route = next((item for item in tasks if item["stage"] == "route"), None)
-                if route:
+                if route and stage != "notes":
                     frozen_route = route_settings(json.loads(route["settings"]))
                     if (not configured(config.get("route", {}), "route")
                             or not preserves_company_map(route_settings(config["route"])["companies"],
@@ -630,29 +807,42 @@ class Queue:
         self.write_status()
         return [task["stage"] for task in selected]
 
-    def run_ready(self, runner, now=None, enabled=None, on_completed=None):
+    def run_ready(self, runner, now=None, enabled=None, on_completed=None, *, stages=None):
         now = time.time() if now is None else now
         def refresh_enabled():
             current = enabled() if callable(enabled) else enabled
             if current is None:
                 return None
+            current = dict(current, prepare_media=current.get("archive") is True and current.get("route") is True)
             # Hold disabled stages even during retry backoff. Otherwise the
             # worker keeps polling until their old retry deadlines arrive.
             with self.db:
                 self.db.executemany(
                     "UPDATE tasks SET status='held',error='Stage disabled in current configuration' "
                     "WHERE stage=? AND status IN ('pending','retry','safety_held')",
-                    ((stage,) for stage in ALL_STAGES if current.get(stage) is not True))
+                    ((stage,) for stage in (*ALL_STAGES, PREPARE_MEDIA) if current.get(stage) is not True))
             return current
 
         refresh_enabled()
         self.reconcile_safety()
+        allowed = tuple(stages) if stages is not None else (*ALL_STAGES, PREPARE_MEDIA)
+        stage_filter = ",".join("?" for _ in allowed)
         rows = self.db.execute(
-            "SELECT * FROM tasks WHERE status IN ('pending','retry') AND next_attempt<=? "
-            "ORDER BY CASE stage WHEN 'notes' THEN 0 WHEN 'route' THEN 1 WHEN 'archive' THEN 2 ELSE 3 END,job", (now,)).fetchall()
+            f"SELECT * FROM tasks WHERE stage IN ({stage_filter}) AND status IN ('pending','retry') AND next_attempt<=? "
+            "ORDER BY CASE stage WHEN 'notes' THEN 0 WHEN 'route' THEN 1 WHEN 'archive' THEN 2 ELSE 3 END,job",
+            (*allowed, now)).fetchall()
         processed = 0
         for row in rows:
             row = dict(row)
+            if row["stage"] == PREPARE_MEDIA:
+                # Final filing can use the same reservation, including after
+                # a preparation failure. Never restart optional staging once filed.
+                archived = self.db.execute("SELECT status FROM tasks WHERE job=? AND stage='archive'", (row["job"],)).fetchone()
+                if archived and archived[0] == "succeeded":
+                    with self.db:
+                        self.db.execute("UPDATE tasks SET status='held',error='Recording already filed' "
+                                        "WHERE job=? AND stage=? AND status IN ('pending','retry')", (row["job"], PREPARE_MEDIA))
+                    continue
             # A previous connector can take minutes. Re-read settings before
             # claiming the next stage, never unholding withdrawn work.
             current = refresh_enabled()
@@ -675,7 +865,10 @@ class Queue:
             with self.db:
                 changed = self.db.execute(
                     "UPDATE tasks SET status='running',attempts=attempts+1 WHERE job=? AND stage=? "
-                    "AND status IN ('pending','retry')", (row["job"], row["stage"])).rowcount
+                    "AND status IN ('pending','retry') AND (stage NOT IN ('prepare_media','archive','publish') "
+                    "OR NOT EXISTS (SELECT 1 FROM tasks other WHERE other.job=tasks.job "
+                    "AND other.stage IN ('prepare_media','archive','publish') AND other.status='running'))",
+                    (row["job"], row["stage"])).rowcount
             if not changed:
                 continue
             processed += 1
@@ -686,15 +879,23 @@ class Queue:
             self.write_status()
             leases = ExitStack()
             try:
-                from .local_deletion import job_lock
-                leases.enter_context(job_lock(self.state, row["job"]))
+                from .local_deletion import ProcessingBusy, job_lock
+                leases.enter_context(job_lock(self.state, row["job"], shared=row["stage"] in ("notes", "route", PREPARE_MEDIA)))
                 self.require_processing(row["job"])
                 receipt = runner(row["stage"], row["job"], json.loads(row["settings"]))
                 if not isinstance(receipt, dict) or receipt.get("job") != row["job"] or receipt.get("stage") != row["stage"]:
                     raise WorkflowError("Connector did not return a matching completion receipt")
                 with self.db:
+                    # Acknowledged external writes must survive a cancellation racing their response.
                     self.db.execute("UPDATE tasks SET status=CASE WHEN status='deleted' THEN 'deleted' ELSE 'succeeded' END,receipt=?,error=NULL "
                                     "WHERE job=? AND stage=?", (json.dumps(receipt), row["job"], row["stage"]))
+            except ProcessingBusy:
+                # Another owner is editing/renaming this meeting. No work ran
+                # and ordinary lock contention must not consume a connector retry.
+                with self.db:
+                    self.db.execute("UPDATE tasks SET status=?,attempts=attempts-1,next_attempt=? "
+                                    "WHERE job=? AND stage=? AND status='running'",
+                                    (row["status"], now + 1, row["job"], row["stage"]))
             except ProcessingCancelled:
                 with self.db:
                     self.stop_remaining(row["job"])
@@ -737,6 +938,14 @@ class Queue:
         return processed
 
     def write_status(self):
+        # Serialize capture of the snapshot as well as its atomic rename. A
+        # slower lane must not replace a newer worker/meeting state with an old one.
+        fd = os.open(self.state / "status-write.lock", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self._write_status()
+
+    def _write_status(self):
         from quill_workflow.queue_status import compact_status
         counts = dict(self.db.execute("SELECT status,COUNT(*) FROM tasks GROUP BY status"))
         pending_reviews = 0
@@ -760,8 +969,13 @@ class Queue:
                 dependencies.append("route")
         return dependencies
 
-    def has_work(self):
-        tasks = {(task["job"], task["stage"]): task for task in self.tasks()}
+    def has_work(self, *, stages=None):
+        allowed = tuple(stages) if stages is not None else (*ALL_STAGES, PREPARE_MEDIA)
+        stage_filter = ",".join("?" for _ in allowed)
+        rows = self.db.execute(
+            "SELECT job,stage,status,settings FROM tasks WHERE job IN "
+            f"(SELECT job FROM tasks WHERE status IN ('pending','retry','running') AND stage IN ({stage_filter}))", allowed)
+        tasks = {(task["job"], task["stage"]): task for task in rows}
 
         def possible(task, seen):
             key = (task["job"], task["stage"])
@@ -775,7 +989,8 @@ class Queue:
                     return False
             return True
 
-        return any(task["status"] in ("pending", "retry", "running") and possible(task, set())
+        return any((stages is None or task["stage"] in stages)
+                   and task["status"] in ("pending", "retry", "running") and possible(task, set())
                    for task in tasks.values())
 
 
@@ -933,13 +1148,16 @@ def notes_markdown_matches(markdown, data, transcript):
 
 
 class ConnectorRunner:
-    def __init__(self, state, skill, lock_fd=None, config_path=None):
+    def __init__(self, state, skill, lock_fd=None, config_path=None, check_worker=None):
         self.state = Path(state)
         self.skill = str(Path(skill).resolve())
         self.lock_fd = lock_fd
         self.config_path = Path(config_path) if config_path is not None else None
+        self.check_worker = check_worker
 
     def require_processing(self, job):
+        if self.check_worker is not None:
+            self.check_worker()
         queue = Queue(self.state)
         try:
             return queue.require_processing(job)
@@ -1029,11 +1247,69 @@ class ConnectorRunner:
             raise WorkflowError("Connector returned conflicting reserved receipt fields")
         return dict(receipt, **returned)
 
+    def drive_uploader(self, job, stage, settings, guard, verified_account):
+        from quill_workflow.codex_drive_transport import CodexDriveTransport
+        from quill_workflow.drive_upload import DriveUploader
+        transport = CodexDriveTransport(
+            settings.get("codex", "/Applications/Codex.app/Contents/Resources/codex"),
+            model=settings.get("model"),
+            account_link_id=settings.get("account_link_id"),
+            timeout=min(7200, max(1, int(settings.get("timeout_seconds", 180)))))
+        transport.cancelled = lambda: self.cancelled(job)
+        if verified_account is not None:
+            profile = transport.invoke("get_profile", {})
+            if (not isinstance(profile, dict) or profile.get("id") != verified_account["profile_id"]
+                    or not isinstance(profile.get("email"), str)
+                    or profile["email"].casefold() != verified_account["email"].casefold()):
+                raise NeedsConfiguration("The connected Google account changed. Verify it in Quill Settings before filing.")
+        upload_options = {}
+        if verified_account is not None:
+            upload_options["expected_owner"] = verified_account["email"]
+        if stage == "archive" and settings.get("large_files"):
+            from quill_workflow.google_drive_auth import GoogleDriveAuth
+            from quill_workflow.resumable_drive import ResumableDriveUploader
+            auth = GoogleDriveAuth(settings["large_files"]["credentials_file"])
+            upload_options.update(large_upload=ResumableDriveUploader(auth.access_token),
+                                  large_upload_preflight=auth.preflight)
+        return DriveUploader(self.state, transport.invoke, settings["meetings_root_id"],
+                                 guard=guard, account_link_id=settings.get("account_link_id"), **upload_options)
+
+    def prepare_media(self, job, settings, recording):
+        from .drive_accounts import require_verified_account
+        from .drive_upload import UploadNeedsReview
+        if self.config_path is None:
+            raise NeedsConfiguration("Private upload requires the current Drive configuration")
+        account = require_verified_account(load_config(self.config_path), settings)
+
+        def guard():
+            self.require_processing(job)
+            current = load_config(self.config_path)
+            archive = current.get("archive", {})
+            if (current.get("route", {}).get("enabled") is not True or not configured(archive, "archive")
+                    or any(archive.get(key) != settings.get(key) for key in (
+                        "type", "meetings_root_id", "account_link_id", "large_files", "text_format"))
+                    or require_verified_account(current, archive) != account):
+                raise NeedsConfiguration("Private upload paused because the Drive configuration changed")
+            if (self.state / "reviews.sqlite3").exists():
+                reviews = RoutingReviews(self.state)
+                try:
+                    review = reviews.get(job)
+                    if review and review["status"] == "skipped":
+                        raise NeedsConfiguration("Recording kept local")
+                finally:
+                    reviews.close()
+
+        guard()
+        uploader = self.drive_uploader(job, "archive", settings, guard, account)
+        try:
+            return uploader.prepare_media(job, recording, settings["text_format"])
+        except UploadNeedsReview as error:
+            raise NeedsConfiguration(str(error)) from error
+
     def run_codex_drive(self, job, stage, settings, source, recording, transcript_path, route):
         self.require_processing(job)
         # These adapters reuse the notes harness, which imports pipeline helpers.
-        from quill_workflow.codex_drive_transport import CodexDriveTransport
-        from quill_workflow.drive_upload import DriveUploader, UploadNeedsReview, UploadRetryable
+        from quill_workflow.drive_upload import UploadNeedsReview, UploadRetryable
         verified_account = None
         if self.config_path is not None:
             from quill_workflow.drive_accounts import require_verified_account
@@ -1148,29 +1424,7 @@ class ConnectorRunner:
             except ValueError as error:
                 raise NeedsConfiguration(str(error)) from error
             source = result_dir
-        transport = CodexDriveTransport(
-            settings.get("codex", "/Applications/Codex.app/Contents/Resources/codex"),
-            model=settings.get("model"),
-            account_link_id=settings.get("account_link_id"),
-            timeout=min(7200, max(1, int(settings.get("timeout_seconds", 180)))))
-        transport.cancelled = lambda: self.cancelled(job)
-        if verified_account is not None:
-            profile = transport.invoke("get_profile", {})
-            if (not isinstance(profile, dict) or profile.get("id") != verified_account["profile_id"]
-                    or not isinstance(profile.get("email"), str)
-                    or profile["email"].casefold() != verified_account["email"].casefold()):
-                raise NeedsConfiguration("The connected Google account changed. Verify it in Quill Settings before filing.")
-        upload_options = {}
-        if verified_account is not None:
-            upload_options["expected_owner"] = verified_account["email"]
-        if stage == "archive" and settings.get("large_files"):
-            from quill_workflow.google_drive_auth import GoogleDriveAuth
-            from quill_workflow.resumable_drive import ResumableDriveUploader
-            auth = GoogleDriveAuth(settings["large_files"]["credentials_file"])
-            upload_options.update(large_upload=ResumableDriveUploader(auth.access_token),
-                                  large_upload_preflight=auth.preflight)
-        uploader = DriveUploader(self.state, transport.invoke, settings["meetings_root_id"],
-                                 guard=guard, account_link_id=settings.get("account_link_id"), **upload_options)
+        uploader = self.drive_uploader(job, stage, settings, guard, verified_account)
         try:
             options = {"meeting_title": display_title}
             if initial_company is not None:
@@ -1219,7 +1473,7 @@ class ConnectorRunner:
         receipt["input_sha256"] = source_hash
         reviews = RoutingReviews(self.state)
         try:
-            previous = reviews.get(job)
+            previous = reviews.bind_early_decision(job, source, frozen["companies"])
             if previous is None:
                 staging = Path(tempfile.mkdtemp(prefix="route-", dir=result_dir))
                 try:
@@ -1237,6 +1491,13 @@ class ConnectorRunner:
                     reviews.propose(job, source, frozen["companies"], read_json(output),
                                     review_required=frozen["review_required"],
                                     auto_file_explicit_companies=frozen["auto_file_explicit_companies"])
+                except (WorkflowError, RoutingError, OSError, ValueError):
+                    self.require_processing(job)
+                    if transcript_path.read_bytes() != source:
+                        raise
+                    decided = reviews.bind_early_decision(job, source, frozen["companies"])
+                    if not decided or decided["decision_source"] != "user":
+                        raise
                 finally:
                     shutil.rmtree(staging, ignore_errors=True)
             # A held, approved, or skipped unchanged review never calls the model again.
@@ -1277,11 +1538,17 @@ class ConnectorRunner:
         uses_speaker_context = stage == "notes" and any("{context}" in part for part in settings.get("command", []))
         if not transcript_path.exists():
             transcript_path = recording / "transcript.json"
+        if stage == PREPARE_MEDIA:
+            return dict(receipt, **self.prepare_media(job, settings, recording))
         if stage == "route":
             return self.run_route(job, settings, transcript_path, result_dir, receipt)
         route = None
         if stage in ("archive", "publish"):
             own_task, routing_task = self.task(job, stage), self.task(job, "route")
+            if stage == "archive" and own_task and own_task["settings"].get("deferred_transcript_inventory") is True:
+                recording = result_dir / "archive-input"
+                if recording.is_symlink() or not recording.is_dir():
+                    raise NeedsConfiguration("This archive waits for its completed transcript inventory")
             required = (settings.get("type") == "codex_drive"
                         or settings.get("requires_route") is True or routing_task is not None
                         or own_task and own_task["settings"].get("requires_route") is True)

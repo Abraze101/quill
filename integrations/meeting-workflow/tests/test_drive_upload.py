@@ -1164,6 +1164,54 @@ class DriveUploadTests(unittest.TestCase):
             return value
         return direct, account, patch("quill_workflow.drive_upload.file_identity", side_effect=selected_identity)
 
+    def test_prepared_media_is_adopted_by_the_approved_archive_only(self):
+        direct, account, _ = self.direct_fixture()
+        self.uploader = DriveUploader(self.root / "state", self.drive, FakeDrive.ROOT,
+                                      expected_owner=FakeDrive.OWNER, account_link_id="link_test",
+                                      large_upload=direct, large_upload_preflight=account)
+        (self.source / "mic.caf").write_bytes(b"s" * 300_000)
+        (self.source / "transcript.json").unlink()
+        (self.source / "transcript.md").unlink()
+        reserved = "early_reserved_media_123"
+        def prepare(**kwargs):
+            self.assertTrue(kwargs["prepare_only"])
+            self.assertEqual(kwargs["parent"], FakeDrive.ROOT)
+            self.assertEqual(kwargs["name"], "mic.caf")
+            kwargs["operation"]["resumable"] = {"file_id": reserved, "offset": 262144}
+            kwargs["save"]()
+            return {"prepared_bytes": 262144}
+        finish = direct.upload.side_effect
+        direct.upload.side_effect = prepare
+        ready = self.uploader.prepare_media(self.job, self.source, COMBINED_TEXT_FORMAT)
+        self.assertEqual(ready, {"prepared_bytes": 262144})
+        self.assertFalse(self.drive.writes)
+        direct.upload.side_effect = finish
+        self.shared_sales()
+        receipt = self.uploader.upload(self.job, "archive", self.source, self.route, self.started,
+                                       text_format=COMBINED_TEXT_FORMAT)
+        self.assertEqual(receipt["files"][0]["id"], reserved)
+        self.assertEqual(self.drive.items[reserved]["parent_ids"], [receipt["folder_id"]])
+        call = direct.upload.call_args_list[1].kwargs
+        self.assertEqual(call["staging_parent"], FakeDrive.ROOT)
+        self.assertEqual(set(call["reader_emails"]), set(self.route["drive_reader_emails"]))
+        self.assertTrue(callable(call["before_filing"]))
+        self.assertNotIn("staging_parent", direct.upload.call_args_list[2].kwargs)
+        saved = direct.upload.call_count
+        self.assertEqual(self.uploader.prepare_media(self.job, self.source, COMBINED_TEXT_FORMAT),
+                         {"prepared_bytes": 0})
+        self.assertEqual(direct.upload.call_count, saved)
+
+    def test_preparation_rejects_wrong_direct_account_before_opening_a_session(self):
+        direct, account, _ = self.direct_fixture()
+        self.uploader = DriveUploader(self.root / "state", self.drive, FakeDrive.ROOT,
+                                      expected_owner=FakeDrive.OWNER, account_link_id="link_test",
+                                      large_upload=direct, large_upload_preflight=account)
+        account.return_value = {"email": "another@example.test"}
+        (self.source / "mic.caf").write_bytes(b"s" * 300_000)
+        with self.assertRaisesRegex(UploadNeedsReview, "private Meetings root"):
+            self.uploader.prepare_media(self.job, self.source, COMBINED_TEXT_FORMAT)
+        direct.upload.assert_not_called()
+
     def archive_journal(self):
         path = self.uploader.state / "results" / self.job / "drive-archive.json"
         return path, json.loads(path.read_text())

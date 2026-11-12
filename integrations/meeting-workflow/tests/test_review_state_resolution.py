@@ -119,14 +119,16 @@ class ReviewStateResolutionTests(unittest.TestCase):
         self.assertTrue(entry["attention"])
         self.assertEqual(entry["body"], "")
 
-    def test_pending_folder_actions_wait_until_active_or_failed_processing_is_resolved(self):
+    def test_folder_can_be_chosen_while_processing_or_waiting_for_a_retry(self):
         self.routing()
-        for state in ("running", "retrying", "queued", "needs_attention", "unknown"):
+        for state in ("running", "retrying", "queued", "needs_attention"):
             with self.subTest(state=state):
                 self.processing = [self.processing_item(state)]
                 entry = self.entry()
-                self.assertNotIn('value="approve"', entry["body"])
-                self.assertNotIn('value="skip"', entry["body"])
+                self.assertIn('value="approve"', entry["body"])
+                self.assertIn('value="skip"', entry["body"])
+        self.processing = [self.processing_item("unknown")]
+        self.assertNotIn('value="approve"', self.entry()["body"])
 
     def test_matching_folder_wait_has_one_approval_form_and_no_duplicate_notes(self):
         record = self.routing()

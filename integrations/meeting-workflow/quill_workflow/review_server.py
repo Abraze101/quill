@@ -15,8 +15,8 @@ import webbrowser
 from zoneinfo import ZoneInfo
 
 from .routing import RoutingError, RoutingReviews, StaleReviewError
-from .review_ui import document, notes_html, workspace, meeting_url
-from .review_library import meeting_index, meeting_detail
+from .review_ui import document, folder_list, notes_html, workspace, meeting_url
+from .review_library import early_folder_choice, meeting_index, meeting_detail
 
 DELETION_ACTIONS = {"delete_prepare", "delete_confirm"}
 MAX_FORM_BYTES = 8192
@@ -427,20 +427,22 @@ def _identity_form(server, record):
     return body
 
 
-def _folder_body(server, record, index):
-    suggestion = record["suggestion"]
-    suggested = next((company["name"] for company in record["companies"]
-                      if company["id"] == suggestion["company_id"]), "Needs your choice")
-    body = '<div class="suggestion"><p class="suggestion-title"><strong>Suggested folder:</strong> ' + _escape(suggested) + '</p>'
-    body += '<p>' + _escape(suggestion["reason"]) + '</p></div>'
-    if suggestion["ambiguous"]:
-        body += '<p class="muted">The destination is unclear. Review the notes and choose a folder.</p>'
+def _folder_body(server, record):
+    body = ''
+    suggestion = record.get("suggestion")
+    if suggestion:
+        suggested = next((company["name"] for company in record["companies"]
+                          if company["id"] == suggestion["company_id"]), "Needs your choice")
+        body = '<div class="suggestion"><p class="suggestion-title"><strong>Suggested folder:</strong> ' + _escape(suggested) + '</p>'
+        body += '<p>' + _escape(suggestion["reason"]) + '</p></div>'
+        if suggestion["ambiguous"]:
+            body += '<p class="muted">The destination is unclear. Review the notes and choose a folder.</p>'
     body += _identity_form(server, record)
-    body += '<label for="company-' + str(index) + '">Meeting folder</label>'
-    body += '<select required name="company_id" id="company-' + str(index) + '"><option value="">Choose a folder…</option>'
-    for company in record["companies"]:
-        body += '<option value="' + _escape(company["id"]) + '">' + _escape(company["name"]) + '</option>'
-    body += '</select><div><button name="action" value="approve">Use this folder</button>'
+    def radio(company, label):
+        return ('<label class="folder-choice"><input type="radio" required name="company_id" value="'
+                + _escape(company["id"]) + '"><span>' + label + '</span></label>')
+    body += '<fieldset class="folder-picker"><legend>Meeting folder</legend>' + folder_list(record["companies"], radio) + '</fieldset>'
+    body += '<div><button name="action" value="approve">Use this folder</button>'
     body += '<button name="action" value="skip" formnovalidate>Keep local</button></div></form>'
     body += '<p class="muted">Keep local saves this meeting on your Mac without filing it in Drive.</p>'
     return '<details><summary>Choose folder</summary>' + body + '</details>'
@@ -552,8 +554,9 @@ def _listed_meeting(saved):
             or any(item.get("status") in ("confirmed", "recorded") for item in saved.get("storage", {}).values()))
 
 
-def _review_entries(server, selected=None):
-    options = server.action_summaries() if server.action_summaries else _live_options(server)
+def _review_entries(server, selected=None, options=None):
+    if options is None:
+        options = server.action_summaries() if server.action_summaries else _live_options(server)
     routing = options["routing"]
     sources = _meeting_sources(options)
     library = meeting_index(server.review_state)
@@ -574,8 +577,12 @@ def _review_entries(server, selected=None):
                 sources.pop(chosen)
         if chosen in sources:
             selected_detail = meeting_detail(server.review_state, chosen)
+            if not routing.get(chosen):
+                early = early_folder_choice(server.review_state, chosen)
+                if early:
+                    routing[chosen] = early
     entries = []
-    for index, (job, source) in enumerate(sources.items()):
+    for job, source in sources.items():
         record = routing.get(job)
         pending = source.get("folder")
         processing = source["processing"]
@@ -668,7 +675,7 @@ def _review_entries(server, selected=None):
         elif pending:
             entry.update(status="Choose a folder", detail="Your notes are ready. Choose where to file this meeting.",
                          tone="amber", priority=1, attention=True,
-                         body=_folder_body(server, pending, index) if opened else "")
+                         body="")
         elif source.get("resume"):
             approved, stages = source["resume"]
             entry.update(status="Ready to resume", detail="Your folder choice is saved. Some work is still on hold.",
@@ -690,6 +697,13 @@ def _review_entries(server, selected=None):
             entry.update(status=status, detail=detail, tone=tone, priority=priority, attention=attention)
         elif record and record["status"] == "skipped":
             entry.update(status="Kept on this Mac", detail="You chose to keep this meeting local without filing it in Drive.")
+
+        # Folder allocation is independent of the current processing badge and
+        # retry controls. It is available as soon as this recording is queued.
+        if (opened and not deletion_pending and not cancelled
+                and all(item.get("state") == "needs_attention" for item in errors)
+                and record and record["status"] in ("pending", "unassigned")):
+            entry["body"] += _folder_body(server, record)
 
         if opened and not deletion_pending and not cancelled and cancellation.get("state") == "available" and server.on_cancel_processing:
             entry["cancel_controls"] = _cancel_controls(server, cancellation)
@@ -732,17 +746,15 @@ def _review_entries(server, selected=None):
 
 
 def _reviews_page(server, notice=None, selected=None, **navigation):
-    entries = _review_entries(server, selected)
-    companies = {}
+    options = server.action_summaries() if server.action_summaries else _live_options(server)
+    entries = _review_entries(server, selected, options)
     for entry in entries:
         if server.speaker_options and server.on_speaker:
             entry["speakers_available"] = True
             if entry["selection"] == selected and navigation.get("tab") == "speakers":
                 entry["speaker_body"] = _speaker_panel(server, entry["job"])
-        for company in entry.get("companies", []):
-            companies[company["id"]] = {"id": company["id"], "name": company["name"]}
     return workspace(entries, server.review_path, notice, bool(server.sharing_options), getattr(server, "preview_mode", False), selected,
-                     companies=list(companies.values()), **navigation)
+                     companies=options.get("folder_catalog"), **navigation)
 
 
 class _ReviewHandler(BaseHTTPRequestHandler):

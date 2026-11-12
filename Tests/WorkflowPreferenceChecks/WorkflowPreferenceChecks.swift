@@ -10,6 +10,16 @@ enum WorkflowPreferenceChecks {
             return
         }
         let fm = FileManager.default
+        let scripts = "/Example/User's recordings/scripts/"
+        let hook = scripts + "quill-workflow-hook.sh"
+        let worker = ["/bin/sh", scripts + "quill-workflow-worker.sh"]
+        let quoted = "'" + hook.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        let early = "exec /bin/sh " + quoted + " --recording-ready"
+        precondition(Config.recordingReadyHook(for: "exec sh " + quoted, workerCommand: worker) == early)
+        precondition(Config.recordingReadyHook(for: "sh \"" + hook + "\"", workerCommand: worker) == early)
+        precondition(Config.recordingReadyHook(for: "exec sh " + hook, workerCommand: worker) == nil)
+        precondition(Config.recordingReadyHook(for: "exec sh " + quoted + " --custom", workerCommand: worker) == nil)
+        precondition(Config.recordingReadyHook(for: "exec sh '/other/scripts/quill-workflow-hook.sh'", workerCommand: worker) == nil)
         let temporary = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try fm.createDirectory(at: temporary, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: temporary) }

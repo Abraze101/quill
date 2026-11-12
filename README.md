@@ -28,8 +28,9 @@ release or a notarized app download. The original MIT license is preserved;
 - Uses a separate completion worker for optional Codex notes, destination
   suggestions, separate Google Drive controls for documents and recordings,
   and retries that reuse reserved file IDs.
-- Presents a local meeting library for reviewing notes, recordings, folder
-  decisions, retries, and deletion of an entire local meeting to Trash.
+- Lets you choose a Drive folder from a nested list while transcription, notes,
+  and enabled direct recording uploads run. The Processing Center also handles
+  retries and moving a local meeting to Trash.
 - Suggests sharing recipients from calendars. Sharing requires review and an
   explicit approval for a notes-only copy. Recordings inherit their filing folder’s access.
 - Holds interrupted or degraded recordings for review before processing, with

@@ -23,8 +23,8 @@ from .capture_quality import notice
 from .meeting_dates import recording_timezone
 from .meeting_title import meeting_title
 from .native_template import build_bound_payload
-from .pipeline import WorkflowError, render_notes
-from .routing import RoutingError, _route as configured_route, validate_companies
+from .pipeline import WorkflowError, configured, render_notes, route_settings
+from .routing import RoutingError, _route as configured_route, early_review, validate_companies
 from .transcript_sources import (effective_attributions, remote_microphone_owner, render_reviewed_transcript,
                                  segment_label, segment_name)
 
@@ -623,7 +623,8 @@ def _confirmed(sources, job, stage, tasks, transcript_hash, route, metadata, not
         if text_format == COMBINED_TEXT_FORMAT and saved.get("verification") != "metadata_and_document_text":
             return None
     elif stage == "archive":
-        manifest = sources.json(f"recordings/{job}/manifest.json", 100_000)
+        directory = f"results/{job}/archive-input" if settings.get("deferred_transcript_inventory") is True else f"recordings/{job}"
+        manifest = sources.json(f"{directory}/manifest.json", 100_000)
         capture = metadata.get("files", {})
         if not isinstance(manifest, dict) or not isinstance(capture, dict):
             return None
@@ -766,6 +767,27 @@ def _entry(sources, row, tasks, *, include_notes=False):
             text = text[:MAX_NOTES_CHARACTERS] + "\n\n[Notes preview shortened.]"
         result["notes_text"] = text
     return result
+
+
+def early_folder_choice(state, job):
+    """Read frozen destinations for one queued meeting before it has a suggestion."""
+    if not isinstance(job, str) or not _JOB.fullmatch(job):
+        return None
+    from .local_deletion import stopped_jobs
+    try:
+        with closing(_Sources(state)) as sources:
+            jobs, all_tasks, removed = sources.rows(job)
+            if not jobs or job in removed or job in stopped_jobs(sources.state, job):
+                return None
+            task = all_tasks.get(job, {}).get("route", {})
+            if task.get("status") not in ("pending", "running", "retry", "failed") or task.get("receipt") is not None:
+                return None
+            settings = task["settings"]
+            if configured(settings, "route"):
+                return early_review(job, route_settings(settings))
+    except (OSError, ValueError, TypeError, KeyError, sqlite3.Error, WorkflowError):
+        return None
+    return None
 
 
 def meeting_detail(state, job):

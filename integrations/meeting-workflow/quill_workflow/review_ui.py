@@ -124,6 +124,18 @@ details>p,details>ul{margin:14px 16px}details>form{margin:14px 16px}details>.not
 .sharing-review h3{margin-top:0}.sharing-review .review-layout{display:flex;flex-direction:column;gap:15px}.sharing-review .action-pane{border:0;padding:0}.sharing-review .reading{min-width:0}
 .sharing-heading{margin-top:0}.calendar-event{padding:14px 17px;border:1px solid var(--line);border-radius:8px;margin:14px 0;background:var(--subtle)}.calendar-event h5{margin:0 0 10px}.calendar-event ul,.calendar-event p{font-size:13px}
 .suggestion{font-size:13px}.suggestion-title{margin:0 0 7px}.notes-caption{font-size:12px;color:var(--muted)}
+.folder-list{list-style:none;margin:0;padding:0;min-width:0}
+.folder-list .folder-branch{margin:0;padding:0;border:0;background:transparent;overflow:visible}
+.folder-branch>summary,.folder-list .folder-choice{display:flex;align-items:center;gap:8px;min-height:38px;margin:0;padding:6px 10px;border-radius:6px;cursor:pointer;background:transparent;color:var(--ink);font-size:13px;overflow-wrap:anywhere}
+.folder-branch>summary{list-style:none}.folder-branch>summary::-webkit-details-marker{display:none}
+.folder-branch>summary::before{content:"";width:6px;height:6px;flex:none;border:solid var(--muted);border-width:0 1.5px 1.5px 0;transform:rotate(-45deg)}
+.folder-branch[open]>summary::before,.folder-branch:has(input:checked,input:user-invalid)>summary::before{transform:rotate(45deg)}
+.folder-list .folder-children{border-inline-start:1px solid var(--line);margin:0 0 0 13px;padding-inline-start:6px}
+.folder-picker{min-width:0;margin:0;padding:6px;border:1px solid var(--line);border-radius:8px}
+.folder-picker legend{padding:0 4px;font-size:13px;font-weight:500}.folder-choice input{margin:0;accent-color:var(--accent);flex:none}
+.folder-choice:has(:checked){background:var(--tint);color:var(--accent)}.sidebar nav>.folder-list{width:100%}
+.folder-list .nav-link{margin:0}.folder-branch:has(input:checked,input:user-invalid,.folder-children :focus)::details-content{content-visibility:visible}
+@media(hover:hover){.folder-branch:hover::details-content{content-visibility:visible}.folder-branch:hover>summary::before{transform:rotate(45deg)}.folder-branch>summary:hover,.folder-choice:hover{background:var(--tint)}}
 .speaker-card{border:1px solid var(--line);border-radius:9px;padding:20px;margin:18px 0;min-width:0}
 .speaker-card>header{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:14px}.speaker-card h2{font-size:17px;margin:0 0 3px}.speaker-card code{font-size:11px;color:var(--muted);overflow-wrap:anywhere}.speaker-card .badge{flex:none}
 .speaker-samples{padding-left:12px;border-left:2px solid var(--line);margin:14px 0}.speaker-samples blockquote{font-size:13px;margin:7px 0;overflow-wrap:anywhere}
@@ -141,6 +153,7 @@ button[value=approve],button[value=sharing_confirm],button[value=sharing_prepare
 @media(max-width:1000px){.app{padding:0 14px;margin:14px auto}.workspace{grid-template-columns:170px minmax(0,1fr)}.meeting-main{padding:24px}.table-head,.meeting-row{grid-template-columns:minmax(0,1fr) 135px}.folder-column{display:none}.panel-header h1{font-size:26px}}
 @media(max-width:620px){.app{margin:0;padding:0}.workspace{display:block;border:0;border-radius:0;min-height:100vh}.sidebar{padding:16px;border-right:0;border-bottom:1px solid var(--line)}.brand{margin:0 0 12px;font-size:19px}.brand svg{width:23px;height:23px}.sidebar nav{display:flex;gap:5px;flex-wrap:wrap}.nav-link{margin:0;min-height:38px;font-size:12px;padding:6px 9px}.nav-label{width:100%;margin:8px 9px 0}.sidebar-foot{display:none}.meeting-main{padding:22px 18px}.toolbar{gap:15px;margin-bottom:24px}.search{width:100%;max-width:none}.search input[type=search]{flex:1;width:100%}.table-head{display:none}.meeting-row{display:flex;flex-direction:column;align-items:flex-start;gap:8px;padding:16px 2px}.row-meta{font-size:12px}.panel-header h1{font-size:25px}.tabs{gap:22px}.activity dl{grid-template-columns:1fr;gap:5px}.activity dd{margin-bottom:14px}.error-page{margin:15px;padding:24px}.toolbar-actions{gap:12px}.workflow-action{padding:15px}.review-footer{margin-top:28px}}
 @media(pointer:coarse){button,.button,.nav-link,.tab,.back,.refresh,summary{min-height:44px}input,textarea,select{font-size:16px}}
+@media(pointer:coarse){.folder-branch>summary,.folder-list .folder-choice{min-height:44px}}
 @media(max-width:620px){.speaker-card{padding:16px}.speaker-card .speaker-fields{grid-template-columns:minmax(0,1fr)}.speaker-card>header{flex-wrap:wrap}.speaker-card .speaker-remember{min-height:44px}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;transition:none!important;animation:none!important}}
 """
@@ -291,6 +304,37 @@ def _meeting_content(entry, path, navigation, tab):
     return body
 
 
+def folder_list(companies, render_choice, current=None):
+    """Group by actual Drive folder identities. Older flat names can contain slashes."""
+    roots = {}
+    for company in companies:
+        children = roots
+        for part in company.get("drive_folder_path") or [company]:
+            identity = part.get("drive_folder_id") or ("legacy", company["id"])
+            node = children.setdefault(identity, {"name": part["name"], "choices": [], "children": {}, "open": False})
+            if company["id"] == current:
+                node["open"] = True
+            children = node["children"]
+        node["choices"].append(company)
+
+    def rows(nodes):
+        items = []
+        for node in nodes.values():
+            name = escape(node["name"])
+            if node["children"]:
+                branch = '<details class="folder-branch"' + (' open' if node["open"] else '') + '><summary>' + name + '</summary>'
+                branch += '<ul class="folder-list folder-children">'
+                for company in node["choices"]:
+                    branch += '<li>' + render_choice(company, 'This folder<span class="sr-only"> (' + name + ')</span>') + '</li>'
+                items.append('<li>' + branch + rows(node["children"]) + '</ul></details></li>')
+            else:
+                for company in node["choices"]:
+                    items.append('<li>' + render_choice(company, name) + '</li>')
+        return ''.join(items)
+
+    return '<ul class="folder-list">' + rows(roots) + '</ul>'
+
+
 def workspace(entries, path, notice=None, sharing=False, preview=False, selected=None,
               *, view="all", folder=None, query="", tab="notes", companies=None):
     """Render a read-only library or one detail; actions remain exact native POSTs.
@@ -299,19 +343,22 @@ def workspace(entries, path, notice=None, sharing=False, preview=False, selected
     is needed, so saved transcript text cannot become executable UI content.
     """
     navigation = {"view": view, "folder": folder, "query": query}
-    folders = {c["id"]: c["name"] for c in companies or []}
+    folders = {c["id"]: c for c in companies or []}
     for entry in entries:
+        for company in entry.get("companies", []):
+            folders.setdefault(company["id"], company)
         if entry.get("folder_id") and entry.get("folder_name"):
-            folders[entry["folder_id"]] = entry["folder_name"]
+            folders.setdefault(entry["folder_id"], {"id": entry["folder_id"], "name": entry["folder_name"]})
     body = '<div class="workspace"><aside class="sidebar" aria-label="Quill navigation">'
     body += _link(FEATHER + 'Quill', path, 'brand') + '<nav aria-label="Meeting views">'
     body += _link('All meetings <span class="count">' + str(len(entries)) + '</span>', path, 'nav-link', view == 'all' and not folder)
     count = sum(bool(e.get("attention")) for e in entries)
     body += _link('Needs attention <span class="count">' + str(count) + '</span>', meeting_url(path, view='attention'), 'nav-link', view == 'attention' and not folder)
     if folders:
-        body += '<p class="nav-label">Folders</p>'
-        for key, name in folders.items():
-            body += _link(escape(name), meeting_url(path, folder=key), 'nav-link', folder == key)
+        body += '<p class="nav-label">Recording folders</p>'
+        def folder_link(company, label):
+            return _link(label, meeting_url(path, folder=company["id"]), 'nav-link', folder == company["id"])
+        body += folder_list(folders.values(), folder_link, current=folder)
     body += '</nav><p class="sidebar-foot">On this Mac</p></aside><div class="meeting-main">'
     if preview:
         body += '<p class="demo-banner">Design preview · Sample meetings. Actions stay in this preview.</p>'
@@ -323,7 +370,7 @@ def workspace(entries, path, notice=None, sharing=False, preview=False, selected
     if chosen:
         body += _meeting_content(chosen, path, navigation, tab)
     else:
-        title = folders.get(folder, "Meetings") if folder else "Needs attention" if view == 'attention' else 'Meetings'
+        title = folders.get(folder, {}).get("name", "Meetings") if folder else "Needs attention" if view == 'attention' else 'Meetings'
         body += '<div class="toolbar"><h1>' + escape(title) + '</h1>'
         body += '<div class="toolbar-actions">' + _link('Refresh status', meeting_url(path, **navigation), 'refresh')
         body += '<form method="get" action="' + escape(path) + '" class="search" role="search">'

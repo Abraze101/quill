@@ -8,6 +8,7 @@ import fcntl
 import hashlib
 import json
 import os
+from contextlib import contextmanager
 from pathlib import Path
 import re
 import stat
@@ -31,6 +32,7 @@ DOCUMENT_MIME = "application/vnd.google-apps.document"
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 COMBINED_TEXT_FORMAT = "combined_google_doc_v1"
 NATIVE_TEMPLATE_FORMAT = "native_template_google_doc_v1"
+PREPARATION_JOURNAL = "drive-media-preparation.json"
 # Codex rust-v0.150.0-alpha.8 local-file transfer limit; check before any write.
 MAX_FILE_BYTES = 512 * 1024 * 1024
 UNKNOWN_MEETING_FOLDER = "A meeting folder write has no saved Drive ID; confirm its ownership before retrying"
@@ -273,6 +275,71 @@ class DriveUploader:
         self.large_upload_preflight = large_upload_preflight
         self._reserved_media_retry = False
 
+    @contextmanager
+    def _upload_directory(self, job):
+        if not isinstance(job, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", job):
+            raise UploadNeedsReview("Expected a fixed meeting job ID")
+        directory = self.state / "results" / job
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        descriptor = os.open(directory / "drive-upload.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            yield directory
+
+    def _media_preparation(self, path, job, source, text_format, files, *, create=False):
+        if not path.exists() and not path.is_symlink() and not create:
+            return None
+        identity = {"job": job, "meetings_root_id": self.root_id, "source": str(source),
+                    "account_link_id": self.account_link_id, "owner": self.expected_owner,
+                    "text_format": text_format, "files": files}
+        if path.exists() or path.is_symlink():
+            journal = read_json(path)
+            if (not isinstance(journal, dict) or journal.get("schema_version") != 1
+                    or journal.get("identity") != identity or not isinstance(journal.get("operations"), dict)):
+                raise UploadNeedsReview("The prepared recording or its Drive account changed; review its upload")
+            return journal
+        journal = {"schema_version": 1, "identity": identity, "operations": {}}
+        atomic_json(path, journal)
+        return journal
+
+    def prepare_media(self, job, source, text_format):
+        """Transfer media prefixes privately. No file is committed before allocation."""
+        from .resumable_drive import CHUNK_ALIGNMENT
+        if (not self.large_upload or not callable(self.large_upload_preflight)
+                or not self.account_link_id or not self.expected_owner
+                or text_format not in {COMBINED_TEXT_FORMAT, NATIVE_TEMPLATE_FORMAT}):
+            raise UploadNeedsReview("Early media upload requires a verified direct recording connection")
+        source = Path(source).expanduser().absolute()
+        with self._upload_directory(job) as directory:
+            self.guard()
+            if (directory / "drive-archive.json").exists():
+                # Filing won the race or this is a historical transfer. Its
+                # original operation owns any IDs and ambiguous writes.
+                return {"prepared_bytes": 0}
+            files = inventory(source, "archive", text_format, allow_large_media=True)
+            eligible = [file for file in files if file["size"] > CHUNK_ALIGNMENT]
+            if not eligible:
+                return {"prepared_bytes": 0}
+            account = self.large_upload_preflight()
+            root = self._metadata(self.root_id)
+            owner = self._verify_access(root, self.expected_owner, mime=FOLDER_MIME)
+            if (not isinstance(account, dict) or not isinstance(account.get("email"), str)
+                    or account["email"].casefold() != owner.casefold()
+                    or self.root_id not in self._find("root", root["title"], True)):
+                raise UploadNeedsReview("The direct Drive account could not verify its private Meetings root")
+            path = directory / PREPARATION_JOURNAL
+            journal = self._media_preparation(path, job, source, text_format, files, create=True)
+            prepared_bytes = 0
+            for file in eligible:
+                key = "file:" + file["name"]
+                op = journal["operations"].setdefault(key, {})
+                result = self.large_upload.upload(
+                    source=source / file["name"], file=file, name=file["name"], mime=file["mime_type"],
+                    parent=self.root_id, owner=owner, operation=op, prepare_only=True,
+                    save=lambda: atomic_json(path, journal), guard=self.guard)
+                prepared_bytes += result["prepared_bytes"]
+            return {"prepared_bytes": prepared_bytes}
+
     def _resumable_media(self, stage, file, operation):
         """Pin transport once; never turn an uncertain legacy write into a create."""
         op = operation or {}
@@ -457,12 +524,9 @@ class DriveUploader:
                     or any(unicodedata.category(char).startswith("C") for char in document_title)):
                 raise UploadNeedsReview("A bounded combined document title is required")
         proposed_name = _folder_name(date, job, meeting_title, meeting_timezone)
-        directory = self.state / "results" / job
-        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        lock_path = directory / "drive-upload.lock"
-        descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(descriptor, "a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+        with self._upload_directory(job) as directory:
+            preparation = (self._media_preparation(directory / PREPARATION_JOURNAL, job, source, text_format, files)
+                           if stage == "archive" else None)
             path = directory / ("drive-" + stage + ".json")
             identity = {"job": job, "stage": stage, "idempotency_key": job + ":" + stage,
                         "meetings_root_id": self.root_id, "route": route, "started": started,
@@ -650,6 +714,16 @@ class DriveUploader:
                 save()
 
             def ensure(key, parent, name, mime, file=None):
+                if file and preparation and key not in journal["operations"]:
+                    prepared = preparation["operations"].get(key, {}).get("resumable")
+                    if prepared:
+                        # Move ownership of this reserved ID and its current
+                        # session to the route-bound archive journal before I/O.
+                        journal["operations"][key] = {
+                            "state": "dispatched", "name": name, "parent": parent,
+                            "transport": "google_drive_resumable", "staging_parent": self.root_id,
+                            "resumable": prepared}
+                        save()
                 op = journal["operations"].setdefault(key, {"state": "planned", "name": name, "parent": parent})
                 if op["name"] != name or op["parent"] != parent:
                     raise UploadNeedsReview("Saved upload operation no longer matches its destination")
@@ -687,12 +761,17 @@ class DriveUploader:
                     reserved = saved.get("file_id") if isinstance(saved, dict) else None
                     if ids and ids != [reserved]:
                         raise UploadNeedsReview("A matching Drive item is not owned by this resumable upload")
+                    staged = {}
+                    if "staging_parent" in op:
+                        if op["staging_parent"] != self.root_id:
+                            raise UploadNeedsReview("The prepared media no longer matches the private Meetings root")
+                        staged = {"staging_parent": self.root_id, "before_filing": validate_ancestors}
                     try:
                         validate_ancestors()
                         result = self.large_upload.upload(
                             source=source / file["name"], file=file, parent=parent,
                             name=name, mime=mime, owner=owner, operation=op,
-                            save=save, guard=self.guard,
+                            save=save, guard=self.guard, **staged,
                             **({"reader_emails": reader_emails} if reader_emails else {}))
                     except (UploadRetryable, DriveAuthRetryable) as error:
                         saved = op.get("resumable")

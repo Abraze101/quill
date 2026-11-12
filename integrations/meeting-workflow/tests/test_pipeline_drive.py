@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT))
 from quill_workflow.pipeline import (ConnectorRunner, NeedsConfiguration, Queue, RecoverableUploadError,
                                      WorkflowError, atomic_json, configured)
 from quill_workflow.routing import RoutingReviews
+from quill_workflow.review_library import early_folder_choice
 from quill_workflow import drive_upload as real_drive_upload
 from quill_workflow.codex_drive_transport import DriveTimeoutError
 from test_native_template_drive import NativeDrive, expected_text, plan_requests, verify_document
@@ -63,6 +64,7 @@ class PipelineDriveTests(unittest.TestCase):
         upload_module.DriveUploader = self.uploader_factory
         upload_module.UploadNeedsReview = FakeNeedsReview
         upload_module.UploadRetryable = FakeRetryable
+        upload_module.file_identity = real_drive_upload.file_identity
         transport_module = types.ModuleType("quill_workflow.codex_drive_transport")
         transport_module.CodexDriveTransport = self.transport_factory
         transport_module.DriveTimeoutError = DriveTimeoutError
@@ -76,9 +78,14 @@ class PipelineDriveTests(unittest.TestCase):
         self.queue.close()
         self.temp.cleanup()
 
-    def prepare(self, config=None):
-        job = self.queue.enqueue(self.session, config or self.config)
-        transcript = self.queue.state / "recordings" / job / "transcript.json"
+    def prepare(self, config=None, early=False):
+        config = config or self.config
+        job = self.queue.enqueue(self.session, config, recording_ready=early)
+        if early:
+            self.assertEqual(self.queue.enqueue(self.session, config, handoff=True), job)
+            transcript = self.queue.state / "results" / job / "input/transcript.json"
+        else:
+            transcript = self.queue.state / "recordings" / job / "transcript.json"
         review = self.reviews.propose(job, transcript.read_bytes(), self.companies, {
             "schema_version": 1, "company_id": "acme", "confidence": "high",
             "reason": "Explicit company context.", "evidence": [0], "ambiguous": False})
@@ -101,6 +108,38 @@ class PipelineDriveTests(unittest.TestCase):
             self.assertFalse(configured(dict(self.settings, command=["unused"]), stage))
         for root in (None, "root", "https://drive.google.com/drive/folders/example", "../folder", 123):
             self.assertFalse(configured(dict(self.settings, meetings_root_id=root), "archive"))
+
+    def test_private_media_runs_before_transcript_or_destination_and_rechecks_keep_local(self):
+        archive = self.config["archive"]
+        archive.update(text_format="combined_google_doc_v1", large_files={
+            "type": "google_drive_resumable", "credentials_file": str(self.root / "direct.json")})
+        self.config["notes"] = {"enabled": True, "command": ["unused"]}
+        (self.session / "transcript.json").unlink()
+        job = self.queue.enqueue(self.session, self.config, recording_ready=True)
+        config_path = self.root / "workflow.json"
+        atomic_json(config_path, self.config)
+        runner = ConnectorRunner(self.queue.state, self.root / "skill", config_path=config_path)
+        self.uploader.prepare_media.return_value = {"prepared_bytes": 262144}
+        with patch.dict(sys.modules, {"quill_workflow.resumable_drive":
+                                      types.SimpleNamespace(ResumableDriveUploader=Mock())}):
+            receipt = runner("prepare_media", job, archive)
+        self.assertEqual(receipt["prepared_bytes"], 262144)
+        self.uploader.prepare_media.assert_called_once_with(job, self.queue.state / "recordings" / job,
+                                                           "combined_google_doc_v1")
+        self.assertIsNone(self.reviews.get(job))
+        self.uploader.upload.assert_not_called()
+        guard = self.uploader_factory.call_args.kwargs["guard"]
+        self.config["archive"]["enabled"] = False
+        atomic_json(config_path, self.config)
+        with self.assertRaises(NeedsConfiguration):
+            guard()
+        self.config["archive"]["enabled"] = True
+        atomic_json(config_path, self.config)
+        guard()
+        early = early_folder_choice(self.queue.state, job)
+        self.reviews.skip(job, early["revision"])
+        with self.assertRaisesRegex(NeedsConfiguration, "kept local"):
+            guard()
         self.assertFalse(configured(dict(self.settings, enabled=False), "archive"))
         self.assertFalse(configured(dict(self.settings, codex=""), "archive"))
         self.assertFalse(configured(dict(self.settings, model=False), "archive"))
@@ -305,6 +344,35 @@ class PipelineDriveTests(unittest.TestCase):
         self.assertTrue(callable(kwargs["guard"]))
         self.transport.invoke.assert_not_called()
 
+    def test_early_legacy_drive_archives_final_inventory(self):
+        (self.session / "transcript.md").write_bytes(b"Original readable transcript\r\n")
+        job, _ = self.prepare(early=True)
+        self.runner("archive", job, self.config["archive"])
+        source = self.uploader.upload.call_args.args[2]
+        self.assertEqual(source, self.queue.state / "results" / job / "archive-input")
+        self.assertEqual({p.name for p in source.iterdir()}, {"manifest.json"} | {p.name for p in self.session.iterdir()})
+        for member in self.session.iterdir():
+            self.assertEqual((source / member.name).read_bytes(), member.read_bytes())
+
+    def test_early_rclone_archive_copies_final_inventory(self):
+        self.config["archive"] = {"enabled": True, "type": "rclone", "remote": "drive", "folder": "meetings"}
+        job, _ = self.prepare(early=True)
+        with patch.object(self.runner, "execute") as execute:
+            self.runner("archive", job, self.config["archive"])
+        source = Path(execute.call_args.args[0][2])
+        self.assertEqual(source, self.queue.state / "results" / job / "archive-input")
+        self.assertEqual((source / "transcript.json").read_bytes(), (self.session / "transcript.json").read_bytes())
+
+    def test_early_custom_archive_receives_final_inventory(self):
+        self.config["archive"] = {"enabled": True, "command": ["archive", "{input}", "{output}"]}
+        job, _ = self.prepare(early=True)
+        def execute(argv, _staging, _timeout):
+            self.assertEqual(Path(argv[1]), self.queue.state / "results" / job / "archive-input")
+            self.assertEqual((Path(argv[1]) / "transcript.json").read_bytes(), (self.session / "transcript.json").read_bytes())
+            atomic_json(argv[2], {"job": job, "stage": "archive", "idempotency_key": job + ":archive", "destination": "test"})
+        with patch.object(self.runner, "execute", side_effect=execute):
+            self.runner("archive", job, self.config["archive"])
+
     def test_configured_model_executable_and_timeout_are_forwarded(self):
         job, _ = self.prepare()
         settings = dict(self.settings, codex="/fixture/codex", model="configured-model", timeout_seconds=90)
@@ -433,6 +501,24 @@ class PipelineDriveTests(unittest.TestCase):
             with self.subTest(stage=stage):
                 self.runner(stage, job, self.settings)
                 self.assertEqual(self.uploader.upload.call_args.kwargs["meeting_title"], "Agenda planning")
+
+    def test_late_transcript_binds_local_title_and_combined_drive_document(self):
+        from quill_workflow.local_naming import _title, _verify_files
+        self.config["archive"]["text_format"] = "combined_google_doc_v1"
+        job, transcript = self.prepare(early=True)
+        self.assertEqual(transcript.read_bytes(), (self.session / "transcript.json").read_bytes())
+        self.assertFalse((self.queue.state / "recordings" / job / "transcript.json").exists())
+        self.titled_notes(job, transcript)
+        receipt = self.queue.state / "results" / job / "notes-receipt.json"
+        with self.queue.db:
+            self.queue.db.execute("UPDATE tasks SET receipt=? WHERE job=? AND stage='notes'", (receipt.read_text(), job))
+        self.assertEqual(_title(self.queue, job), "Agenda planning")
+        self.runner("publish", job, dict(self.settings, text_format="combined_google_doc_v1"))
+        self.assertEqual(self.uploader.upload.call_args.kwargs["meeting_title"], "Agenda planning")
+        _verify_files(self.queue, job, self.session)
+        atomic_json(self.session / "transcript.json", {"segments": [{"text": "Changed after transcription"}]})
+        with self.assertRaisesRegex(WorkflowError, "Local transcript changed"):
+            _verify_files(self.queue, job, self.session)
 
     def test_title_with_wrong_provenance_or_cited_source_never_starts_transport(self):
         for changed in ("receipt", "provenance", "source", "title", "held"):
